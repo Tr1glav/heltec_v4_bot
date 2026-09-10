@@ -7,3 +7,4 @@
 .vscode/launch.json
 .vscode/ipch
 __pycache__
+secrets.ini

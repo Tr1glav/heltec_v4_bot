@@ -13,6 +13,7 @@ ESP32-S3 + SX1262: слушает каналы `#public` и `#connections`, от
 - [Как добавить свою плату](#как-добавить-свою-плату)
 - [Русский шрифт на OLED](#русский-шрифт-на-oled)
 - [Параметры радио и каналы](#параметры-радио-и-каналы)
+- [MQTT / Home Assistant](#mqtt--home-assistant)
 - [Драйвер OLED (SH1106 vs SSD1306)](#драйвер-oled-sh1106-vs-ssd1306)
 
 ## Структура проекта
@@ -147,6 +148,76 @@ ASCII-умы и символы после `0xF0`.
 уходит через ~6 с после старта. Подпись — ed25519 (ключ зернится из
 `SHA256(DEVICE_NAME)`). `/ping` отвечает на `#connections`: если пакет пришёл
 напрямую — `hops:direct`, иначе `hops:N, route:aa → bb`.
+
+## MQTT / Home Assistant
+
+Опциональная интеграция с Home Assistant через MQTT (Auto-Discovery).
+Компилируется только при `-DMQTT_ENABLED`; без этого флага код WiFi/MQTT
+полностью исключается из сборки.
+
+### Включение
+
+1. В `platformio.ini` раскомментируйте env `heltec_v4_3_mqtt` и заполните:
+   ```
+   -DWIFI_SSID=\"YourSSID\"
+   -DWIFI_PASS=\"YourPassword\"
+   -DMQTT_BROKER=\"192.168.1.100\"
+   -DMQTT_PORT=1883
+   ```
+
+2. В Home Assistant установите интеграцию [MQTT](https://www.home-assistant.io/integrations/mqtt/)
+   (она уже может быть — если HA подключён к Mosquitto/EMQX/etc).
+
+3. Прошейте бота. После подключения к WiFi и MQTT бот автоматически
+   создаст сущности в HA через MQTT Discovery.
+
+### Сущности в HA
+
+| Тип | Имя | Описание |
+|-----|-----|----------|
+| **Sensor** | `<имя> Message` | Последнее сообщение: sender, text, channel, RSSI, SNR, hops, route |
+| **Sensor** | `<имя> LastMsg` | Текст последнего сообщения **выбранного** канала (удобно для триггеров) |
+| **Sensor** | `<имя> Status` | Системный статус: uptime, packets, duplicates, channel, private |
+| **Text** | `<имя> Send` | Текстовое поле → LoRa TX (флуд в выбранный канал) |
+| **Select** | `<имя> Channel` | Выбор канала TX: `#public` / `#connections` / приватный канал |
+| **Text** | `<имя> Priv Chan Name` | Имя приватного канала для прослушки, напр. `#garage` |
+| **Text** | `<имя> Priv Chan Key` | PSK приватного канала (base64, 16 байт; пусто = автоключ из имени) |
+| **Switch** | `<имя> Listening` | Вкл/выкл приёмника (radio.startReceive / radio.standby) |
+
+### MQTT Topics
+
+| Topic | Direction | Описание |
+|-------|-----------|----------|
+| `meshcore/bot/<name>/state` | → HA | JSON: последнее сообщение |
+| `meshcore/bot/<name>/lastmsg` | → HA | Текст сообщения ВЫБРАННОГО канала (для триггеров) |
+| `meshcore/bot/<name>/status` | → HA | JSON: статус (uptime, packets, channel, private, ...) |
+| `meshcore/bot/<name>/lstate` | → HA | `"ON"` / `"OFF"` (listening state) |
+| `meshcore/bot/<name>/cmd/send` | ← HA | Текст → LoRa TX |
+| `meshcore/bot/<name>/cmd/channel` | ← HA | `"#public"` / `"#connections"` / приватный канал |
+| `meshcore/bot/<name>/cmd/listening` | ← HA | `"ON"` / `"OFF"` |
+| `meshcore/bot/<name>/cmd/private/name` | ← HA | Имя приватного канала (напр. `#garage`) |
+| `meshcore/bot/<name>/cmd/private/key` | ← HA | PSK base64 (16 байт); пусто = автоключ |
+
+### Приватный канал
+
+Задаётся из HA двумя полями: **имя** (например `#garage`) и **ключ**. Если
+ключ пустой — используется автоключ `SHA256(имя)[0:16]` (как у
+`#connections`); если задан — это PSK в base64 (16 байт, как у `#public`).
+Канал добавляется третьим в таблицу, и бот слушает его вместе с
+`#public`/`#connections`. Имя + ключ сохраняются в NVS и восстанавливаются
+после перезагрузки. После смены имени/ключа discovery перепубликуется.
+
+### Статус на OLED
+
+При включённом MQTT на экране рядом с «Listening...» показывается строка
+`WiFi:+ MQTT:+` (`+` = подключено, `-` = нет).
+
+### Размер прошивки
+
+| Вариант | RAM | Flash |
+|---------|-----|-------|
+| Без MQTT | 7.2% (23 КБ) | 12.2% (408 КБ) |
+| С MQTT | 15.1% (49 КБ) | 25.2% (843 КБ) |
 
 ## Драйвер OLED (SH1106 vs SSD1306)
 
