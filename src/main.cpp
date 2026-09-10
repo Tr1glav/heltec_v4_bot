@@ -8,6 +8,8 @@
 #include <mbedtls/aes.h>
 #include <mbedtls/base64.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 // ===== ПИНЫ ДЛЯ HELTEC V4.3 =====
 #define SCREEN_WIDTH 128
@@ -47,6 +49,9 @@
 // Имя устройства (идёт в заголовке исходящих сообщений)
 #define DEVICE_NAME "Tr1glav_esp_bot"
 
+// Часовой пояс для отображения локального времени (из BUILD_UNIX_TIME)
+#define LOCAL_TZ "Europe/Moscow"
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
@@ -76,6 +81,20 @@ float lastSNR = 0;
 bool buttonPressed = false;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastRxDisplay = 0;
+
+// ===== СТРАЖ ЗДОРОВЬЯ LORA =====
+// Как в Dispatcher: периодически сбрасываем AGC (warm sleep -> startReceive),
+// иначе SX1262 со временем глохнет и перестаёт ловить пакеты ("засыпает").
+#define RADIO_REARM_INTERVAL_MS 10000
+unsigned long lastReArmMs = 0;
+
+// Warm sleep сбрасывает аналоговый фронтенд (AGC/LNA), затем заново в RX.
+void rearmRadioAGC() {
+    radio.sleep();
+    radio.startReceive();
+    lastReArmMs = millis();
+    Serial.println("[RADIO] AGC reset, RX re-armed");
+}
 
 // ===== ДЕДУПЛИКАЦИЯ (как SimpleMeshTables в MeshCore) =====
 // Хэш считается по payload_type + payload (без header/transport/path),
@@ -396,12 +415,19 @@ bool sendGroupMessageOnChannel(int chIdx, const String& msg) {
     int st = radio.transmit(frame, f);
     digitalWrite(FEM_TX_PIN, LOW);
 
-    radio.startReceive();
     if (st == RADIOLIB_ERR_NONE) {
         Serial.println("[TX] OK");
+    } else {
+        Serial.printf("[TX] FAILED %d\n", st);
+    }
+
+    // после TX обязательно вернуться в RX; при ошибке — полный ре-арм AGC
+    if (radio.startReceive() != RADIOLIB_ERR_NONE) {
+        rearmRadioAGC();
+    }
+    if (st == RADIOLIB_ERR_NONE) {
         return true;
     }
-    Serial.printf("[TX] FAILED %d\n", st);
     return false;
 }
 
@@ -437,10 +463,38 @@ bool initLoRa() {
     return false;
 }
 
+// Компилятором задавалось BUILD_UNIX_TIME из времени хоста (см. scripts/gen_build_time.py)
+#ifndef BUILD_UNIX_TIME
+#define BUILD_UNIX_TIME 0
+#endif
+
+char sysTimeStr[32] = "?";
+
+// Устанавливает системные часы ESP32-S3 в момент старта из времени хоста
+// в момент сборки/прошивки. NTP не используется.
+void initSystemClock() {
+    struct timeval tv;
+    tv.tv_sec = BUILD_UNIX_TIME;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+
+    setenv("TZ", LOCAL_TZ, 1);
+    tzset();
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(sysTimeStr, sizeof(sysTimeStr), "%Y-%m-%d %H:%M:%S", &tm_now);
+    Serial.printf("[RTC] SysTime set from host: %s (%s)\n", sysTimeStr, LOCAL_TZ);
+    Serial.printf("[RTC] epoch=%lld\n", (long long)now);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(3000);
     Serial.println("\n=== MESHCORE LISTENER V4.3 ===\n");
+    
+    initSystemClock();
     
     // ===== ПИТАНИЕ OLED =====
     pinMode(VEXT_PIN, OUTPUT);
@@ -463,17 +517,54 @@ void setup() {
     // ===== OLED =====
     pinMode(OLED_RESET, OUTPUT);
     digitalWrite(OLED_RESET, LOW);
-    delay(50);
+    delay(10);
     digitalWrite(OLED_RESET, HIGH);
-    delay(50);
-    
+    delay(200);
+
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
-    
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("Display FAILED!");
-        while (1) delay(1000);
+
+    // Сканер I2C: некоторые экземпляры Heltec V4 живут на 0x3D, а не 0x3C.
+    // Полоски/мусор на экране часто = неверный адрес или ранний инит.
+    uint8_t oledAddr = SCREEN_ADDRESS;
+    bool addrFound = false;
+    for (uint8_t a = 0x03; a < 0x78; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("[I2C] device found at 0x%02X\n", a);
+            if (a == 0x3C || a == 0x3D) {
+                oledAddr = a;
+                addrFound = true;
+            }
+        }
     }
+    if (!addrFound) {
+        Serial.printf("[OLED] no 0x3C/0x3D found, defaulting to 0x%02X\n", oledAddr);
+    } else {
+        Serial.printf("[OLED] address = 0x%02X\n", oledAddr);
+    }
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
+        // пробуем альтернативный адрес
+        uint8_t alt = (oledAddr == 0x3C) ? 0x3D : 0x3C;
+        if (!display.begin(SSD1306_SWITCHCAPVCC, alt)) {
+            Serial.println("Display FAILED!");
+            while (1) delay(1000);
+        } else {
+            Serial.printf("OLED ok at 0x%02X (alt)\n", alt);
+        }
+    } else {
+        Serial.printf("OLED ok at 0x%02X\n", oledAddr);
+    }
+
+    // Принудительно очищаем 2 раза и снимаем dim — уже фактически
+    // устраняет "полоски" начального мусора на SSD1306
+    display.dim(false);
+    display.clearDisplay();
+    display.display();
+    delay(50);
+    display.clearDisplay();
+    display.display();
     
     display.clearDisplay();
     display.setTextSize(1);
@@ -515,6 +606,7 @@ void setup() {
     display.println("MeshCore");
     display.println("#public + #connections");
     display.println("Listening...");
+    display.print(sysTimeStr);
     display.display();
     
     Serial.println("Listening on #public + #connections...\n");
@@ -543,8 +635,16 @@ void loop() {
     
     // ===== ПРИЁМ =====
     if (isListening) {
+        // Периодический сброс AGC, если не идёт приём пакета прямо сейчас.
+        // Не сбрасываем, пока стоит RX_DONE (иначе потеряем пакет).
+        bool rxPending = (radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) != 0;
+        if (!rxPending && (millis() - lastReArmMs > RADIO_REARM_INTERVAL_MS)) {
+            rearmRadioAGC();
+            rxPending = (radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) != 0;
+        }
+
         // читать только если радио действительно получило пакет (RX_DONE)
-        if (radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) {
+        if (rxPending) {
             uint8_t buffer[256];
             int state = radio.readData(buffer, sizeof(buffer));
             if (state == RADIOLIB_ERR_NONE) {
@@ -580,6 +680,12 @@ void loop() {
                     if (parsed) lastRxDisplay = millis();
                 }
                 radio.startReceive();
+            } else {
+                // Захват сорвался (CRC и т.п.) — флаг RX_DONE мог остаться,
+                // что приведёт к бесконечному циклу. Сбрасываем флаги и ре-армим.
+                Serial.printf("[RX] readData error %d, re-arming\n", state);
+                radio.clearIrqStatus();
+                rearmRadioAGC();
             }
         }
     }
@@ -593,6 +699,13 @@ void loop() {
             display.setCursor(0, 0);
             display.println("MeshCore listen");
             display.println("Listening...");
+            // часы из системного времени (обновляются каждые 500 мс вместе с экраном)
+            time_t now = time(NULL);
+            struct tm tm_now;
+            localtime_r(&now, &tm_now);
+            char tbuf[32];
+            strftime(tbuf, sizeof(tbuf), "%H:%M:%S  %d.%m", &tm_now);
+            display.println(tbuf);
             display.printf("Pkts: %d\n", packetCount);
             if (lastMessage.length() > 0) {
                 display.printf("Last: %s\n", lastMessage.substring(0, 20).c_str());
