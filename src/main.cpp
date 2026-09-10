@@ -7,6 +7,7 @@
 #include <mbedtls/md.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/base64.h>
+#include <Ed25519.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -49,10 +50,23 @@
 // Имя устройства (идёт в заголовке исходящих сообщений)
 #define DEVICE_NAME "Tr1glav_esp_bot"
 
-// Часовой пояс для отображения локального времени (из BUILD_UNIX_TIME)
-#define LOCAL_TZ "Europe/Moscow"
+// Часовой пояс: фиксированное смещение от UTC (Европа/Москва = UTC+3, без DST).
+// Делаем вручную, т.к. setenv("TZ")/tzset на ESP-IDF капризны, а settimeofday
+// с tz=NULL сбрасывает пояс в UTC.
+#define TZ_OFFSET_HOURS 3
+#define LOCAL_TZ "Europe/Moscow UTC+3"
 
+// ===== ВЫБОР ДРАЙВЕРА OLED =====
+// На новых партиях Heltec V4 стоит SH1106-панель: SSD1306-инит даёт
+// «горизонтальные полосы без текста». Ставим 1 = SH1106 (свой драйвер).
+#define OLED_DRIVER_SH1106 1
+#if OLED_DRIVER_SH1106
+#include "sysoled.h"
+SysOled display(SCREEN_WIDTH, SCREEN_HEIGHT);
+#else
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#endif
+
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 // ===== КАНАЛЫ =====
@@ -82,10 +96,35 @@ bool buttonPressed = false;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastRxDisplay = 0;
 
+// ===== ИДЕНТИЧНОСТЬ НОДЫ ДЛЯ ADVERT =====
+// Advert'ы подписываются Ed25519 (rweather/Crypto) — ровно тот же verify,
+// который используют ноды MeshCore. Ключ стабильный: seed = SHA256(имя).
+uint8_t bot_priv[32];
+uint8_t bot_pub[32];
+
+// Периодичность: direct advert раз в 5 мин, flood advert раз в 30 мин.
+#define ADVERT_PERIOD_MS        (5UL * 60 * 1000)
+#define ADVERT_FLOOD_PERIOD_MS (30UL * 60 * 1000)
+#define ADV_ROUTE_DIRECT 0x02
+#define ADV_ROUTE_FLOOD  0x01
+unsigned long lastDirectAdvertMs = 0;
+unsigned long lastFloodAdvertMs = 0;
+bool advertBootSent = false;
+
+void initAdvertIdentity() {
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+               (const uint8_t*)DEVICE_NAME, strlen(DEVICE_NAME), bot_priv);
+    Ed25519::derivePublicKey(bot_pub, bot_priv);
+    Serial.printf("[ADV] identity pub: ");
+    for (int i = 0; i < 32; i++) Serial.printf("%02X", bot_pub[i]);
+    Serial.println();
+}
+
 // ===== СТРАЖ ЗДОРОВЬЯ LORA =====
 // Как в Dispatcher: периодически сбрасываем AGC (warm sleep -> startReceive),
 // иначе SX1262 со временем глохнет и перестаёт ловить пакеты ("засыпает").
-#define RADIO_REARM_INTERVAL_MS 10000
+// Сброс откладывается, пока идёт активный приём.
+#define RADIO_REARM_INTERVAL_MS 30000
 unsigned long lastReArmMs = 0;
 
 // Warm sleep сбрасывает аналоговый фронтенд (AGC/LNA), затем заново в RX.
@@ -93,7 +132,6 @@ void rearmRadioAGC() {
     radio.sleep();
     radio.startReceive();
     lastReArmMs = millis();
-    Serial.println("[RADIO] AGC reset, RX re-armed");
 }
 
 // ===== ДЕДУПЛИКАЦИЯ (как SimpleMeshTables в MeshCore) =====
@@ -331,6 +369,9 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         lastMessage = message;
     }
 
+    // убираем хвостовые пробелы/переносы (у некоторых клиентов "/ping \n")
+    lastMessage.trim();
+
     // не обрабатываем собственные сообщения (эхо собственного флуда)
     if (lastSender == DEVICE_NAME) return false;
     
@@ -379,6 +420,65 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     return true;
 }
 
+// ===== ОБЩАЯ ПЕРЕДАЧА =====
+// Фем-переключатель + transmit + гарантированный возврат в RX.
+int txFrame(uint8_t* frame, int f) {
+    digitalWrite(FEM_TX_PIN, HIGH);
+    int st = radio.transmit(frame, f);
+    digitalWrite(FEM_TX_PIN, LOW);
+
+    if (st == RADIOLIB_ERR_NONE) {
+        Serial.println("[TX] OK");
+    } else {
+        Serial.printf("[TX] FAILED %d\n", st);
+    }
+
+    // после TX обязательно вернуться в RX; при ошибке — полный ре-арм AGC
+    if (radio.startReceive() != RADIOLIB_ERR_NONE) {
+        rearmRadioAGC();
+    }
+    return st;
+}
+
+// ===== ОТПРАВКА ADVERT =====
+// Пакет: header(тип ADVERT 0x04 | route) + path_len 0 + pub[32] + ts[4]
+//       + signature[64] + app_data. Подпись по pub||ts||app.
+void sendAdvert(uint8_t route_type) {
+    uint8_t app[32];
+    int applen = 0;
+    app[applen++] = 0x80 | 0x01;  // ADV_TYPE_CHAT + имя
+    const char* name = DEVICE_NAME;
+    int nlen = strlen(name);
+    if (nlen > 31) nlen = 31;
+    memcpy(app + applen, name, nlen);
+    applen += nlen;
+
+    uint8_t frame[190];
+    int f = 0;
+    frame[f++] = (uint8_t)((0x04 << 2) | (route_type & 0x03));  // ADVERT | route
+    frame[f++] = 0x00;  // path_len: hash_size=1, 0 хопов
+
+    memcpy(frame + f, bot_pub, 32); f += 32;
+    uint32_t ts = (uint32_t)time(NULL);
+    memcpy(frame + f, &ts, 4); f += 4;
+
+    uint8_t msg[32 + 4 + 32];
+    int mlen = 0;
+    memcpy(msg + mlen, bot_pub, 32); mlen += 32;
+    memcpy(msg + mlen, &ts, 4); mlen += 4;
+    memcpy(msg + mlen, app, applen); mlen += applen;
+
+    uint8_t sig[64];
+    Ed25519::sign(sig, bot_priv, bot_pub, msg, mlen);
+    memcpy(frame + f, sig, 64); f += 64;
+    memcpy(frame + f, app, applen); f += applen;
+
+    Serial.printf("\n[TX ADV] route=%u (%dB)\n", route_type, f);
+    for (int i = 0; i < f; i++) Serial.printf("%02X", frame[i]);
+    Serial.println();
+    txFrame(frame, f);
+}
+
 // ===== ОТПРАВКА GRP_TXT =====
 // Формирует сообщение "DEVICE_NAME: msg" и шлёт флудом (header 0x15, без transport codes).
 bool sendGroupMessageOnChannel(int chIdx, const String& msg) {
@@ -410,21 +510,7 @@ bool sendGroupMessageOnChannel(int chIdx, const String& msg) {
     for (int i = 0; i < f; i++) Serial.printf("%02X", frame[i]);
     Serial.println();
 
-    // FEM на передачу
-    digitalWrite(FEM_TX_PIN, HIGH);
-    int st = radio.transmit(frame, f);
-    digitalWrite(FEM_TX_PIN, LOW);
-
-    if (st == RADIOLIB_ERR_NONE) {
-        Serial.println("[TX] OK");
-    } else {
-        Serial.printf("[TX] FAILED %d\n", st);
-    }
-
-    // после TX обязательно вернуться в RX; при ошибке — полный ре-арм AGC
-    if (radio.startReceive() != RADIOLIB_ERR_NONE) {
-        rearmRadioAGC();
-    }
+    int st = txFrame(frame, f);
     if (st == RADIOLIB_ERR_NONE) {
         return true;
     }
@@ -478,15 +564,13 @@ void initSystemClock() {
     tv.tv_usec = 0;
     settimeofday(&tv, NULL);
 
-    setenv("TZ", LOCAL_TZ, 1);
-    tzset();
-
-    time_t now = time(NULL);
+    // Локальное время считаем вручную: UTC + фиксированное смещение.
+    time_t local = (time_t)BUILD_UNIX_TIME + (time_t)TZ_OFFSET_HOURS * 3600;
     struct tm tm_now;
-    localtime_r(&now, &tm_now);
+    gmtime_r(&local, &tm_now);
     strftime(sysTimeStr, sizeof(sysTimeStr), "%Y-%m-%d %H:%M:%S", &tm_now);
     Serial.printf("[RTC] SysTime set from host: %s (%s)\n", sysTimeStr, LOCAL_TZ);
-    Serial.printf("[RTC] epoch=%lld\n", (long long)now);
+    Serial.printf("[RTC] epoch=%lld\n", (long long)time(NULL));
 }
 
 void setup() {
@@ -522,7 +606,7 @@ void setup() {
     delay(200);
 
     Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(400000);
+    Wire.setClock(100000);   // 400k часть OLED-панелей V4 "мусорит" — снижаем
 
     // Сканер I2C: некоторые экземпляры Heltec V4 живут на 0x3D, а не 0x3C.
     // Полоски/мусор на экране часто = неверный адрес или ранний инит.
@@ -598,8 +682,10 @@ void setup() {
     }
     
     deriveChannels();
+    initAdvertIdentity();
     radio.startReceive();
     isListening = true;
+    lastDirectAdvertMs = lastFloodAdvertMs = millis();
     
     display.clearDisplay();
     display.setCursor(0, 0);
@@ -631,6 +717,22 @@ void loop() {
         }
     } else {
         buttonPressed = false;
+    }
+
+    // ===== ADVERT (периодический) =====
+    if (isListening) {
+        if (!advertBootSent && millis() > 6000) {   // стартовый beacon
+            advertBootSent = true;
+            sendAdvert(ADV_ROUTE_DIRECT);
+        }
+        if (millis() - lastDirectAdvertMs >= ADVERT_PERIOD_MS) {
+            lastDirectAdvertMs = millis();
+            sendAdvert(ADV_ROUTE_DIRECT);
+        }
+        if (millis() - lastFloodAdvertMs >= ADVERT_FLOOD_PERIOD_MS) {
+            lastFloodAdvertMs = millis();
+            sendAdvert(ADV_ROUTE_FLOOD);
+        }
     }
     
     // ===== ПРИЁМ =====
@@ -676,10 +778,11 @@ void loop() {
                         lastRxDisplay = millis();
                     }
 
-                    // не перезатираем экран 5 сек после сообщения
+// не перезатираем экран 5 сек после сообщения
                     if (parsed) lastRxDisplay = millis();
+                    lastReArmMs = millis();  // был приём — сброс AGC откладываем
+                    radio.startReceive();
                 }
-                radio.startReceive();
             } else {
                 // Захват сорвался (CRC и т.п.) — флаг RX_DONE мог остаться,
                 // что приведёт к бесконечному циклу. Сбрасываем флаги и ре-армим.
@@ -700,9 +803,9 @@ void loop() {
             display.println("MeshCore listen");
             display.println("Listening...");
             // часы из системного времени (обновляются каждые 500 мс вместе с экраном)
-            time_t now = time(NULL);
+            time_t now = time(NULL) + (time_t)TZ_OFFSET_HOURS * 3600;
             struct tm tm_now;
-            localtime_r(&now, &tm_now);
+            gmtime_r(&now, &tm_now);
             char tbuf[32];
             strftime(tbuf, sizeof(tbuf), "%H:%M:%S  %d.%m", &tm_now);
             display.println(tbuf);
