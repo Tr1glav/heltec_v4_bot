@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
+#include "cyrillic.h"
 
 // Само обозначение 128x64: видимая область начинается с DDRAM-колонки 0.
 #define SH1106_COL_OFFSET 0
@@ -84,7 +85,13 @@ public:
     else       _buf[idx] &= ~bit;
   }
 
+  // UTF-8 -> CP866 decode hook: ASCII -> classic font, Cyrillic -> 6x8 table.
+  size_t write(uint8_t c) override {
+    return utf8cp866::processByte(*this, _u8, c, 1, 1, 1);
+  }
+
 private:
+  utf8cp866::Decoder _u8;
   static const uint16_t WIDTH = 128;
   static const uint16_t HEIGHT = 64;
 

@@ -1,71 +1,40 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
 #include <SPI.h>
 #include <mbedtls/md.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/base64.h>
 #include <Ed25519.h>
+#include <ed_25519.h>   // Nightcracker ed25519: X25519 key exchange для ответов в личку
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
-// ===== ПИНЫ ДЛЯ HELTEC V4.3 =====
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET   21
-#define SCREEN_ADDRESS 0x3C
-#define SDA_PIN 17
-#define SCL_PIN 18
-#define VEXT_PIN 36
-#define BUTTON_PIN 0
-
-// ===== ПИНЫ LORA (SX1262) =====
-#define LORA_CS   8
-#define LORA_RST  12
-#define LORA_DIO1 14
-#define LORA_BUSY 13
-
-// ===== ПИНЫ SPI =====
-#define LORA_SCK  9
-#define LORA_MISO 11
-#define LORA_MOSI 10
-
-// ===== ПИНЫ FEM (УСИЛИТЕЛЬ KCT8103L) ДЛЯ V4.3 =====
-#define FEM_VCC_PIN 7
-#define FEM_EN_PIN  2
-#define FEM_TX_PIN  5
-
-// ===== MESHCORE ПАРАМЕТРЫ =====
-#define LORA_FREQ 868.731018
-#define LORA_BW   62.5
-#define LORA_SF   8
-#define LORA_CR   7
-#define LORA_SYNC_WORD 0x12
-#define LORA_TX_POWER 10
-#define LORA_PREAMBLE 16
+// Per-board pins (Heltec V4.3 by default), radio params and display driver
+// are mapped here from build_flags — see README / platformio.ini.
+#include "board_config.h"
 
 // Имя устройства (идёт в заголовке исходящих сообщений)
+#ifndef DEVICE_NAME
 #define DEVICE_NAME "Tr1glav_esp_bot"
+#endif
+
+// Hash ноды (этим хэшем приложение адресует ЛИЧНОЕ сообщение) — в MeshCore это
+// просто первый байт Ed25519-публичного ключа устройства (PATH_HASH_SIZE=1).
+// Мы определяем его автоматически из нашего advertise-key; можно переопределить
+// принудительно через -DBOT_ID_HASH=0xNN в platformio.ini.
+#ifdef BOT_ID_HASH
+uint8_t ownShortHash = BOT_ID_HASH;
+#else
+uint8_t ownShortHash = 0xFF;
+#endif
 
 // Часовой пояс: фиксированное смещение от UTC (Европа/Москва = UTC+3, без DST).
 // Делаем вручную, т.к. setenv("TZ")/tzset на ESP-IDF капризны, а settimeofday
 // с tz=NULL сбрасывает пояс в UTC.
 #define TZ_OFFSET_HOURS 3
 #define LOCAL_TZ "Europe/Moscow UTC+3"
-
-// ===== ВЫБОР ДРАЙВЕРА OLED =====
-// На новых партиях Heltec V4 стоит SH1106-панель: SSD1306-инит даёт
-// «горизонтальные полосы без текста». Ставим 1 = SH1106 (свой драйвер).
-#define OLED_DRIVER_SH1106 1
-#if OLED_DRIVER_SH1106
-#include "sysoled.h"
-SysOled display(SCREEN_WIDTH, SCREEN_HEIGHT);
-#else
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-#endif
 
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
@@ -96,11 +65,66 @@ bool buttonPressed = false;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastRxDisplay = 0;
 
+// ===== ОТВЕТ НА /ping: обратный маршрут + ретрай =====
+// Путь, которым к нам дошёл последний пакет (в порядке «от источника»),
+// и место/текст ответа для повтора через ~250 мс.
+#define MAX_REPLY_PATH 63
+uint8_t replyPath[MAX_REPLY_PATH];
+uint8_t replyHopCount = 0;
+uint8_t replyHashSize = 1;
+String pingReplyText = "";
+uint8_t pingReplyFrame[300];
+int pingReplyFrameLen = 0;
+int pingReplyChannel = 0;
+uint8_t pingReplyEnc[256];      // зашифрованный блок ответа — общий для
+int pingReplyEncLen = 0;        // первого (direct) и повторного (flood) кадра
+bool replyPendingRetransmit = false;
+unsigned long replyRetransmitAt = 0;
+
+// ===== ОТВЕТ В ЛИЧКУ (TXT_MSG) =====
+// Кадр приватного ответа хранится целиком: повтор 250 мс — той же копией.
+uint8_t dmSrcHash = 0;
+uint8_t dmReplyFrame[300];
+int dmReplyFrameLen = 0;
+bool dmReplyPendingRetransmit = false;
+unsigned long dmReplyRetransmitAt = 0;
+
+// ===== КЭШ ПУБЛИЧНЫХ КЛЮЧЕЙ НОД =====
+// Для шифрования ответа в личку нужен ПОЛНЫЙ pubkey отправителя (32 Б), а в
+// TXT_MSG его нет — только 1-байтовый хэш. Собираем ключи из ADVERT-пакетов.
+#define PEER_CACHE_MAX 8
+struct PeerEntry {
+    uint8_t hash;
+    uint8_t pub[32];
+    uint32_t last_seen;
+};
+PeerEntry peerCache[PEER_CACHE_MAX];
+
+uint8_t* findPeerPub(uint8_t hash) {
+    for (int i = 0; i < PEER_CACHE_MAX; i++) {
+        if (peerCache[i].hash == hash && peerCache[i].pub[0] != 0) return peerCache[i].pub;
+    }
+    return NULL;
+}
+
+void rememberPeerPub(uint8_t hash, const uint8_t* pub) {
+    int slot = -1;
+    uint32_t oldest = 0xFFFFFFFF;
+    for (int i = 0; i < PEER_CACHE_MAX; i++) {
+        if (peerCache[i].hash == hash) { slot = i; break; }
+        if (peerCache[i].last_seen < oldest) { oldest = peerCache[i].last_seen; slot = i; }
+    }
+    peerCache[slot].hash = hash;
+    memcpy(peerCache[slot].pub, pub, 32);
+    peerCache[slot].last_seen = millis();
+}
+
 // ===== ИДЕНТИЧНОСТЬ НОДЫ ДЛЯ ADVERT =====
 // Advert'ы подписываются Ed25519 (rweather/Crypto) — ровно тот же verify,
 // который используют ноды MeshCore. Ключ стабильный: seed = SHA256(имя).
 uint8_t bot_priv[32];
 uint8_t bot_pub[32];
+uint8_t bot_prv64[64];   // ed25519 private key (seed-расширенный) для X25519
 
 // Периодичность: direct advert раз в 5 мин, flood advert раз в 30 мин.
 #define ADVERT_PERIOD_MS        (5UL * 60 * 1000)
@@ -115,9 +139,21 @@ void initAdvertIdentity() {
     mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
                (const uint8_t*)DEVICE_NAME, strlen(DEVICE_NAME), bot_priv);
     Ed25519::derivePublicKey(bot_pub, bot_priv);
+
+    // Ed25519 private key (64 Б) для X25519-обмена при ответе в личку.
+    // seed = тот же bot_priv, pub должен совпасть с bot_pub (RFC8032).
+    uint8_t pub_check[32];
+    ed25519_create_keypair(pub_check, bot_prv64, bot_priv);
+    if (memcmp(pub_check, bot_pub, 32) != 0) {
+        Serial.println("[ADV] WARNING: ed25519 pub mismatch (!)");
+    }
+
+    #ifndef BOT_ID_HASH
+    ownShortHash = bot_pub[0];   // авто: hash ноды = первый байт pubkey
+    #endif
     Serial.printf("[ADV] identity pub: ");
     for (int i = 0; i < 32; i++) Serial.printf("%02X", bot_pub[i]);
-    Serial.println();
+    Serial.printf(", own short hash: 0x%02X\n", ownShortHash);
 }
 
 // ===== СТРАЖ ЗДОРОВЬЯ LORA =====
@@ -274,7 +310,17 @@ String decryptGroupText(const uint8_t* secret32, uint8_t* mac, uint8_t* cipherte
 }
 
 // ===== ОТВЕТ НА /ping =====
-bool sendGroupMessageOnChannel(int chIdx, const String& msg);  // fwd decl
+int buildGroupEnc(int chIdx, const String& msg, uint8_t* enc);  // fwd decl
+int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxlen,
+                         const uint8_t* enc_in = NULL, int enc_in_len = 0);  // fwd decl
+int buildGroupFrameReturnPath(int chIdx, const String& msg, const uint8_t* path,
+                              uint8_t hop_count, uint8_t hash_size,
+                              uint8_t* frame, int maxlen,
+                              const uint8_t* enc_in = NULL, int enc_in_len = 0);  // fwd decl
+int sendFrame(int chIdx, const uint8_t* frame, int f);  // fwd decl
+int txFrame(uint8_t* frame, int f);  // fwd decl
+int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
+                          const String& msg, uint8_t* frame, int maxlen);  // fwd decl
 // Формат ответа как в bot.py: "hops:direct" либо "hops:N, route:aa → bb → cc"
 void buildPingReply(char* out, size_t outlen, const uint8_t* path, uint8_t hop_count, uint8_t path_hash_size) {
     if (hop_count == 0) {
@@ -303,7 +349,40 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     uint8_t payload_type = (header >> 2) & 0x0F;
     uint8_t route_type = header & 0x03;
     
-    if (payload_type != 0x05) return false;  // только GRP_TXT
+    // GRP_TXT (0x05) — групповые сообщения, TXT_MSG (0x02) — личные (ДМ).
+    if (payload_type != 0x05 && payload_type != 0x02) {
+        // ADVERT (0x04): кэшируем публичные ключи нод — без них не ответить
+        // в личку (нужен полный pubkey для X25519). В кадре: [pub 32][ts 4][sig 64][app...].
+        if (payload_type == 0x04) {
+            int o = 1;
+            if (route_type == 0x00 || route_type == 0x03) o += 4;
+            if (o < len) {
+                uint8_t pl = data[o++];
+                o += (pl & 0x3F) * (((pl >> 6) & 3) + 1);   // path bytes
+                if (o + 32 + 4 + 64 <= len) {
+                    uint8_t* pub = &data[o];
+                    uint8_t* ts  = &data[o + 32];
+                    uint8_t* sig = &data[o + 36];
+                    uint8_t* app = &data[o + 100];
+                    int applen = len - (o + 100);
+                    if (applen < 0) applen = 0;
+                    if (applen > 64) applen = 64;
+                    uint8_t msg[32 + 4 + 64];
+                    int mlen = 0;
+                    memcpy(&msg[mlen], pub, 32); mlen += 32;
+                    memcpy(&msg[mlen], ts, 4); mlen += 4;
+                    memcpy(&msg[mlen], app, applen); mlen += applen;
+                    if (Ed25519::verify(sig, pub, msg, mlen)) {
+                        rememberPeerPub(pub[0], pub);
+                        Serial.printf("[ADV] cached pubkey for <%02X>\n", pub[0]);
+                    } else {
+                        Serial.printf("[ADV] bad signature for <%02X>\n", pub[0]);
+                    }
+                }
+            }
+        }
+        return false;
+    }
     
     int offset = 1;
     if (route_type == 0x00 || route_type == 0x03) offset += 4;  // transport codes
@@ -328,47 +407,83 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             strcat(lastPath, tmp);
         }
     }
+
+    // копия пути для обратного маршрута ответа (хэши ретрансляторов)
+    replyHopCount = (hop_count > 0 && offset + hop_count * path_hash_size <= len) ? hop_count : 0;
+    if (hop_count > 0 && offset + hop_count * path_hash_size <= len) {
+        replyHashSize = path_hash_size;
+        memcpy(replyPath, &data[offset], hop_count * path_hash_size);
+    }
     offset += hop_count * path_hash_size;
     
     if (offset >= len) return false;
-    uint8_t channel_hash = data[offset++];
-    if (offset + 2 > len) return false;
     
-    // ищем канал по хэшу
+    // === Разбор тела пакета: ДМ (TXT_MSG) или групповое (GRP_TXT) ===
+    bool personalDm = false;
     int chIdx = -1;
-    for (int i = 0; i < numChannels; i++) {
-        if (channel_hash == channels[i].hash) { chIdx = i; break; }
-    }
-    if (chIdx < 0) return false;
-    lastChannelName = channels[chIdx].name;
     
-    uint8_t* mac = &data[offset];         // 2 байта MAC
-    uint8_t* ciphertext = &data[offset + 2];  // шифротекст после MAC
-    int ciphertext_len = len - (offset + 2);
-    
-    // обрезаем до кратного 16
-    int ciphertext_len_trunc = ciphertext_len & ~15;
-    if (ciphertext_len_trunc <= 0) return false;
-    String message = decryptGroupText(channels[chIdx].secret, mac, ciphertext, ciphertext_len_trunc);
-    
-    if (message.length() == 0) {
-        Serial.println("[!] HMAC не совпал или пустое сообщение");
-        return false;
+    if (payload_type == 0x02) {
+        // Личное сообщение: payload = [dest_hash 1B][src_hash 1B][MAC 2B][cipher...].
+        // Шифруется общим секретом X25519 — текст без ключей ноды не прочитать,
+        // но dest_hash (первый байт) показывает, адресовано ли сообщение НАМ.
+        if (offset + 2 > len) return false;
+        uint8_t dest_hash = data[offset];
+        uint8_t src_hash  = data[offset + 1];
+        if (dest_hash != ownShortHash) {
+            Serial.printf("[DM] dest=%02X (не нам, наш=%02X) src=%02X, игнор\n", dest_hash, ownShortHash, src_hash);
+            return false;
+        }
+        personalDm = true;
+        dmSrcHash = src_hash;
+        
+        // В ДМ нет хэша канала — отвечаем в #connections (личный канал).
+        chIdx = 1;
+        if (chIdx >= numChannels) chIdx = 0;
+        lastChannelName = "DM #connections";
+        
+        char senderHex[8];
+        snprintf(senderHex, sizeof(senderHex), "<%02X>", src_hash);
+        lastSender = senderHex;
+        lastMessage = "(личное сообщение)";
+    } else {
+        uint8_t channel_hash = data[offset++];
+        if (offset + 2 > len) return false;
+        
+        // ищем канал по хэшу
+        for (int i = 0; i < numChannels; i++) {
+            if (channel_hash == channels[i].hash) { chIdx = i; break; }
+        }
+        if (chIdx < 0) return false;
+        lastChannelName = channels[chIdx].name;
+        
+        uint8_t* mac = &data[offset];         // 2 байта MAC
+        uint8_t* ciphertext = &data[offset + 2];  // шифротекст после MAC
+        int ciphertext_len = len - (offset + 2);
+        
+        // обрезаем до кратного 16
+        int ciphertext_len_trunc = ciphertext_len & ~15;
+        if (ciphertext_len_trunc <= 0) return false;
+        String message = decryptGroupText(channels[chIdx].secret, mac, ciphertext, ciphertext_len_trunc);
+        
+        if (message.length() == 0) {
+            Serial.println("[!] HMAC не совпал или пустое сообщение");
+            return false;
+        }
+        
+        int colonPos = message.indexOf(": ");
+        if (colonPos > 0) {
+            lastSender = message.substring(0, colonPos);
+            lastMessage = message.substring(colonPos + 2);
+        } else {
+            lastSender = "?";
+            lastMessage = message;
+        }
     }
     
     packetCount++;
     lastRSSI = radio.getRSSI();
     lastSNR = radio.getSNR();
     
-    int colonPos = message.indexOf(": ");
-    if (colonPos > 0) {
-        lastSender = message.substring(0, colonPos);
-        lastMessage = message.substring(colonPos + 2);
-    } else {
-        lastSender = "?";
-        lastMessage = message;
-    }
-
     // убираем хвостовые пробелы/переносы (у некоторых клиентов "/ping \n")
     lastMessage.trim();
 
@@ -408,13 +523,73 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     display.println(showMsg);
     display.display();
 
-    // === ОТВЕТ НА /ping В КАНАЛЕ #connections ===
-    if (chIdx == 1 && lastMessage == "/ping") {
+    // === ОТВЕТ НА СООБЩЕНИЕ ===
+    // - Личное (TXT_MSG) с dest_hash == BOT_ID_HASH: отвечаем ВСЕГДА, как на /ping.
+    // - Групповой GRP_TXT: на текст "/ping" в #connections либо на любое
+    //   DIRECT-сообщение, адресованное устройству.
+    bool isDirect = (route_type == 0x02 || route_type == 0x03);
+    if (personalDm || (chIdx == 1 && lastMessage == "/ping") || isDirect) {
+        // Пауза перед ответом: даём отправителю выйти из TX и перейти в RX,
+        // иначе его приёмник «задирается» на старт нашей передачи (desense).
+        delay(250);
+
         char reply[100];
-        buildPingReply(reply, sizeof(reply), path_bytes, hop_count, path_hash_size);
+        buildPingReply(reply, sizeof(reply), replyPath, replyHopCount, replyHashSize);
         Serial.printf("[PING] reply: %s\n", reply);
-        String full = String(reply);
-        sendGroupMessageOnChannel(chIdx, full);
+        pingReplyText = String(reply);
+
+        // === Личное сообщение: ответ уходит В ЛИЧКУ (TXT_MSG), а не в канал ===
+        if (personalDm) {
+            uint8_t* peerPub = findPeerPub(dmSrcHash);
+            if (peerPub != NULL) {
+                int dl = buildPrivateTextFrame(dmSrcHash, peerPub, pingReplyText,
+                                               dmReplyFrame, sizeof(dmReplyFrame));
+                if (dl > 0) {
+                    dmReplyFrameLen = dl;
+                    Serial.printf("\n[TX DM] to <%02X>: %s (%dB)\n", dmSrcHash, pingReplyText.c_str(), dl);
+                    for (int i = 0; i < dl; i++) Serial.printf("%02X", dmReplyFrame[i]);
+                    Serial.println();
+                    if (txFrame(dmReplyFrame, dl) == RADIOLIB_ERR_NONE) {
+                        dmReplyPendingRetransmit = true;
+                        dmReplyRetransmitAt = millis() + 250;   // повтор лички
+                    }
+                }
+            } else {
+                Serial.printf("[DM] pubkey <%02X> неизвестен (нет advert) — ответ не отправлен\n", dmSrcHash);
+            }
+            return true;
+        }
+
+        // Шифруем ответ ОДИН раз и храним блок: первый кадр уходит DIRECT по
+        // обратному маршруту (если путь был), повтор через ~250 мс — флудом.
+        // Оба кадра несут тот же зашифрованный блок (один timestamp) =>
+        // приёмник дедуплицирует их как повторы одного сообщения.
+        int enclen = buildGroupEnc(chIdx, pingReplyText, pingReplyEnc);
+        if (enclen <= 0) return true;
+        pingReplyEncLen = enclen;
+
+        int f = 0;
+        bool viaReturnPath = (replyHopCount > 0);
+        if (viaReturnPath) {
+            f = buildGroupFrameReturnPath(chIdx, pingReplyText, replyPath,
+                                          replyHopCount, replyHashSize,
+                                          pingReplyFrame, sizeof(pingReplyFrame),
+                                          pingReplyEnc, pingReplyEncLen);
+        } else {
+            f = buildGroupFrameFlood(chIdx, pingReplyText, pingReplyFrame, sizeof(pingReplyFrame),
+                                     pingReplyEnc, pingReplyEncLen);
+        }
+        if (f > 0) {
+            pingReplyFrameLen = f;
+            pingReplyChannel = chIdx;
+            Serial.printf("\n[TX] %s: %s (%dB, %s)\n", channels[chIdx].name,
+                          (DEVICE_NAME ": " + pingReplyText).c_str(), f,
+                          viaReturnPath ? "direct" : "flood");
+            if (sendFrame(chIdx, pingReplyFrame, pingReplyFrameLen) == RADIOLIB_ERR_NONE) {
+                replyPendingRetransmit = true;
+                replyRetransmitAt = millis() + 250;   // повтор на случай desense ближнего узла
+            }
+        }
     }
     
     return true;
@@ -423,9 +598,13 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 // ===== ОБЩАЯ ПЕРЕДАЧА =====
 // Фем-переключатель + transmit + гарантированный возврат в RX.
 int txFrame(uint8_t* frame, int f) {
+    #if HAS_FEM
     digitalWrite(FEM_TX_PIN, HIGH);
+    #endif
     int st = radio.transmit(frame, f);
+    #if HAS_FEM
     digitalWrite(FEM_TX_PIN, LOW);
+    #endif
 
     if (st == RADIOLIB_ERR_NONE) {
         Serial.println("[TX] OK");
@@ -480,9 +659,10 @@ void sendAdvert(uint8_t route_type) {
 }
 
 // ===== ОТПРАВКА GRP_TXT =====
-// Формирует сообщение "DEVICE_NAME: msg" и шлёт флудом (header 0x15, без transport codes).
-bool sendGroupMessageOnChannel(int chIdx, const String& msg) {
-    if (chIdx < 0 || chIdx >= numChannels) return false;
+// Общая часть для обоих вариантов: формирует "DEVICE_NAME: msg",
+// шифрует по ключу канала и возвращает зашифрованный блок.
+int buildGroupEnc(int chIdx, const String& msg, uint8_t* enc) {
+    if (chIdx < 0 || chIdx >= numChannels) return 0;
     MeshChannel& ch = channels[chIdx];
 
     uint8_t plaintext[256];
@@ -495,26 +675,107 @@ bool sendGroupMessageOnChannel(int chIdx, const String& msg) {
     size_t mlen = min((size_t)200, msg.length());
     memcpy(plaintext + plen, msg.c_str(), mlen); plen += mlen;
 
-    uint8_t enc[256];
-    int enclen = encryptGroupText(ch.secret, enc, plaintext, plen);
-    if (enclen <= 0) return false;
+    return encryptGroupText(ch.secret, enc, plaintext, plen);
+}
 
-    uint8_t frame[300];
+// Флуд-броадкаст (header 0x15, path_len = 0; ретрансляторы сами достроят путь).
+// Если enc_in задан — используем готовый зашифрованный блок (тот же timestamp),
+// иначе шифруем заново. Только СОБИРАЕТ кадр; отправка — sendFrame().
+int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxlen,
+                         const uint8_t* enc_in, int enc_in_len) {
+    if (chIdx < 0 || chIdx >= numChannels) return 0;
+    uint8_t enc[256];
+    int enclen;
+    if (enc_in != NULL && enc_in_len > 0) {
+        enclen = min(enc_in_len, (int)sizeof(enc));
+        memcpy(enc, enc_in, enclen);
+    } else {
+        enclen = buildGroupEnc(chIdx, msg, enc);
+    }
+    if (enclen <= 0 || 3 + enclen > maxlen) return 0;
+
     int f = 0;
     frame[f++] = 0x15;        // GRP_TXT | ROUTE_TYPE_FLOOD
     frame[f++] = 0x00;        // path_len: hash_size=1, 0 хопов (построится ретрансляторами)
-    frame[f++] = ch.hash;     // channel hash
+    frame[f++] = channels[chIdx].hash;
     memcpy(frame + f, enc, enclen); f += enclen;
+    return f;
+}
 
-    Serial.printf("\n[TX] %s: %s (%dB)\n", ch.name, (DEVICE_NAME ": " + msg).c_str(), f);
+// Ответ ПО ОБРАТНОМУ МАРШРУТУ (header 0x16 = GRP_TXT | ROUTE_TYPE_DIRECT).
+// Путь, которым пришёл запрос, разворачивается: первый хэш в кадре —
+// ближайший к нам ретранслятор, дальше до источника, который получает
+// пакет как zero-hop. Ретрансляторы пересылают DIRECT-пакет, только если
+// первый хэш пути совпадает с их собственным. Только СОБИРАЕТ кадр.
+int buildGroupFrameReturnPath(int chIdx, const String& msg,
+                              const uint8_t* path, uint8_t hop_count, uint8_t hash_size,
+                              uint8_t* frame, int maxlen,
+                              const uint8_t* enc_in, int enc_in_len) {
+    if (chIdx < 0 || chIdx >= numChannels) return 0;
+    if (hop_count == 0 || hop_count > 0x3F || hash_size == 0 || hash_size > 8) return 0;
+    uint8_t enc[256];
+    int enclen;
+    if (enc_in != NULL && enc_in_len > 0) {
+        enclen = min(enc_in_len, (int)sizeof(enc));
+        memcpy(enc, enc_in, enclen);
+    } else {
+        enclen = buildGroupEnc(chIdx, msg, enc);
+    }
+    if (enclen <= 0) return 0;
+
+    int pathBytes = hop_count * hash_size;
+    if (3 + pathBytes + enclen > maxlen) return 0;
+
+    int f = 0;
+    frame[f++] = 0x16;        // GRP_TXT | ROUTE_TYPE_DIRECT
+    frame[f++] = (uint8_t)(((hash_size - 1) << 6) | hop_count);
+    for (int h = 0; h < hop_count; h++) {
+        int src = (hop_count - 1 - h) * hash_size;   // разворачиваем путь
+        for (int b = 0; b < hash_size; b++) frame[f++] = path[src + b];
+    }
+    frame[f++] = channels[chIdx].hash;
+    memcpy(frame + f, enc, enclen); f += enclen;
+    return f;
+}
+
+// ===== ОТПРАВКА TXT_MSG (ответ В ЛИЧКУ) =====
+// Кадр: header 0x09 (TXT_MSG|FLOOD) + path_len 0x40 +
+//       payload[dest_hash 1B][src_hash 1B][MAC 2B][cipher...]
+// Данные: [ts u32 LE][attempt 1B][text\0]; шифр AES-128-ECB + HMAC-SHA256
+// по X25519 shared secret (ed25519_key_exchange) — как Utils::encryptThenMAC.
+int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
+                          const String& msg, uint8_t* frame, int maxlen) {
+    uint8_t secret[32];
+    ed25519_key_exchange(secret, dest_pub, bot_prv64);
+
+    uint8_t data[128];
+    int dlen = 0;
+    uint32_t ts = (uint32_t)time(NULL) * 1000 + (millis() % 1000);
+    memcpy(data, &ts, 4); dlen += 4;
+    data[dlen++] = 0;                        // attempt = 0
+    size_t ml = min((size_t)96, msg.length());
+    memcpy(data + dlen, msg.c_str(), ml); dlen += ml;
+    data[dlen++] = 0;                        // null terminator
+
+    uint8_t enc[128];
+    int enclen = encryptGroupText(secret, enc, data, dlen);   // [MAC 2B][cipher]
+    if (enclen <= 0 || 4 + enclen > maxlen) return 0;
+
+    int f = 0;
+    frame[f++] = 0x09;                       // TXT_MSG | ROUTE_TYPE_FLOOD
+    frame[f++] = 0x40;                       // path_len: hash_size=2, 0 хопов
+    frame[f++] = dest_hash;
+    frame[f++] = ownShortHash;
+    memcpy(frame + f, enc, enclen); f += enclen;
+    return f;
+}
+
+// Отправка уже собранного кадра + hex-лог. Возвращает статус RadioLib.
+int sendFrame(int chIdx, const uint8_t* frame, int f) {
+    if (chIdx < 0 || chIdx >= numChannels) return RADIOLIB_ERR_UNKNOWN;
     for (int i = 0; i < f; i++) Serial.printf("%02X", frame[i]);
     Serial.println();
-
-    int st = txFrame(frame, f);
-    if (st == RADIOLIB_ERR_NONE) {
-        return true;
-    }
-    return false;
+    return txFrame((uint8_t*)frame, f);
 }
 
 // ===== ИНИЦИАЛИЗАЦИЯ LORA =====
@@ -533,15 +794,25 @@ bool initLoRa() {
         Serial.println("LoRa OK (TCXO from macro)");
         radio.setCRC(true);
 
-        // SX1262 настройки для Heltec V4 (аналог MeshCore std_init)
+        // SX1262-специфичные настройки включаются build_flags'ами
+        // (см. platformio.ini / board_config.h), чтобы на других платах
+        // не применять опции, нужные только Heltec V4.
+        #ifdef SX126X_DIO2_AS_RF_SWITCH
         radio.setDio2AsRfSwitch(true);
+        #endif
+        #ifdef SX126X_RX_BOOSTED_GAIN
         radio.setRxBoostedGainMode(true);
-        radio.setCurrentLimit(140);
+        #endif
+        #ifdef SX126X_CURRENT_LIMIT
+        radio.setCurrentLimit(SX126X_CURRENT_LIMIT);
+        #endif
+        #ifdef SX126X_REGISTER_PATCH
         // патч регистра 0x8B5 для улучшенного приёма на Heltec v4
         uint8_t r_data = 0;
         radio.readRegister(0x8B5, &r_data, 1);
         r_data |= 0x01;
         radio.writeRegister(0x8B5, &r_data, 1);
+        #endif
         return true;
     }
     
@@ -580,12 +851,15 @@ void setup() {
     
     initSystemClock();
     
-    // ===== ПИТАНИЕ OLED =====
+    // ===== ПИТАНИЕ ПЕРИФЕРИИ (VEXT) =====
+    #if HAS_OLED && defined(VEXT_PIN)
     pinMode(VEXT_PIN, OUTPUT);
-    digitalWrite(VEXT_PIN, LOW);
+    digitalWrite(VEXT_PIN, VEXT_EN_ACTIVE);
     delay(300);
+    #endif
     
-    // ===== FEM =====
+    // ===== FEM (усилитель KCT8103L на V4) =====
+    #if HAS_FEM
     Serial.println("Init FEM...");
     pinMode(FEM_VCC_PIN, OUTPUT);
     pinMode(FEM_EN_PIN, OUTPUT);
@@ -597,15 +871,21 @@ void setup() {
     digitalWrite(FEM_TX_PIN, LOW);  // RX
     delay(10);
     Serial.println("FEM OK");
+    #endif
     
     // ===== OLED =====
+    #if HAS_OLED
     pinMode(OLED_RESET, OUTPUT);
     digitalWrite(OLED_RESET, LOW);
     delay(10);
     digitalWrite(OLED_RESET, HIGH);
     delay(200);
 
+    #if defined(SDA_PIN) && defined(SCL_PIN)
     Wire.begin(SDA_PIN, SCL_PIN);
+    #else
+    Wire.begin();
+    #endif
     Wire.setClock(100000);   // 400k часть OLED-панелей V4 "мусорит" — снижаем
 
     // Сканер I2C: некоторые экземпляры Heltec V4 живут на 0x3D, а не 0x3C.
@@ -656,8 +936,11 @@ void setup() {
     display.println("MeshCore");
     display.println("V4.3 init...");
     display.display();
+    #endif
     
+    #if BUTTON_PIN >= 0
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+    #endif
     
     // ===== SPI =====
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -671,10 +954,12 @@ void setup() {
     
     // ===== LORA =====
     if (!initLoRa()) {
+        #if HAS_OLED
         display.clearDisplay();
         display.setCursor(0, 0);
         display.println("LoRa ERROR!");
         display.display();
+        #endif
         while (1) {
             delay(1000);
             Serial.println("LoRa init FAILED");
@@ -687,6 +972,7 @@ void setup() {
     isListening = true;
     lastDirectAdvertMs = lastFloodAdvertMs = millis();
     
+    #if HAS_OLED
     display.clearDisplay();
     display.setCursor(0, 0);
     display.println("MeshCore");
@@ -694,13 +980,14 @@ void setup() {
     display.println("Listening...");
     display.print(sysTimeStr);
     display.display();
+    #endif
     
     Serial.println("Listening on #public + #connections...\n");
 }
 
 void loop() {
     // ===== КНОПКА =====
-    if (digitalRead(BUTTON_PIN) == LOW) {
+    if (BUTTON_PIN >= 0 && digitalRead(BUTTON_PIN) == LOW) {
         if (!buttonPressed) {
             buttonPressed = true;
             isListening = !isListening;
@@ -732,6 +1019,35 @@ void loop() {
         if (millis() - lastFloodAdvertMs >= ADVERT_FLOOD_PERIOD_MS) {
             lastFloodAdvertMs = millis();
             sendAdvert(ADV_ROUTE_FLOOD);
+        }
+    }
+
+    // ===== РЕТРАЙ ОТВЕТА /ping (повтор через ~250 мс — уже ФЛУДОМ) =====
+    if (isListening && replyPendingRetransmit && millis() >= replyRetransmitAt) {
+        replyPendingRetransmit = false;
+        if (pingReplyFrameLen > 0) {
+            // Тот же зашифрованный блок (тот же timestamp) => копии одного сообщения.
+            uint8_t flood[300];
+            int fl = buildGroupFrameFlood(pingReplyChannel, pingReplyText, flood, sizeof(flood),
+                                          pingReplyEnc, pingReplyEncLen);
+            if (fl > 0) {
+                Serial.printf("\n[PING] retransmit reply (flood): %s\n", pingReplyText.c_str());
+                Serial.printf("[TX] %s: %s (%dB)\n", channels[pingReplyChannel].name,
+                              (DEVICE_NAME ": " + pingReplyText).c_str(), fl);
+                sendFrame(pingReplyChannel, flood, fl);
+            }
+        }
+    }
+
+    // ===== РЕТРАЙ ОТВЕТА В ЛИЧКУ (повтор тех же байт через ~250 мс) =====
+    if (isListening && dmReplyPendingRetransmit && millis() >= dmReplyRetransmitAt) {
+        dmReplyPendingRetransmit = false;
+        if (dmReplyFrameLen > 0) {
+            Serial.printf("\n[DM] retransmit reply to <%02X>: %s (%dB)\n",
+                          dmSrcHash, pingReplyText.c_str(), dmReplyFrameLen);
+            for (int i = 0; i < dmReplyFrameLen; i++) Serial.printf("%02X", dmReplyFrame[i]);
+            Serial.println();
+            txFrame(dmReplyFrame, dmReplyFrameLen);
         }
     }
     

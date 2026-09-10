@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Generate a 6x8 CP866 Cyrillic glyph table + preview for the OLED.
+
+Reads a monospace TTF (DejaVu Sans Mono) off the system, rasterises the
+Cyrillic alphabet into 6x8 pixel bitmaps (1 bit/px, MSB = leftmost column),
+and emits src/cyrillic_glyphs.h + a magnified preview PNG for visual check.
+
+Usage: python3 scripts/gen_cyrillic_font.py
+"""
+
+import os
+import struct
+from PIL import Image, ImageFont
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FONT_PATH = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"
+OUT_DIR = os.path.join(ROOT, "src")
+OUT_H = os.path.join(OUT_DIR, "cyrillic_glyphs.h")
+PREVIEW = os.path.join(OUT_DIR, "_preview.png")
+
+CELL_W, CELL_H = 6, 8        # target glyph box
+FONT_PX = 10                 # render size in pixels (near-native, clean strokes)
+THRESHOLD = 110              # 0-255, above = ink
+SCALE = 4                    # preview magnification
+
+
+def cp866_map():
+    """unicode codepoint -> CP866 byte (verified with iconv)."""
+    m = {}
+    for i, cp in enumerate(range(0x0410, 0x0410 + 32)):   # А-Я
+        m[cp] = 0x80 + i
+    for i, cp in enumerate(range(0x0430, 0x0430 + 16)):   # а-п
+        m[cp] = 0xA0 + i
+    for i, cp in enumerate(range(0x0440, 0x0440 + 16)):   # р-я
+        m[cp] = 0xE0 + i
+    m[0x0401] = 0xF0                                     # Ё
+    m[0x0451] = 0xF1                                     # ё
+    return m
+
+
+def raster_glyph(font, char):
+    """Return a 2D bitmap for a single char (grayscale)."""
+    from PIL import ImageDraw
+    img = Image.new("L", (CELL_W * 4, CELL_H * 4), 0)
+    ImageDraw.Draw(img).text((2, 1), char, font=font, fill=255)
+    w, h = img.size
+    arr = list(img.getdata())
+    return [[arr[y * w + x] for x in range(w)] for y in range(h)]
+
+
+def crop_bmp(bmp):
+    """Crop a grayscale bitmap to its content bbox."""
+    h = len(bmp)
+    if h == 0:
+        return 0, 0, 0, 0
+    w = len(bmp[0])
+    ys = [y for y in range(h) if any(bmp[y])]
+    xs = [x for x in range(w) if any(bmp[y][x] for y in range(h))]
+    if not ys or not xs:
+        return 0, 0, 0, 0
+    return min(xs), max(xs) + 1, min(ys), max(ys) + 1
+
+
+def bmp_to_img(bmp, x0, x1, y0, y1):
+    img = Image.new("L", (x1 - x0, y1 - y0), 0)
+    img.putdata([bmp[y][x] for y in range(y0, y1) for x in range(x0, x1)])
+    return img
+
+
+def glyph_to_rows(bmp):
+    """Crop, place into CELL_W x CELL_H. Oversized glyphs (Й/ё/ф ...) are
+    downscaled, the rest keeps crisp native strokes. Bottom-aligned so
+    descenders sit on the final row."""
+    x0, x1, y0, y1 = crop_bmp(bmp)
+    gw, gh = x1 - x0, y1 - y0
+    if gw == 0 or gh == 0:
+        return [0] * CELL_H
+
+    if gh > CELL_H or gw > CELL_W:
+        img = bmp_to_img(bmp, x0, x1, y0, y1).resize((CELL_W, CELL_H), Image.LANCZOS)
+        arr = list(img.getdata())
+        cell = [[1 if arr[y * CELL_W + x] > THRESHOLD else 0
+                 for x in range(CELL_W)] for y in range(CELL_H)]
+        return [sum((cell[y][x] << (7 - x)) for x in range(CELL_W)) for y in range(CELL_H)]
+
+    cell = [[0] * CELL_W for _ in range(CELL_H)]
+    dx = (CELL_W - gw) // 2
+    dy = CELL_H - gh
+    for y in range(gh):
+        for x in range(gw):
+            cell[dy + y][dx + x] = 1 if bmp[y0 + y][x0 + x] > THRESHOLD else 0
+    return [sum((cell[y][x] << (7 - x)) for x in range(CELL_W)) for y in range(CELL_H)]
+
+
+def build():
+    font = ImageFont.truetype(FONT_PATH, FONT_PX)
+    table = cp866_map()
+
+    glyphs = {}      # cp866 byte -> rows
+    for cp, c86 in sorted(table.items(), key=lambda kv: kv[1]):
+        bmp = raster_glyph(font, chr(cp))
+        glyphs[c86] = glyph_to_rows(bmp)
+
+    # blocks with a sample line that also has extra chars no extra
+    lines = [
+        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+    ]
+
+    # ---- preview ----
+    pw, ph = (len(lines[0]) * CELL_W, len(lines) * CELL_H)
+    pm = Image.new("L", (pw * SCALE, ph * SCALE), 0)
+    for ly, text in enumerate(lines):
+        for ci, ch in enumerate(text):
+            rows = glyphs[table[ord(ch)]]
+            for y in range(CELL_H):
+                for x in range(CELL_W):
+                    if rows[y] & (0x80 >> x):
+                        for yy in range(SCALE):
+                            for xx in range(SCALE):
+                                pm.putpixel(
+                                    ((ci * CELL_W + x) * SCALE + xx,
+                                     (ly * CELL_H + y) * SCALE + yy), 255)
+    pm.save(PREVIEW)
+
+    # ---- header ----
+    body = ["static const uint8_t CYRILLIC_CP866_GLYPHS[][8] = {"]
+    for c86 in range(0x80, 0xF2):
+        rows = glyphs.get(c86, [0] * CELL_H)
+        body.append("  { %s }," % ", ".join("0x%02X" % r for r in rows))
+    body.append("};")
+    body.append("")
+    body.append("// glyph index = CP866 byte - 0x80 (0x80..0xF1 valid); blanks elsewhere")
+    body.append("#define CYRILLIC_GLYPH_COUNT 0x72")
+
+    header = "\n".join([
+        "// Generated by scripts/gen_cyrillic_font.py - do not edit by hand.",
+        f"// Source: {FONT_PATH} at {FONT_PX}px, threshold {THRESHOLD}.",
+        "// 6x8 bitmaps, MSB = leftmost column, CP866 byte addressing (A-y range).",
+        "#pragma once",
+        "",
+        "#include <stdint.h>",
+        "",
+    ] + body + ["", ""])
+
+    with open(OUT_H, "w") as fh:
+        fh.write(header)
+    print("wrote", OUT_H)
+    print("wrote", PREVIEW)
+
+
+if __name__ == "__main__":
+    build()

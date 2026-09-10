@@ -9,6 +9,15 @@
   #define ADC_MULTIPLIER 5.42
 #endif
 
+// Peripheral power rail. Boards without one (see platformio.ini: no
+// -DPIN_VEXT_EN) default to an unused GPIO so nothing is ever toggled.
+#ifndef PIN_VEXT_EN
+  #define PIN_VEXT_EN -1
+#endif
+#ifndef PIN_VEXT_EN_ACTIVE
+  #define PIN_VEXT_EN_ACTIVE LOW
+#endif
+
 class HeltecV4Board : public ESP32Board {
 
 protected:
