@@ -10,11 +10,13 @@
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
-#include <Preferences.h>
 
 #ifdef MQTT_ENABLED
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <esp_sntp.h>
 #endif
 
 // Per-board pins (Heltec V4.3 by default), radio params and display driver
@@ -74,6 +76,27 @@ int sensorChannelIdx = -1;
 #define SENSOR_DEV_CACHE_MAX 8
 String sensorDeviceDisc[SENSOR_DEV_CACHE_MAX];
 int sensorDeviceDiscCount = 0;
+unsigned long sensorLastActive[SENSOR_DEV_CACHE_MAX];
+bool sensorOnlineNow[SENSOR_DEV_CACHE_MAX];
+
+// Пауза без сообщений от датчика, после которой его availability уходит в offline.
+// Должен быть больше SENSOR_HEARTBEAT_MS (10 мин), чтобы hello не попадал на границу.
+#ifndef SENSOR_OFFLINE_MS
+#define SENSOR_OFFLINE_MS (15UL * 60 * 1000)
+#endif
+
+// ---- Сенсорные сообщения: кнопка = триггер, hello = регулярный heartbeat ----
+#define SENSOR_MSG_BUTTON "button"      // одиночное нажатие кнопки (триггер для автоматизаций)
+#define SENSOR_MSG_BUTTON2 "button2"    // двойное нажатие кнопки
+#define SENSOR_MSG_HELLO   "hello"      // периодический heartbeat (доступность)
+// Окно ожидания второго нажатия после отпускания кнопки (двойной клик).
+#ifndef SNS_BTN_DBL_WINDOW_MS
+#define SNS_BTN_DBL_WINDOW_MS 700
+#endif
+// Период авто-рассылки heartbeat сенсором (кнопка шлёт "button", hello — таймером).
+#ifndef SENSOR_HEARTBEAT_MS
+#define SENSOR_HEARTBEAT_MS (10UL * 60 * 1000)
+#endif
 
 // ===== ДЕФОЛТЫ ИЗ BUILD-ФЛАГОВ (secrets.ini) =====
 // Применяются только если NVS пуст (приоритет: MQTT/NVS > эти флаги).
@@ -125,29 +148,20 @@ float cpuTempC() {
     return temperatureRead() - (float)TEMP_SENSOR_OFFSET;
 }
 
-// ===== ОТВЕТ НА /ping: обратный маршрут + ретрай =====
-// Путь, которым к нам дошёл последний пакет (в порядке «от источника»),
-// и место/текст ответа для повтора через ~250 мс.
+// ===== ОТВЕТ НА /ping: текст, зашифрованный блок =====
+// Кадр строится на лету (flood x3), здесь храним только enc и replyPath
+// для вычисления хеша seen-фильтра.
 #define MAX_REPLY_PATH 63
 uint8_t replyPath[MAX_REPLY_PATH];
 uint8_t replyHopCount = 0;
 uint8_t replyHashSize = 1;
 String pingReplyText = "";
-uint8_t pingReplyFrame[300];
-int pingReplyFrameLen = 0;
-int pingReplyChannel = 0;
-uint8_t pingReplyEnc[256];      // зашифрованный блок ответа — общий для
-int pingReplyEncLen = 0;        // первого (direct) и повторного (flood) кадра
-bool replyPendingRetransmit = false;
-unsigned long replyRetransmitAt = 0;
+uint8_t pingReplyEnc[256];
+int pingReplyEncLen = 0;
 
 // ===== ОТВЕТ В ЛИЧКУ (TXT_MSG) =====
-// Кадр приватного ответа хранится целиком: повтор 250 мс — той же копией.
 uint8_t dmSrcHash = 0;
 uint8_t dmReplyFrame[300];
-int dmReplyFrameLen = 0;
-bool dmReplyPendingRetransmit = false;
-unsigned long dmReplyRetransmitAt = 0;
 
 // ===== КЭШ ПУБЛИЧНЫХ КЛЮЧЕЙ НОД =====
 // Для шифрования ответа в личку нужен ПОЛНЫЙ pubkey отправителя (32 Б), а в
@@ -220,6 +234,9 @@ bool ntpStarted = false;           // SNTP-синхронизация не ча�
 bool ntpSyncedLogged = false;      // лог факта синхронизации — один раз
 #define NTP_RESYNC_INTERVAL_MS (60UL * 60 * 1000)   // ре-синк раз в час
 unsigned long lastNtpSyncMs = 0;
+unsigned long lastSensorAvailCheckMs = 0;
+unsigned long lastSensorTimeSyncMs = 0;
+#define SENSOR_TIME_SYNC_INTERVAL_MS (5UL * 60 * 1000)   // время сенсорам — раз в 5 минут
 
 // Выбранный канал для отправки из HA (index в channels[])
 int mqttTxChannel = 1;  // по умолчанию #connections
@@ -228,6 +245,13 @@ int mqttTxChannel = 1;  // по умолчанию #connections
 #define LASTMSG_RESET_MS 4000
 unsigned long lastmsgClearAt = 0;
 bool lastmsgPendingClear = false;
+
+// ---- Триггер "button": после публикации обнуляем text через N сек,
+//      чтобы повторное нажатие снова вызывало "state_changed" в HA. ----
+#define SNS_BTN_CLEAR_MS 500
+unsigned long snsBtnClearAt = 0;
+bool snsBtnPendingClear = false;
+char snsBtnSlug[48];       // slug датчика, текст которого нужно обнулить
 
 // Буферы для кадров TX из HA
 uint8_t mqttTxFrame[300];
@@ -239,15 +263,16 @@ void setupMQTT();
 void tickRetryConnections();
 void publishDiscovery();
 void publishMessage();
-void publishSensorMessage();   // fwd-decl: вызывается из parseMeshCorePacket
+bool publishSensorMessage();   // fwd-decl (bool): вызывается из parseMeshCorePacket
 void publishStatus();
 void clearLastMsg();
+void clearSensorBtnText();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 #endif
 
 // Декларация вне #ifdef: вызов из parseMeshCorePacket компилируется во всех сборках
 // (в non-MQTT-сборках сенсорный канал не создаётся и вызов недостижим).
-void publishSensorMessage();
+bool publishSensorMessage();
 
 void initAdvertIdentity() {
     mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
@@ -391,10 +416,6 @@ void deriveChannels() {
 // Задаются ТОЛЬКО из secrets.ini (-DPRIVATE_CHANNEL_NAME/KEY, -DSENSOR_CHANNEL_NAME/KEY),
 // в HA настраивать нельзя. Ведение каналов не зависит от MQTT — функции определены
 // вне #ifdef MQTT_ENABLED (используются и сенсорной платой без WiFi).
-Preferences prefs;
-#define PRIV_CHAN_NS    "meshbot"
-#define PRIV_CHAN_TXCH  "txchan"
-
 int findChannelByName(const char* name) {
     for (int i = 0; i < numChannels; i++) {
         if (strcmp(channels[i].name, name) == 0) return i;
@@ -468,41 +489,17 @@ void loadPrivateChannel() {
     }
 }
 
-void saveTxChannel(int idx) {
-#ifdef MQTT_ENABLED
-    prefs.begin(PRIV_CHAN_NS, false);
-    prefs.putInt(PRIV_CHAN_TXCH, idx);
-    prefs.end();
-    if (mqttConnected) {
-        char cfgTopic[96];
-        snprintf(cfgTopic, sizeof(cfgTopic), "%s/cfg/channel", mqttPrefix);
-        mqtt.publish(cfgTopic, channels[idx].name, true);   // retained: соберём при рестарте
-    }
-#endif
-    Serial.printf("[MQTT] TX channel %s saved to NVS + retained cfg\n", channels[idx].name);
-}
-
+// Канал отправки из HA не настраивается — только из build-флагов (TX_CHANNEL).
 #ifdef MQTT_ENABLED
 void loadTxChannel() {
-    prefs.begin(PRIV_CHAN_NS, false);
-    int idx = prefs.getInt(PRIV_CHAN_TXCH, -1);
-    prefs.end();
-    if (idx < 0) {
-        // дефолт из build-флагов, если такого канала ещё нет в NVS
-        idx = findChannelByName(TX_CHANNEL);
-        if (idx < 0) idx = 1;   // #connections
-        if (idx < numChannels) {
-            Serial.printf("[MQTT] no saved TX channel, using default '%s'\n", channels[idx].name);
-        }
-    }
+    int idx = findChannelByName(TX_CHANNEL);
+    if (idx < 0) idx = 1;   // #connections
     if (idx < numChannels) {
         mqttTxChannel = idx;
-        Serial.printf("[MQTT] TX channel restored from NVS: %s\n", channels[idx].name);
-    } else {
-        Serial.printf("[MQTT] saved TX channel idx %d out of range, using default\n", idx);
+        Serial.printf("[MQTT] TX channel from build flags: %s\n", channels[idx].name);
     }
 }
-#endif // MQTT_ENABLED (loadTxChannel использует mqttTxChannel)
+#endif // MQTT_ENABLED
 
 // ===== ВТОРОЙ ПРИВАТНЫЙ КАНАЛ (сенсоры) =====
 // Добавляет/обновляет канал датчиков (name + keyb64; "" = автоключ). Зеркало
@@ -625,6 +622,7 @@ int buildGroupFrameReturnPath(int chIdx, const String& msg, const uint8_t* path,
                               const uint8_t* enc_in = NULL, int enc_in_len = 0);  // fwd decl
 int sendFrame(int chIdx, const uint8_t* frame, int f);  // fwd decl
 int txFrame(uint8_t* frame, int f);  // fwd decl
+void floodSend3(int chIdx, const uint8_t* frame, int f);  // fwd decl
 int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
                           const String& msg, uint8_t* frame, int maxlen);  // fwd decl
 // Формат ответа как в bot.py: "hops:direct" либо "hops:N, route:aa → bb → cc"
@@ -836,13 +834,40 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 
     // === СЕНСОРНЫЙ КАНАЛ: сообщение уходит в MQTT как отдельное устройство ===
     if (sensorChannelIdx >= 0 && chIdx == sensorChannelIdx) {
+        // === Синхронизация времени: бот шлёт "time:<epoch>" от NTP ===
+        if (lastMessage.startsWith("time:")) {
+            uint64_t epoch = (uint64_t)strtoull(lastMessage.c_str() + 5, NULL, 10);
+            if (epoch > (uint64_t)BUILD_UNIX_TIME) {
+                struct timeval tv;
+                tv.tv_sec = (time_t)epoch;
+                tv.tv_usec = 0;
+                settimeofday(&tv, NULL);
+                time_t local = (time_t)epoch + (time_t)TZ_OFFSET_HOURS * 3600;
+                struct tm tm_now;
+                gmtime_r(&local, &tm_now);
+                char tbuf[32];
+                strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_now);
+                Serial.printf("[RTC] SYNCED from channel: %s\n", tbuf);
+            }
+        }
         #ifdef MQTT_ENABLED
-        publishSensorMessage();
+        bool snsPub = publishSensorMessage();
+        // Диагностика на экран: канал приёма -> статус публикации в MQTT.
+        display.drawLine(0, 48, 128, 48, SSD1306_WHITE);
+        display.setCursor(0, 50);
+        if (snsPub) display.printf("SNS -> MQTT RSSI:%.0f", lastRSSI);
+        else        display.printf("SNS RX, MQTT %s", wifiConnected ? "off" : "no-wifi");
+        display.display();
+        #else
+        Serial.printf("[SNS] %s: %s (MQTT disabled)\n", lastSender.c_str(), lastMessage.c_str());
         #endif
         return true;
     }
 
     // === ОТВЕТ НА СООБЩЕНИЕ ===
+    // Только для MQTT-бота. Сенсорный узел — пассивный: отвечает ТОЛЬКО кнопкой
+    // ("button") и heartbeat ("hello"), пинг/DM он не обслуживает.
+    #ifndef SENSOR_NODE
     // - Личное (TXT_MSG) с dest_hash == BOT_ID_HASH: отвечаем ВСЕГДА, как на /ping.
     // - Групповой GRP_TXT: на текст "/ping" в #connections либо на любое
     //   DIRECT-сообщение, адресованное устройству.
@@ -864,14 +889,8 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
                 int dl = buildPrivateTextFrame(dmSrcHash, peerPub, pingReplyText,
                                                dmReplyFrame, sizeof(dmReplyFrame));
                 if (dl > 0) {
-                    dmReplyFrameLen = dl;
-                    Serial.printf("\n[TX DM] to <%02X>: %s (%dB)\n", dmSrcHash, pingReplyText.c_str(), dl);
-                    for (int i = 0; i < dl; i++) Serial.printf("%02X", dmReplyFrame[i]);
-                    Serial.println();
-                    if (txFrame(dmReplyFrame, dl) == RADIOLIB_ERR_NONE) {
-                        dmReplyPendingRetransmit = true;
-                        dmReplyRetransmitAt = millis() + 250;   // повтор лички
-                    }
+                    Serial.printf("\n[TX DM] to <%02X>: %s (%dB, flood x3)\n", dmSrcHash, pingReplyText.c_str(), dl);
+                    floodSend3(-1, dmReplyFrame, dl);
                 }
             } else {
                 Serial.printf("[DM] pubkey <%02X> неизвестен (нет advert) — ответ не отправлен\n", dmSrcHash);
@@ -879,38 +898,21 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             return true;
         }
 
-        // Шифруем ответ ОДИН раз и храним блок: первый кадр уходит DIRECT по
-        // обратному маршруту (если путь был), повтор через ~250 мс — флудом.
-        // Оба кадра несут тот же зашифрованный блок (один timestamp) =>
-        // приёмник дедуплицирует их как повторы одного сообщения.
         int enclen = buildGroupEnc(chIdx, pingReplyText, pingReplyEnc);
         if (enclen <= 0) return true;
         pingReplyEncLen = enclen;
 
-        int f = 0;
-        bool viaReturnPath = (replyHopCount > 0);
-        if (viaReturnPath) {
-            f = buildGroupFrameReturnPath(chIdx, pingReplyText, replyPath,
-                                          replyHopCount, replyHashSize,
-                                          pingReplyFrame, sizeof(pingReplyFrame),
-                                          pingReplyEnc, pingReplyEncLen);
-        } else {
-            f = buildGroupFrameFlood(chIdx, pingReplyText, pingReplyFrame, sizeof(pingReplyFrame),
+        uint8_t frame[300];
+        int f = buildGroupFrameFlood(chIdx, pingReplyText, frame, sizeof(frame),
                                      pingReplyEnc, pingReplyEncLen);
-        }
         if (f > 0) {
-            pingReplyFrameLen = f;
-            pingReplyChannel = chIdx;
-            Serial.printf("\n[TX] %s: %s (%dB, %s)\n", channels[chIdx].name,
-                          (DEVICE_NAME ": " + pingReplyText).c_str(), f,
-                          viaReturnPath ? "direct" : "flood");
-            if (sendFrame(chIdx, pingReplyFrame, pingReplyFrameLen) == RADIOLIB_ERR_NONE) {
-                replyPendingRetransmit = true;
-                replyRetransmitAt = millis() + 250;   // повтор на случай desense ближнего узла
-            }
+            Serial.printf("\n[TX] %s: %s (%dB, flood x3)\n", channels[chIdx].name,
+                          (DEVICE_NAME ": " + pingReplyText).c_str(), f);
+            floodSend3(chIdx, frame, f);
         }
     }
-    
+    #endif  // !SENSOR_NODE (ответ на пинг/DM — только MQTT-бот)
+
     return true;
 }
 
@@ -1097,6 +1099,35 @@ int sendFrame(int chIdx, const uint8_t* frame, int f) {
     return txFrame((uint8_t*)frame, f);
 }
 
+// ===== ФЛУД-ОТПРАВКА С 3 РЕТРАЯМИ =====
+// chIdx >= 0: sendFrame (с валидацией канала, hex-лог), chIdx < 0: txFrame (личка).
+// Отправляется тот же кадр 3 раза с паузой 100 мс; приёмник дедуплицирует.
+#ifndef FLOOD_RETRY_MS
+#define FLOOD_RETRY_MS 100
+#endif
+void floodSend3(int chIdx, const uint8_t* frame, int f) {
+    for (int i = 0; i < 3; i++) {
+        if (chIdx >= 0) sendFrame(chIdx, frame, f);
+        else            txFrame((uint8_t*)frame, f);
+        if (i < 2) delay(FLOOD_RETRY_MS);
+    }
+}
+
+// ===== РАССЫЛКА ВРЕМЕНИ В СЕНСОРНЫЙ КАНАЛ =====
+// Бот синхронизирован по NTP и периодически шлёт в сенсорный канал команду
+// "time:<epoch>". Датчики без WiFi/радио берут из неё точное время.
+void sendSensorTimeSync() {
+    if (sensorChannelIdx < 0) return;
+    uint8_t frame[300];
+    char msg[40];
+    snprintf(msg, sizeof(msg), "time:%llu", (unsigned long long)time(NULL));
+    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), NULL, 0);
+    if (f > 0) {
+        Serial.printf("\n[TIME] -> %s: %s\n", channels[sensorChannelIdx].name, msg);
+        floodSend3(sensorChannelIdx, frame, f);
+    }
+}
+
 // ===== ИНИЦИАЛИЗАЦИЯ LORA =====
 bool initLoRa() {
     Serial.println("Init LoRa...");
@@ -1174,23 +1205,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     memcpy(msg, payload, mlen);
     msg[mlen] = 0;
 
-    // --- meshcore/bot/.../cmd/channel ---
-    if (strstr(topic, "/cmd/channel")) {
-        int tci = findChannelByName(msg);
-        if (tci >= 0) {
-            mqttTxChannel = tci;
-            Serial.printf("[MQTT] TX channel → %s\n", channels[tci].name);
-            saveTxChannel(tci);
-        } else {
-            Serial.printf("[MQTT] unknown channel '%s'\n", msg);
-        }
-        // публикуем обратно текущее значение
-        char stateTopic[96];
-        snprintf(stateTopic, sizeof(stateTopic), "%s/state", mqttPrefix);
-        mqtt.publish(stateTopic, channels[mqttTxChannel].name, true);
-        return;
-    }
-
     // --- meshcore/bot/.../cmd/send ---
     if (strstr(topic, "/cmd/send")) {
         if (!isListening) {
@@ -1203,7 +1217,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (fl > 0) {
             Serial.printf("[MQTT TX] %s: %s (%dB)\n", channels[mqttTxChannel].name,
                           (String(DEVICE_NAME) + ": " + txt).c_str(), fl);
-            sendFrame(mqttTxChannel, frame, fl);
+            floodSend3(mqttTxChannel, frame, fl);
         }
         return;
     }
@@ -1222,22 +1236,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         char stateTopic[96];
         snprintf(stateTopic, sizeof(stateTopic), "%s/state", mqttPrefix);
         mqtt.publish(stateTopic, isListening ? "ON" : "OFF", true);
-        return;
-    }
-
-    // --- meshcore/bot/.../cfg/* (retained-конфиг, восстанавливается при старте) ---
-    // Применяем БЕЗ обратной публикации и без discovery, чтобы исключить циклы.
-    if (strstr(topic, "/cfg/channel")) {
-        int tci = findChannelByName(msg);
-        if (tci >= 0) {
-            mqttTxChannel = tci;
-            Serial.printf("[MQTT] TX channel restored from cfg: %s\n", channels[tci].name);
-            prefs.begin(PRIV_CHAN_NS, false);
-            prefs.putInt(PRIV_CHAN_TXCH, tci);
-            prefs.end();
-        } else {
-            Serial.printf("[MQTT] cfg/channel: unknown channel '%s'\n", msg);
-        }
         return;
     }
 
@@ -1281,6 +1279,18 @@ void publishDiscovery() {
         DEVICE_NAME, mqttPrefix, mqttPrefix, DEVICE_NAME, devBlock);
     mqtt.publish(topic, payload, true);
 
+    // --- Sensor: IP адрес _mqtt (атрибут ip из /status) ---
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/ip/config", DEVICE_NAME);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s IP\","
+        "\"state_topic\":\"%s/status\","
+        "\"value_template\":\"{{ value_json.ip }}\","
+        "\"unique_id\":\"meshcore_%s_ip\","
+        "\"icon\":\"mdi:ip-network\","
+        "\"device\":{%s}}",
+        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+    mqtt.publish(topic, payload, true);
+
     // --- Sensor: температура CPU (встроенный датчик ESP32-S3) ---
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/temp/config", DEVICE_NAME);
     snprintf(payload, sizeof(payload),
@@ -1316,25 +1326,6 @@ void publishDiscovery() {
         "\"device\":{%s}}",
         DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
     mqtt.publish(topic, payload, true);
-
-    // --- Select: канал (options включают приватный и сенсорный каналы) ---
-    String chOpts = "\"#public\",\"#connections\"";
-    if (privateChannelIdx >= 0) chOpts += String(",\"") + privateChannelName + "\"";
-    if (sensorChannelIdx >= 0) chOpts += String(",\"") + sensorChannelName + "\"";
-    char selTopic[128], selPayload[600];
-    snprintf(selTopic, sizeof(selTopic), "homeassistant/select/meshcore_%s/channel/config", DEVICE_NAME);
-    snprintf(selPayload, sizeof(selPayload),
-        "{\"name\":\"%s Channel\","
-        "\"command_topic\":\"%s/cmd/channel\","
-        "\"state_topic\":\"%s/state\","
-        "\"value_template\":\"{{ value_json.channel }}\","
-        "\"options\":[%s],"
-        "\"retain\":true,"
-        "\"unique_id\":\"meshcore_%s_ch\","
-        "\"icon\":\"mdi:radio-tower\","
-        "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, mqttPrefix, chOpts.c_str(), DEVICE_NAME, devBlock);
-    mqtt.publish(selTopic, selPayload, true);
 
     // --- Switch: listening ---
     snprintf(topic, sizeof(topic), "homeassistant/switch/meshcore_%s/listening/config", DEVICE_NAME);
@@ -1420,6 +1411,20 @@ void clearLastMsg() {
     Serial.println("[MQTT] lastmsg cleared");
 }
 
+// Обнуляет text-топик сенсора после триггера "button":
+// следующее нажатие снова вызывает state_changed → повторная автоматизация.
+void clearSensorBtnText() {
+    if (!snsBtnPendingClear || !mqttConnected) return;
+    if ((int32_t)(millis() - snsBtnClearAt) < 0) return;
+    snsBtnPendingClear = false;
+    if (snsBtnSlug[0] == 0) return;
+    char tText[128];
+    snprintf(tText, sizeof(tText), "%s/sensor/%s/text", mqttPrefix, snsBtnSlug);
+    mqtt.publish(tText, "", false);
+    Serial.printf("[SNS] button text cleared for %s\n", snsBtnSlug);
+    snsBtnSlug[0] = 0;
+}
+
 // Имя отправителя -> безопасный фрагмент топика/идентификатора.
 void mqttSlug(const char* name, char* out, int maxLen) {
     int n = 0;
@@ -1439,8 +1444,10 @@ void publishSensorDisc(const String& sender, const char* slug) {
         "\"identifiers\":[\"meshcore_sensor_%s\"],\"name\":\"MeshBot Sensor %s\","
         "\"manufacturer\":\"MeshCore\",\"model\":\"Sensor node\"",
         slug, slug);
-    char topic[128], payload[320];
-    snprintf(topic, sizeof(topic), "homeassistant/text/meshcore_sensor_%s/state/config", slug);
+    char topic[128], payload[512];
+    // Данные: sensor с текстовым state (HA MQTT text требует command_topic,
+    // а у нас сущность read-only — это state от сенсора).
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/text/config", slug);
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s data\",\"state_topic\":\"%s/sensor/%s/text\","
         "\"icon\":\"mdi:sprout\",\"unique_id\":\"meshcore_sensor_%s_text\","
@@ -1450,7 +1457,7 @@ void publishSensorDisc(const String& sender, const char* slug) {
     mqtt.publish(topic, payload, true);
     Serial.printf("[MQTT] sensor device discovery: %s\n", slug);
 
-    char retTopic[128], retPayload[160];
+    char retTopic[128], retPayload[512];
     snprintf(retTopic, sizeof(retTopic), "homeassistant/sensor/meshcore_sensor_%s/rssi/config", slug);
     snprintf(retPayload, sizeof(retPayload),
         "{\"name\":\"%s RSSI\",\"state_topic\":\"%s/sensor/%s/rssi\","
@@ -1460,26 +1467,83 @@ void publishSensorDisc(const String& sender, const char* slug) {
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
     mqtt.publish(retTopic, retPayload, true);
     Serial.printf("[MQTT] sensor rssi discovery: %s\n", slug);
+
+    // Availability: бинарник device_class=connectivity, «online» пока датчик шлёт.
+    char alvTopic[128], alvPayload[512];
+    snprintf(alvTopic, sizeof(alvTopic),
+             "homeassistant/binary_sensor/meshcore_sensor_%s/available/config", slug);
+    snprintf(alvPayload, sizeof(alvPayload),
+        "{\"name\":\"%s available\",\"state_topic\":\"%s/sensor/%s/available\","
+        "\"payload_on\":\"online\",\"payload_off\":\"offline\",\"device_class\":\"connectivity\","
+        "\"unique_id\":\"meshcore_sensor_%s_available\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(alvTopic, alvPayload, true);
+    Serial.printf("[MQTT] sensor availability discovery: %s\n", slug);
+
+    // Event entity: MQTT event platform — появляется как device-trigger "Fired"
+    // в автоматизациях HA.  При нажатии кнопки сенсор шлёт "button", бот
+    // публикует payload "button" в event_type_topic, HA генерирует событие.
+    char evtTopic[128], evtPayload[512];
+    snprintf(evtTopic, sizeof(evtTopic),
+             "homeassistant/event/meshcore_sensor_%s/button/config", slug);
+    snprintf(evtPayload, sizeof(evtPayload),
+        "{\"name\":\"%s Button\","
+        "\"state_topic\":\"%s/sensor/%s/button\","
+        "\"event_types\":[\"button\",\"button2\"],"
+        "\"unique_id\":\"meshcore_sensor_%s_button\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(evtTopic, evtPayload, true);
+    Serial.printf("[MQTT] sensor button event discovery: %s\n", slug);
 }
 
 // Публикует сообщение из сенсорного канала: устройство HA на каждого отправителя.
-void publishSensorMessage() {
+// hello = heartbeat (только availability, без text/rssi).
+// button = триггер: text + rssi + availability + event entity (для автоматизаций).
+// Возвращает true, если сообщение реально отправлено в MQTT.
+bool publishSensorMessage() {
     #ifdef MQTT_ENABLED
-    if (!mqttConnected) return;
+    if (!mqttConnected) {
+        Serial.printf("[SNS] %s: %s (MQTT not connected, skipped)\n",
+                      lastSender.c_str(), lastMessage.c_str());
+        return false;
+    }
     char slug[48];
     mqttSlug(lastSender.c_str(), slug, sizeof(slug));
     if (strlen(slug) == 0) snprintf(slug, sizeof(slug), "unknown");
-    // discovery публикуется один раз на отправителя (кэш имён)
+    // discovery публикуется один раз на отправителя (кэш имён).
     bool known = false;
+    int discIdx = -1;
     for (int i = 0; i < sensorDeviceDiscCount; i++) {
-        if (sensorDeviceDisc[i] == lastSender) { known = true; break; }
+        if (sensorDeviceDisc[i] == lastSender) { known = true; discIdx = i; break; }
     }
     if (!known) {
         publishSensorDisc(lastSender, slug);
-        if (sensorDeviceDiscCount < SENSOR_DEV_CACHE_MAX) {
+        if (mqttConnected && sensorDeviceDiscCount < SENSOR_DEV_CACHE_MAX) {
+            discIdx = sensorDeviceDiscCount;
             sensorDeviceDisc[sensorDeviceDiscCount++] = lastSender;
+        } else {
+            discIdx = -1;
         }
     }
+    // availability: любой приём от датчика = online.
+    if (discIdx >= 0) {
+        sensorLastActive[discIdx] = millis();
+        if (!sensorOnlineNow[discIdx]) {
+            sensorOnlineNow[discIdx] = true;
+            char tAvail[128];
+            snprintf(tAvail, sizeof(tAvail), "%s/sensor/%s/available", mqttPrefix, slug);
+            mqtt.publish(tAvail, "online", true);
+            Serial.printf("[SNS] %s AVAILABLE (online)\n", lastSender.c_str());
+        }
+    }
+    // --- heartbeat: только availability, без text/rssi ---
+    if (lastMessage == SENSOR_MSG_HELLO) {
+        Serial.printf("[SNS] heartbeat from %s\n", lastSender.c_str());
+        return true;
+    }
+    // --- данные: text + rssi ---
     char escText[128];
     jsonEscape(lastMessage.c_str(), escText, sizeof(escText));
     char tText[128], tRssi[128];
@@ -1489,9 +1553,28 @@ void publishSensorMessage() {
     char rssiStr[24];
     snprintf(rssiStr, sizeof(rssiStr), "%.1f", lastRSSI);
     mqtt.publish(tRssi, rssiStr);
-    Serial.printf("[SNS] %s: %s (rssi %.1f)\n", lastSender.c_str(), lastMessage.c_str(), lastRSSI);
+    // --- button: event entity trigger для автоматизаций ---
+    if ((lastMessage == SENSOR_MSG_BUTTON) || (lastMessage == SENSOR_MSG_BUTTON2)) {
+        char tEvt[128];
+        snprintf(tEvt, sizeof(tEvt), "%s/sensor/%s/button", mqttPrefix, slug);
+        // MQTT event entity ожидает JSON с "event_type" (docs event.mqtt),
+        // ретранслированные retained-сообщения отбрасываются.
+        char evtJson[64];
+        snprintf(evtJson, sizeof(evtJson), "{\"event_type\":\"%s\"}", lastMessage.c_str());
+        mqtt.publish(tEvt, evtJson, false);
+        // auto-clear: через SNS_BTN_CLEAR_MS текст сбрасывается "",
+        // чтобы следующее нажатие снова вызвало "state_changed" в HA.
+        snsBtnClearAt = millis() + SNS_BTN_CLEAR_MS;
+        snsBtnPendingClear = true;
+        strlcpy(snsBtnSlug, slug, sizeof(snsBtnSlug));
+        Serial.printf("[SNS] %s from %s — trigger published\n", lastMessage.c_str(), lastSender.c_str());
+    } else {
+        Serial.printf("[SNS] %s: %s (rssi %.1f)\n", lastSender.c_str(), lastMessage.c_str(), lastRSSI);
+    }
+    return true;
     #else
     Serial.printf("[SNS] %s: %s (MQTT disabled)\n", lastSender.c_str(), lastMessage.c_str());
+    return false;
     #endif
 }
 
@@ -1511,11 +1594,12 @@ void publishStatus() {
     snprintf(payload, sizeof(payload),
         "{\"wifi\":true,\"mqtt\":true,\"lora_rx\":%s,"
         "\"uptime\":%lu,\"packets\":%d,\"duplicates\":%lu,"
-        "\"temp\":%.1f,"
+        "\"temp\":%.1f,\"ip\":\"%s\","
         "\"channel\":\"%s\",\"private\":\"%s\"}",
         isListening ? "true" : "false",
         upSec, packetCount, duplicateCount,
         tempC,
+        wifiConnected ? WiFi.localIP().toString().c_str() : "0.0.0.0",
         chEsc, prvEsc);
     mqtt.publish(topic, payload, true);
 
@@ -1590,12 +1674,6 @@ void tickRetryConnections() {
         mqtt.subscribe(cmdTopic);
         snprintf(cmdTopic, sizeof(cmdTopic), "%s/cmd/listening", mqttPrefix);
         mqtt.subscribe(cmdTopic);
-        snprintf(cmdTopic, sizeof(cmdTopic), "%s/cmd/channel", mqttPrefix);
-        mqtt.subscribe(cmdTopic);
-
-        // Retained-конфиг (для восстановления при рестарте без циклов)
-        snprintf(cmdTopic, sizeof(cmdTopic), "%s/cfg/channel", mqttPrefix);
-        mqtt.subscribe(cmdTopic);
 
         // Discovery публикуем только при ПЕРВОМ подключении (reconnect его
         // повторяет поток retained-конфигов). Обновления — по факту изменений.
@@ -1650,6 +1728,156 @@ void drawIdleStatus() {
     }
     display.display();
 }
+
+// ===== HTTP OTA (порт 3232): обновление прошивки _mqtt по WiFi из HA =====
+#ifdef MQTT_ENABLED
+WebServer otaServer(3232);
+bool otaFlashing = false;
+unsigned long otaStartMs = 0;
+
+void otaHandleRoot() {
+    static const char PAGE[] PROGMEM =
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>MeshBot OTA</title><style>"
+        "body{font-family:system-ui,sans-serif;background:#1c2333;color:#e8ecf3;margin:0;"
+        "min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
+        ".card{background:#242d40;border:1px solid #35405a;border-radius:14px;padding:28px;"
+        "max-width:520px;width:100%}"
+        "h2{margin:0 0 4px}h4{margin:0 0 18px;color:#93a4c4;font-weight:400}"
+        "#drop{border:2px dashed #4a5775;border-radius:10px;padding:26px;text-align:center;"
+        "cursor:pointer;transition:.15s;background:#1e2638}"
+        "#drop.hover{border-color:#5eead4;background:#1b2233}"
+        "#drop .big{display:block;font-size:40px}#drop span{color:#93a4c4}"
+        "#fname{display:block;margin-top:10px;color:#5eead4;word-break:break-all;font-size:13px}"
+        "button{display:block;width:100%;margin-top:16px;padding:12px;border:0;border-radius:8px;"
+        "background:#0ea5e9;color:#fff;font-size:15px;font-weight:600;cursor:pointer}"
+        "button:hover{background:#38bdf8}button:disabled{background:#33415c;cursor:not-allowed}"
+        "#bar{display:none;margin-top:18px}#bar .t{display:flex;justify-content:space-between;"
+        "font-size:12px;color:#93a4c4}#bar .w{height:10px;background:#33415c;border-radius:5px;"
+        "overflow:hidden;margin-top:6px}#bar .f{height:100%;width:0;background:#0ea5e9;transition:width .15s}"
+        "#st{margin-top:12px;font-size:13px;min-height:18px}#st.err{color:#f87171}#st.ok{color:#5eead4}"
+        "</style></head><body>"
+        "<div class='card'><h2>MeshBot OTA</h2><h4>" DEVICE_NAME "</h4>"
+        "<div id='drop'><span class='big'>&#128190;</span><span id='hint'>"
+        "Перетащи .bin сюда<br>или нажми для выбора</span><span id='fname'></span></div>"
+        "<input id='file' type='file' accept='.bin' style='display:none'>"
+        "<button id='go' disabled>&#10133; Обновить прошивку</button>"
+        "<div id='bar'><div class='t'><span id='pc'>0%</span><span id='sz'></span></div>"
+        "<div class='w'><div class='f'></div></div></div>"
+        "<div id='st'></div></div>"
+        "<script>var file=null,input=document.getElementById('file'),drop=document.getElementById('drop'),"
+        "go=document.getElementById('go'),bar=document.getElementById('bar'),st=document.getElementById('st');"
+        "function setF(f){file=f;if(!f)return;document.getElementById('fname').textContent=f.name+' ('+(f.size/1024|0)+' KB)';"
+        "document.getElementById('hint').style.display='none';go.disabled=false;}"
+        "drop.onclick=function(){input.click()};drop.ondragover=function(e){e.preventDefault();drop.classList.add('hover')};"
+        "drop.ondragleave=function(){drop.classList.remove('hover')};drop.ondrop=function(e){e.preventDefault();"
+        "drop.classList.remove('hover');if(e.dataTransfer.files[0])setF(e.dataTransfer.files[0])};"
+        "input.onchange=function(){setF(input.files[0])};"
+        "go.onclick=function(){if(!file)return;go.disabled=true;st.className='';st.textContent='Загрузка...';"
+        "bar.style.display='block';var fd=new FormData();fd.append('fw',file);var x=new XMLHttpRequest();"
+        "x.open('POST','/update');x.upload.onprogress=function(e){if(e.lengthComputable){var p=e.loaded/e.total*100|0;"
+        "document.getElementById('pc').textContent=p+'%';document.getElementById('sz').textContent=file.size/1024|0+' KB';"
+        "document.getElementById('bar').firstElementChild.nextElementSibling.firstElementChild.style.width=p+'%'}};"
+        "x.onload=function(){st.className=x.response.indexOf('OK')>=0?'ok':'err';st.textContent=x.response;"
+        "if(st.className=='ok')setTimeout(function(){location.reload()},3000)};x.send(fd)};</script>"
+        "</body></html>";
+    otaServer.sendHeader("Connection", "close");
+    otaServer.send(200, "text/html", PAGE);
+    #if HAS_OLED
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("OTA page open");
+    display.display();
+    #endif
+}
+
+// multipart с нетипичным размером partition — работаем потоково через Update
+void otaHandleUpdate() {
+    HTTPUpload& up = otaServer.upload();
+    switch (up.status) {
+    case UPLOAD_FILE_START:
+    {
+        otaFlashing = true;
+        otaStartMs = millis();
+        Serial.printf("\n[OTA] загрузка: %s (%u байт)\n", up.filename.c_str(), (unsigned)up.totalSize);
+        #if HAS_OLED
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("OTA update...");
+        display.display();
+        #endif
+        // NAS: выключаем радио и сеть на время прошивки
+        radio.sleep();
+        isListening = false;
+        if (mqttConnected) mqtt.disconnect();
+        #if HAS_FEM
+        digitalWrite(FEM_EN_PIN, LOW);
+        #endif
+        // totalSize на UPLOAD_FILE_START равен 0 в Arduino core (растёт только при
+        // WRITE), поэтому размер берём из свободного места под прошивку.
+        uint32_t otaMax = UPDATE_SIZE_UNKNOWN;
+        if (!Update.begin(otaMax)) {
+            Update.printError(Serial);
+        }
+        break;
+    break;
+    }
+    case UPLOAD_FILE_WRITE:
+    {
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+            Update.printError(Serial);
+        }
+        if ((millis() - otaStartMs) / 1000 > 3) {
+            otaStartMs = millis();   // только для прогресса не критично
+        }
+        break;
+    }
+    case UPLOAD_FILE_END:
+    {
+        if (Update.end(true)) {
+            Serial.printf("[OTA] OK, %u bytes, reboot...\n", (unsigned)up.totalSize);
+            #if HAS_OLED
+            display.println("OK! Rebooting...");
+            display.display();
+            #endif
+            otaServer.send(200, "text/plain", "OK rebooting");
+            delay(300);
+            ESP.restart();
+        } else {
+            Update.printError(Serial);
+            #if HAS_OLED
+            display.println("OTA FAILED!");
+            display.display();
+            #endif
+            otaFlashing = false;
+            radio.startReceive();
+            isListening = true;
+        }
+        break;
+    }
+    case UPLOAD_FILE_ABORTED:
+    {
+        Update.abort();
+        otaFlashing = false;
+        radio.startReceive();
+        isListening = true;
+        Serial.println("[OTA] прервано");
+        break;
+    }
+    }
+}
+
+void setupOtaServer() {
+    otaServer.on("/", HTTP_GET, otaHandleRoot);
+    otaServer.on("/update", HTTP_POST, []() {
+        otaServer.sendHeader("Connection", "close");
+        otaServer.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    }, otaHandleUpdate);
+    otaServer.begin();
+    Serial.println("OTA server: http://<ip>:3232/update");
+}
+#endif
 
 void setup() {
     Serial.begin(115200);
@@ -1783,6 +2011,7 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);   // без modem-sleep: меньше задержка отвёта
     setupMQTT();            // только конфиг (префиксы/сервер/коллбэк)
+    setupOtaServer();       // HTTP OTA на :3232 (обновление прошивки по WiFi)
     #endif
 
     radio.startReceive();
@@ -1803,8 +2032,29 @@ void setup() {
     lastScreenActivityMs = millis();   // старт таймера автовыключения экрана
 }
 
+// Отправляет сообщение в сенсорный канал (3 flood-ретрая).
+// Используется только SENSOR_NODE-сборкой. chIdx для sendFrame здесь
+// не нужен: flood-кадры идут целиком, без return-path.
+void sensorSendMsg(const char* msg) {
+    if (sensorChannelIdx < 0) {
+        Serial.printf("[SNS] sensor channel not configured, cannot send \"%s\"\n", msg);
+        return;
+    }
+    uint8_t enc[256];
+    int enclen = buildGroupEnc(sensorChannelIdx, msg, enc);
+    if (enclen <= 0) return;
+    uint8_t frame[300];
+    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), enc, enclen);
+    if (f > 0) {
+        floodSend3(-1, frame, f);
+        Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
+    }
+}
+
 void loop() {
     #ifdef MQTT_ENABLED
+    otaServer.handleClient();   // HTTP OTA: принимаем реквесты не блокируя радио
+
     // ===== MQTT RECONNECT (неблокирующий, раз в 5 с) =====
     if (millis() - lastMqttReconnectMs > MQTT_RECONNECT_INTERVAL_MS) {
         lastMqttReconnectMs = millis();
@@ -1829,35 +2079,6 @@ void loop() {
         }
     }
 
-    // ===== РЕТРАЙ ОТВЕТА /ping (повтор через ~250 мс — уже ФЛУДОМ) =====
-    if (isListening && replyPendingRetransmit && millis() >= replyRetransmitAt) {
-        replyPendingRetransmit = false;
-        if (pingReplyFrameLen > 0) {
-            // Тот же зашифрованный блок (тот же timestamp) => копии одного сообщения.
-            uint8_t flood[300];
-            int fl = buildGroupFrameFlood(pingReplyChannel, pingReplyText, flood, sizeof(flood),
-                                          pingReplyEnc, pingReplyEncLen);
-            if (fl > 0) {
-                Serial.printf("\n[PING] retransmit reply (flood): %s\n", pingReplyText.c_str());
-                Serial.printf("[TX] %s: %s (%dB)\n", channels[pingReplyChannel].name,
-                              (DEVICE_NAME ": " + pingReplyText).c_str(), fl);
-                sendFrame(pingReplyChannel, flood, fl);
-            }
-        }
-    }
-
-    // ===== РЕТРАЙ ОТВЕТА В ЛИЧКУ (повтор тех же байт через ~250 мс) =====
-    if (isListening && dmReplyPendingRetransmit && millis() >= dmReplyRetransmitAt) {
-        dmReplyPendingRetransmit = false;
-        if (dmReplyFrameLen > 0) {
-            Serial.printf("\n[DM] retransmit reply to <%02X>: %s (%dB)\n",
-                          dmSrcHash, pingReplyText.c_str(), dmReplyFrameLen);
-            for (int i = 0; i < dmReplyFrameLen; i++) Serial.printf("%02X", dmReplyFrame[i]);
-            Serial.println();
-            txFrame(dmReplyFrame, dmReplyFrameLen);
-        }
-    }
-    
     // ===== ПРИЁМ =====
     if (isListening) {
         // Периодический сброс AGC, если не идёт приём пакета прямо сейчас.
@@ -1938,13 +2159,32 @@ void loop() {
         lastStatusPublishMs = millis();
         publishStatus();
     }
+    // ===== ДОСТУПНОСТЬ ДАТЧИКОВ: если от датчика давно ничего нет — offline =====
+    if (mqttConnected && millis() - lastSensorAvailCheckMs > 10000) {
+        lastSensorAvailCheckMs = millis();
+        for (int i = 0; i < sensorDeviceDiscCount; i++) {
+            if (sensorOnlineNow[i] && millis() - sensorLastActive[i] > SENSOR_OFFLINE_MS) {
+                sensorOnlineNow[i] = false;
+                char slug[48];
+                mqttSlug(sensorDeviceDisc[i].c_str(), slug, sizeof(slug));
+                char tAvail[128];
+                snprintf(tAvail, sizeof(tAvail), "%s/sensor/%s/available", mqttPrefix, slug);
+                mqtt.publish(tAvail, "offline", true);
+                Serial.printf("[SNS] %s OFFLINE (no data for %lus)\n",
+                              sensorDeviceDisc[i].c_str(), (unsigned long)(SENSOR_OFFLINE_MS / 1000));
+            }
+        }
+    }
     // ===== Ре-синк NTP раз в час (configTime снова делает stop+init) =====
     if (ntpStarted && wifiConnected && (int32_t)(millis() - lastNtpSyncMs) >= (int32_t)NTP_RESYNC_INTERVAL_MS) {
         lastNtpSyncMs = millis();
         configTime(0, 0, "pool.ntp.org");
     }
-    // ===== Одноразовый лог, когда SNTP уточнил build-time =====
-    if (ntpStarted && !ntpSyncedLogged && time(NULL) > (time_t)BUILD_UNIX_TIME + 3600) {
+    // ===== Первая успешная синхронизация SNTP: лог + сразу рассылка времени сенсорам =====
+    // Отслеживаем статус lwIP SNTP (SNTP_SYNC_STATUS_COMPLETED), а не сдвиг часов:
+    // при свежем билде реальное время может лишь на минуты отличаться от build-time.
+    if (ntpStarted && !ntpSyncedLogged &&
+        sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
         ntpSyncedLogged = true;
         time_t local = time(NULL) + (time_t)TZ_OFFSET_HOURS * 3600;
         struct tm tm_now;
@@ -1952,31 +2192,56 @@ void loop() {
         char tbuf[32];
         strftime(tbuf, sizeof(tbuf), "%H:%M:%S %d.%m.%Y", &tm_now);
         Serial.printf("[RTC] NTP time synced: %s\n", tbuf);
+        if (sensorChannelIdx >= 0) {
+            lastSensorTimeSyncMs = millis();
+            sendSensorTimeSync();
+        }
+    }
+    // ===== Рассылка актуального времени сенсорам в сенсорный канал =====
+    // Работает только при реально синхронизированном времени (ntpSyncedLogged):
+    // build-time устаревает, и датчики должны получать истинный epoch.
+    if (ntpSyncedLogged && sensorChannelIdx >= 0 &&
+        (int32_t)(millis() - lastSensorTimeSyncMs) >= (int32_t)SENSOR_TIME_SYNC_INTERVAL_MS) {
+        lastSensorTimeSyncMs = millis();
+        sendSensorTimeSync();
     }
     // ===== Сброс lastmsg после паузы (чтобы повторный одинаковый текст триггерил HA) =====
     clearLastMsg();
+    // ===== Сброс text-топика после триггера "button" (повторное нажатие = новый state_changed) =====
+    clearSensorBtnText();
     #endif
 
-    // Sensor node: send boot message into sensor channel on button press
+    // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
     static unsigned long lastBtnPress = 0;
+    static unsigned long lastHeartbeat = 0;
     if (millis() - lastBtnPress > 5000) {
         if (digitalRead(BUTTON_PIN) == LOW) {
             lastBtnPress = millis();
-            // Send "hello" message into sensor channel
-            uint8_t enc[256];
-            int enclen = buildGroupEnc(sensorChannelIdx, "hello", enc);
-            if (enclen > 0) {
-                uint8_t frame[300];
-                int f = buildGroupFrameFlood(sensorChannelIdx, "hello", frame, sizeof(frame), enc, enclen);
-                if (f > 0) {
-                    txFrame(frame, f);
-                    Serial.println("[SNS] boot message sent to sensor channel");
+            // ждём отпускания кнопки (таймаут защиты от залипания)
+            unsigned long heldAt = millis();
+            while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt < 5000) delay(2);
+
+            // окно двойного нажатия: если в течение SNS_BTN_DBL_WINDOW_MS
+            // кнопку нажмут снова — это button2
+            bool isDouble = false;
+            unsigned long waitUntil = millis() + SNS_BTN_DBL_WINDOW_MS;
+            while (millis() < waitUntil) {
+                if (digitalRead(BUTTON_PIN) == LOW) {
+                    isDouble = true;
+                    unsigned long heldAt2 = millis();
+                    while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt2 < 5000) delay(2);
+                    break;
                 }
+                delay(5);
             }
-            // wait for release (with timeout to avoid hanging)
-            while (digitalRead(BUTTON_PIN) == LOW && millis() - lastBtnPress < 5000);
+            sensorSendMsg(isDouble ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
         }
+    }
+    // Регулярный heartbeat: держит сенсор "online" в HA даже без кнопок
+    if (millis() - lastHeartbeat >= SENSOR_HEARTBEAT_MS) {
+        lastHeartbeat = millis();
+        sensorSendMsg(SENSOR_MSG_HELLO);
     }
 #endif
 
