@@ -217,6 +217,7 @@
     void clearDisplay(void) {}
     void display(void) {}
     void dim(bool) {}
+    void setPower(bool) {}
   };
 
 #endif // HAS_OLED
@@ -242,6 +243,7 @@
       size_t write(uint8_t c) override {
         return utf8cp866::processByte(*this, _u8, c, 1, 1, 1);
       }
+      void setPower(bool on) { ssd1306_command(on ? 0xAF : 0xAE); }
     private:
       utf8cp866::Decoder _u8;
     };

@@ -157,13 +157,28 @@ ASCII-умы и символы после `0xF0`.
 
 ### Включение
 
-1. В `platformio.ini` раскомментируйте env `heltec_v4_3_mqtt` и заполните:
+1. В `platformio.ini` раскомментируйте env `heltec_v4_3_mqtt`. WiFi/MQTT —
+   креды и настройки каналов хранятся в `secrets.ini` (в git не трекается,
+   пример со всеми полями — `secrets_example.ini`):
    ```
-   -DWIFI_SSID=\"YourSSID\"
-   -DWIFI_PASS=\"YourPassword\"
-   -DMQTT_BROKER=\"192.168.1.100\"
-   -DMQTT_PORT=1883
+   [secrets]
+   build_flags =
+       -DDEVICE_NAME='"Tr1glav_home"'
+       -DWIFI_SSID='"YourSSID"'
+       -DWIFI_PASS='"YourPassword"'
+       -DMQTT_BROKER='"192.168.1.100"'
+       -DMQTT_PORT=1883
+       -DMQTT_USER='"user"'
+       -DMQTT_PASS='"pass"'
+       ; дефолты каналов (применяются только при пустом NVS):
+       -DPRIVATE_CHANNEL_NAME='"dla.su"'
+       -DPRIVATE_CHANNEL_KEY='"TF/kJS5gJxoCWcqH9Une3w=="'
+       -DSENSOR_CHANNEL_NAME='""'
+       -DSENSOR_CHANNEL_KEY='""'
+       -DTX_CHANNEL='"#connections"'
    ```
+   Флаги каналов — лишь дефолт первого старта; после настройки через HA
+   они сохраняются в NVS, и флаги больше не влияют (их можно закомментить).
 
 2. В Home Assistant установите интеграцию [MQTT](https://www.home-assistant.io/integrations/mqtt/)
    (она уже может быть — если HA подключён к Mosquitto/EMQX/etc).
@@ -177,12 +192,19 @@ ASCII-умы и символы после `0xF0`.
 |-----|-----|----------|
 | **Sensor** | `<имя> Message` | Последнее сообщение: sender, text, channel, RSSI, SNR, hops, route |
 | **Sensor** | `<имя> LastMsg` | Текст последнего сообщения **выбранного** канала (удобно для триггеров) |
-| **Sensor** | `<имя> Status` | Системный статус: uptime, packets, duplicates, channel, private |
+| **Sensor** | `<имя> Status` | Системный статус: uptime, packets, duplicates, channel, private, **temp** |
 | **Text** | `<имя> Send` | Текстовое поле → LoRa TX (флуд в выбранный канал) |
-| **Select** | `<имя> Channel` | Выбор канала TX: `#public` / `#connections` / приватный канал |
+| **Select** | `<имя> Channel` | Выбор канала TX: `#public` / `#connections` / приватный / сенсорный канал |
 | **Text** | `<имя> Priv Chan Name` | Имя приватного канала для прослушки, напр. `#garage` |
 | **Text** | `<имя> Priv Chan Key` | PSK приватного канала (base64, 16 байт; пусто = автоключ из имени) |
+| **Text** | `<имя> Sensor Chan Name` | Имя сенсорного канала (сообщения → отдельное устройство в HA) |
+| **Text** | `<имя> Sensor Chan Key` | PSK сенсорного канала (base64, 16 байт; пусто = автоключ из имени) |
 | **Switch** | `<имя> Listening` | Вкл/выкл приёмника (radio.startReceive / radio.standby) |
+
+Для каждого отправителя на **сенсорном канале** бот создаёт отдельное
+устройство `MeshBot Sensor <имя>` с двумя сущностями: Text `<имя> data`
+(текст сообщения) и Sensor `<имя> RSSI` (сигнал). Все они обновляются
+самостоятельно на каждый приход сообщения.
 
 ### MQTT Topics
 
@@ -197,15 +219,39 @@ ASCII-умы и символы после `0xF0`.
 | `meshcore/bot/<name>/cmd/listening` | ← HA | `"ON"` / `"OFF"` |
 | `meshcore/bot/<name>/cmd/private/name` | ← HA | Имя приватного канала (напр. `#garage`) |
 | `meshcore/bot/<name>/cmd/private/key` | ← HA | PSK base64 (16 байт); пусто = автоключ |
+| `meshcore/bot/<name>/cmd/sensor/name` | ← HA | Имя сенсорного канала (канал датчиков) |
+| `meshcore/bot/<name>/cmd/sensor/key` | ← HA | PSK сенсорного канала; пусто = автоключ |
+| `meshcore/bot/<name>/cfg/private_name`…`cfg/sensor_key` | ← HA | Retained-эхо настройки (для восстановления при рестарте) |
+| `meshcore/bot/<name>/sensor/<slug>/text` | → HA | Текст от датчика (slug = отправитель) |
+| `meshcore/bot/<name>/sensor/<slug>/rssi` | → HA | RSSI датчика, dBm |
 
-### Приватный канал
+Retained настройки каналов (`cfg/private_name`, `cfg/private_key`,
+`cfg/sensor_name`, `cfg/sensor_key`) публикуются ботом при каждом изменении —
+при перезапуске он сам восстанавливает конфигурацию подписками, не полагаясь
+на NVS-флаги.
 
-Задаётся из HA двумя полями: **имя** (например `#garage`) и **ключ**. Если
+### Приватный и сенсорный каналы
+
+Задаются из HA двумя полями: **имя** (например `#garage`) и **ключ**. Если
 ключ пустой — используется автоключ `SHA256(имя)[0:16]` (как у
 `#connections`); если задан — это PSK в base64 (16 байт, как у `#public`).
-Канал добавляется третьим в таблицу, и бот слушает его вместе с
+Каждый канал добавляется в таблицу, и бот слушает его вместе с
 `#public`/`#connections`. Имя + ключ сохраняются в NVS и восстанавливаются
-после перезагрузки. После смены имени/ключа discovery перепубликуется.
+после перезагрузки (также дублируются retained-топиками `cfg/*`). После
+смены имени/ключа discovery перепубликуется.
+
+**Сенсорный канал** отличается поведением: сообщения из него не участвуют в
+`/ping`-ответах и не идут в `state/lastmsg`, а публикуются как отдельное
+устройство Home Assistant на каждого отправителя (см. таблицу сущностей).
+Рекомендуется завести под него отдельный приватный канал для датчиков
+(температура/уровень/напряжение) — тогда их данные не смешиваются с чатом.
+
+### Температура
+
+В статус включается температура чипа (`temperatureRead()` ядра). Из-за
+некомпенсированного eFuse датчика на ESP32-S3 показания могут быть
+завышены — поправка задаётся флагом `-DTEMP_SENSOR_OFFSET=<градусы>`
+(например `-12.0`), сечение `[mqtt]` в `platformio.ini`.
 
 ### Статус на OLED
 
@@ -216,8 +262,8 @@ ASCII-умы и символы после `0xF0`.
 
 | Вариант | RAM | Flash |
 |---------|-----|-------|
-| Без MQTT | 7.2% (23 КБ) | 12.2% (408 КБ) |
-| С MQTT | 15.1% (49 КБ) | 25.2% (843 КБ) |
+| Без MQTT | 7.3% (23 КБ) | 12.3% (402 КБ) |
+| С MQTT | 15.3% (49 КБ) | 25.8% (843 КБ) |
 
 ## Драйвер OLED (SH1106 vs SSD1306)
 

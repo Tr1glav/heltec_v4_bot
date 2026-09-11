@@ -52,6 +52,11 @@ public:
     command(_contrast);
   }
 
+  // Выключить/включить экран (RAM сохраняется, повторная инициализация не нужна)
+  void setPower(bool on) {
+    command(on ? 0xAF : 0xAE);   // display on / display off
+  }
+
   void clearDisplay(void) {
     memset(_buf, 0, sizeof(_buf));
   }
