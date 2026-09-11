@@ -8,15 +8,16 @@ void otaTxGroup(const String& msg);
 void otaBotAbort(const char* why);
 void otaDrawProgress();
 void otaSendStart();
-void otaSendChunk();
 void otaSendEnd();
 void otaHandleAck();
 void otaBotTick();
+void otaInspectStoredFw();
+bool otaSessionActive();
 String buildDiagReport();
 void setupOtaServer();
 #endif
 #ifdef SENSOR_NODE
-void otaSensorSend(const String& msg, bool flood = false, unsigned int staggerMs = 0);
+void otaSensorSend(const String& msg);
 void otaSensorDraw();
 void otaSensorAbort(const char* why);
 void otaSensorTick();

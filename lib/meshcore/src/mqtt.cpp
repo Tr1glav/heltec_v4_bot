@@ -3,6 +3,7 @@
 #include "crypto.h"
 #include "mesh.h"
 #include "mqtt.h"
+#include "ota.h"
 
 #ifdef MQTT_ENABLED
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -15,6 +16,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (strstr(topic, "/cmd/send")) {
         if (!isListening) {
             Serial.println("[MQTT] radio off, ignoring send cmd");
+            return;
+        }
+        if (otaSessionActive()) {
+            Serial.println("[MQTT] mesh OTA in progress, ignoring send cmd");
             return;
         }
         String txt = msg;
@@ -55,7 +60,8 @@ void publishDiscovery() {
         "\"identifiers\":[\"meshcore_bot_%s\"],"
         "\"name\":\"%s\","
         "\"manufacturer\":\"MeshCore\","
-        "\"model\":\"ESP32-S3 Listener\"",
+        "\"model\":\"ESP32-S3 Listener\","
+        "\"sw_version\":\"" FW_VERSION "\"",
         DEVICE_NAME, DEVICE_NAME);
 
     char topic[128], payload[512];
@@ -106,6 +112,19 @@ void publishDiscovery() {
         "\"unit_of_measurement\":\"°C\","
         "\"unique_id\":\"meshcore_%s_temp\","
         "\"icon\":\"mdi:thermometer\","
+        "\"device\":{%s}}",
+        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+    mqtt.publish(topic, payload, true);
+
+    // --- Sensor: версия прошивки (поле version из /status) ---
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/version/config", DEVICE_NAME);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s Firmware\","
+        "\"state_topic\":\"%s/status\","
+        "\"value_template\":\"{{ value_json.version }}\","
+        "\"unique_id\":\"meshcore_%s_version\","
+        "\"icon\":\"mdi:chip\","
+        "\"entity_category\":\"diagnostic\","
         "\"device\":{%s}}",
         DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
     mqtt.publish(topic, payload, true);
@@ -266,6 +285,16 @@ void publishSensorDisc(const String& sender, const char* slug) {
     mqtt.publish(alvTopic, alvPayload, true);
     Serial.printf("[MQTT] sensor availability discovery: %s\n", slug);
 
+    char verTopic[128], verPayload[512];
+    snprintf(verTopic, sizeof(verTopic), "homeassistant/sensor/meshcore_sensor_%s/version/config", slug);
+    snprintf(verPayload, sizeof(verPayload),
+        "{\"name\":\"%s firmware\",\"state_topic\":\"%s/sensor/%s/version\","
+        "\"icon\":\"mdi:chip\",\"entity_category\":\"diagnostic\","
+        "\"unique_id\":\"meshcore_sensor_%s_version\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(verTopic, verPayload, true);
+
     // Event entity: MQTT event platform — появляется как device-trigger "Fired"
     // в автоматизациях HA.  При нажатии кнопки сенсор шлёт "button", бот
     // публикует payload "button" в event_type_topic, HA генерирует событие.
@@ -319,8 +348,14 @@ bool publishSensorMessage() {
             Serial.printf("[SNS] %s AVAILABLE (online)\n", lastSender.c_str());
         }
     }
-    // --- heartbeat: только availability, без text/rssi ---
-    if (lastMessage == SENSOR_MSG_HELLO) {
+    // --- heartbeat: availability и версия прошивки ("hello:<версия>"; старые сенсоры шлют "hello") ---
+    if (lastMessage == SENSOR_MSG_HELLO || lastMessage.startsWith(SENSOR_MSG_HELLO ":")) {
+        int sep = lastMessage.indexOf(':');
+        if (sep > 0) {
+            char tVer[128];
+            snprintf(tVer, sizeof(tVer), "%s/sensor/%s/version", mqttPrefix, slug);
+            mqtt.publish(tVer, lastMessage.c_str() + sep + 1, true);
+        }
         Serial.printf("[SNS] heartbeat from %s\n", lastSender.c_str());
         return true;
     }
@@ -368,12 +403,12 @@ void publishStatus() {
     const char* chName = (mqttTxChannel >= 0 && mqttTxChannel < numChannels)
                          ? channels[mqttTxChannel].name : "?";
     jsonEscape(chName, chEsc, sizeof(chEsc));
-    char topic[96], payload[320];
+    char topic[96], payload[384];
     unsigned long upSec = millis() / 1000;
     float tempC = cpuTempC();
     snprintf(topic, sizeof(topic), "%s/status", mqttPrefix);
     snprintf(payload, sizeof(payload),
-        "{\"wifi\":true,\"mqtt\":true,\"lora_rx\":%s,"
+        "{\"version\":\"" FW_VERSION "\",\"wifi\":true,\"mqtt\":true,\"lora_rx\":%s,"
         "\"uptime\":%lu,\"packets\":%d,\"duplicates\":%lu,"
         "\"temp\":%.1f,\"ip\":\"%s\","
         "\"channel\":\"%s\",\"private\":\"%s\"}",

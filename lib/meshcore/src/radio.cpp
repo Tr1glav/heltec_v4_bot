@@ -30,6 +30,28 @@ int txFrame(uint8_t* frame, int f) {
     return st;
 }
 
+// SX1262-специфичные настройки включаются build_flags'ами
+// (см. platformio.ini / board_config.h), чтобы на других платах
+// не применять опции, нужные только Heltec V4. begin/beginFSK их сбрасывают.
+static void applyBoardRadioOptions() {
+    #ifdef SX126X_DIO2_AS_RF_SWITCH
+    radio.setDio2AsRfSwitch(true);
+    #endif
+    #ifdef SX126X_RX_BOOSTED_GAIN
+    radio.setRxBoostedGainMode(true);
+    #endif
+    #ifdef SX126X_CURRENT_LIMIT
+    radio.setCurrentLimit(SX126X_CURRENT_LIMIT);
+    #endif
+    #ifdef SX126X_REGISTER_PATCH
+    // патч регистра 0x8B5 для улучшенного приёма на Heltec v4
+    uint8_t r_data = 0;
+    radio.readRegister(0x8B5, &r_data, 1);
+    r_data |= 0x01;
+    radio.writeRegister(0x8B5, &r_data, 1);
+    #endif
+}
+
 bool initLoRa() {
     Serial.println("Init LoRa...");
     
@@ -44,26 +66,7 @@ bool initLoRa() {
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println("LoRa OK (TCXO from macro)");
         radio.setCRC(true);
-
-        // SX1262-специфичные настройки включаются build_flags'ами
-        // (см. platformio.ini / board_config.h), чтобы на других платах
-        // не применять опции, нужные только Heltec V4.
-        #ifdef SX126X_DIO2_AS_RF_SWITCH
-        radio.setDio2AsRfSwitch(true);
-        #endif
-        #ifdef SX126X_RX_BOOSTED_GAIN
-        radio.setRxBoostedGainMode(true);
-        #endif
-        #ifdef SX126X_CURRENT_LIMIT
-        radio.setCurrentLimit(SX126X_CURRENT_LIMIT);
-        #endif
-        #ifdef SX126X_REGISTER_PATCH
-        // патч регистра 0x8B5 для улучшенного приёма на Heltec v4
-        uint8_t r_data = 0;
-        radio.readRegister(0x8B5, &r_data, 1);
-        r_data |= 0x01;
-        radio.writeRegister(0x8B5, &r_data, 1);
-        #endif
+        applyBoardRadioOptions();
         return true;
     }
     
@@ -82,6 +85,34 @@ void radioSetParams(float freq, float bw, int sf, int cr) {
     isListening = true;
 }
 
-void radioSetNormalConfig() { radioSetParams(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR); }
+static bool radioFsk = false;
 
-void radioSetFastConfig()   { radioSetParams(OTA_FAST_FREQ, OTA_FAST_BW, OTA_FAST_SF, OTA_FAST_CR); }
+void radioSetNormalConfig() {
+    if (radioFsk) {
+        radioFsk = false;
+        initLoRa();
+        lastReArmMs = 0;
+        radio.startReceive();
+        isListening = true;
+        return;
+    }
+    radioSetParams(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
+}
+
+void radioSetFastConfig() {
+    #if OTA_FAST_FSK
+    int st = radio.beginFSK(OTA_FAST_FREQ, OTA_FSK_BR, OTA_FSK_DEV, OTA_FSK_RXBW,
+                            LORA_TX_POWER, OTA_FSK_PREAMBLE, 1.8);
+    if (st != RADIOLIB_ERR_NONE) Serial.printf("[RADIO] beginFSK failed %d\n", st);
+    radioFsk = true;
+    applyBoardRadioOptions();
+    radio.setDataShaping(RADIOLIB_SHAPING_0_5);
+    uint8_t sw[] = { 0xBE, 0xEF, 0x07, 0xA5 };
+    radio.setSyncWord(sw, sizeof(sw));
+    lastReArmMs = 0;
+    radio.startReceive();
+    isListening = true;
+    #else
+    radioSetParams(OTA_FAST_FREQ, OTA_FAST_BW, OTA_FAST_SF, OTA_FAST_CR);
+    #endif
+}

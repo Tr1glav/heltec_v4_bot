@@ -200,10 +200,7 @@ void setup() {
         slog("[LITTLEFS] FAILED (begin) — mesh OTA недоступен\n");
     }
     if (LittleFS.exists("/ota.bin")) {
-        File f = LittleFS.open("/ota.bin", "r");
-        otaFwSize = f ? (uint32_t)f.size() : 0;
-        otaFwReady = (otaFwSize > 0);
-        if (f) f.close();
+        otaInspectStoredFw();
         slog("[OTA] /ota.bin: %u байт (mesh OTA ready=%d)\n",
              (unsigned)otaFwSize, (int)otaFwReady);
     }
@@ -277,11 +274,10 @@ void loop() {
                 int pktLen = radio.getPacketLength();
                 float rssi = radio.getRSSI();
                 float snr = radio.getSNR();
-                if (pktLen > 0) {
+                // в fast-режиме лог каждого кадра стоит миллисекунды UART на кадр
+                if (pktLen > 0 && !otaFastMode) {
                     Serial.printf("\n[RX] len=%d RSSI=%.1f SNR=%.1f ", pktLen, rssi, snr);
-                    // hex-дамп опускаем в fast-режиме: каждый пакет — это ~8 мс на UART
-                    if (!otaFastMode)
-                        for (int i = 0; i < min(pktLen, 24); i++) Serial.printf("%02X", buffer[i]);
+                    for (int i = 0; i < min(pktLen, 24); i++) Serial.printf("%02X", buffer[i]);
                     Serial.println();
                 }
                 if (pktLen > 0 && otaFastMode &&
@@ -299,6 +295,7 @@ void loop() {
 
                     // hex-экран только для GRP_TXT, который не расшифровался
                     // (рекламные/служебные пакеты экран не трогаем)
+                    #ifndef SENSOR_NODE
                     if (pktLen > 0 && !parsed && !otaFastMode && ((buffer[0] >> 2) & 0x0F) == 0x05) {
                         if (!screenOff) {
                             display.setTextSize(1);
@@ -312,6 +309,7 @@ void loop() {
                         }
                         lastRxDisplay = millis();
                     }
+                    #endif
 
 // не перезатираем экран 5 сек после сообщения
                     if (parsed) {
@@ -337,7 +335,12 @@ void loop() {
     // Показать статус на экране (обновляем раз в 500мс)
     if (isListening && !screenOff && (millis() - lastDisplayUpdate > 500)) {
         lastDisplayUpdate = millis();
-        if (!otaFastMode && (millis() - lastRxDisplay > 5000)) {
+        #ifdef SENSOR_NODE
+        bool rxScreenHeld = false;   // сенсор входящие пакеты не рисует, статус не ждёт паузы после приёма
+        #else
+        bool rxScreenHeld = millis() - lastRxDisplay <= 5000;
+        #endif
+        if (!otaFastMode && !rxScreenHeld) {
             drawIdleStatus();
         }
     }
@@ -381,7 +384,7 @@ void loop() {
         char tbuf[32];
         strftime(tbuf, sizeof(tbuf), "%H:%M:%S %d.%m.%Y", &tm_now);
         Serial.printf("[RTC] NTP time synced: %s\n", tbuf);
-        if (sensorChannelIdx >= 0) {
+        if (sensorChannelIdx >= 0 && !otaSessionActive()) {
             lastSensorTimeSyncMs = millis();
             sendSensorTimeSync();
         }
@@ -389,7 +392,8 @@ void loop() {
     // ===== Рассылка актуального времени сенсорам в сенсорный канал =====
     // Работает только при реально синхронизированном времени (ntpSyncedLogged):
     // build-time устаревает, и датчики должны получать истинный epoch.
-    if (ntpSyncedLogged && sensorChannelIdx >= 0 &&
+    // во время mesh OTA любой TX бота бьёт ответы сенсора; рассылка догонит после сессии
+    if (ntpSyncedLogged && sensorChannelIdx >= 0 && !otaSessionActive() &&
         (int32_t)(millis() - lastSensorTimeSyncMs) >= (int32_t)SENSOR_TIME_SYNC_INTERVAL_MS) {
         lastSensorTimeSyncMs = millis();
         sendSensorTimeSync();
@@ -402,7 +406,7 @@ void loop() {
 
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
-    otaSensorTick();   // mesh OTA: сторожевое время — при зависании откат к прежней прошивке
+    otaSensorTick();   // mesh OTA: сторожевое время — при зависании прерываем сессию
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
     // Во время OTA mesh-отправки подавляем: радио слушает raw-чанки на быстром канале.
     static unsigned long lastBtnPress = 0;
@@ -411,12 +415,12 @@ void loop() {
     if (!otaActive) {
         if (!bootHelloSent) {
             bootHelloSent = true;
-            sensorSendMsg(SENSOR_MSG_HELLO);   // стартовый hello сразу после включения
+            sensorSendMsg(SENSOR_MSG_HELLO ":" FW_VERSION);   // стартовый hello сразу после включения
             // не упреждать первый периодический heartbeat после boot-привета
             lastHeartbeat = millis();
         } else if (millis() - lastHeartbeat >= SENSOR_HEARTBEAT_MS) {
             lastHeartbeat = millis();
-            sensorSendMsg(SENSOR_MSG_HELLO);
+            sensorSendMsg(SENSOR_MSG_HELLO ":" FW_VERSION);
         }
     }
     if (!otaActive && millis() - lastBtnPress > 5000) {

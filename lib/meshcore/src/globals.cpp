@@ -113,7 +113,6 @@ uint32_t otaSeq = 0;        // seq последнего отправленног
 uint32_t otaSentBytes = 0;  // байт, подтверждённых сенсором
 uint8_t otaRetries = 0;     // повторы подряд по таймауту/nack
 unsigned long otaSince = 0; // millis() последней отправки
-bool otaRawMode = false;    // чистая LoRa OTA (raw-фреймы) вместо legacy mesh-текста
 WebServer otaServer(3232);
 bool otaFlashing = false;
 unsigned long otaStartMs = 0;
@@ -130,4 +129,5 @@ uint32_t otaCrcExp = 0;     // ожидаемый CRC32 всего файла
 uint32_t otaCrcAcc = 0xFFFFFFFF;  // накапливаемый CRC32
 uint32_t otaSeqExp = 0;     // следующий ожидаемый seq
 unsigned long otaLastActivity = 0; // millis() последнего OTA-пакета
+String sensorLastSent = "";        // последнее сообщение, отправленное сенсором (для экрана)
 #endif // SENSOR_NODE

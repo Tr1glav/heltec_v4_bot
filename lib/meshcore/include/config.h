@@ -119,21 +119,35 @@ struct PeerEntry {
 #define SEEN_ADVERT_HASH_COUNT 16
 
 // ===== МESH OTA =====
-#define OTA_CHUNK_HEX 200
-#define OTA_CHUNK_BYTES (OTA_CHUNK_HEX / 2)
 #define OTA_ACK_TIMEOUT_MS 400
+// ota:start идёт на штатном SF8/BW62.5: пакет ~0.5 с в эфире, ответ сенсора ~0.4 с — 400 мс не хватает
+#define OTA_START_TIMEOUT_MS 3000
+// финал: Update.end() на сенсоре проверяет весь образ перед ответом
+#define OTA_END_TIMEOUT_MS 3000
 #define OTA_MAX_RETRIES 4
-#define OTA_ACK_STAGGER_MS 15
-#define OTA_DRAW_MS 100
+#define OTA_MAX_FW_BYTES (3UL * 1024 * 1024)
+#define OTA_DRAW_MS 1000
 #define OTA_FAST_FREQ       868.950
 #define OTA_FAST_BW         500.0
-#define OTA_FAST_SF         7
+#define OTA_FAST_SF         5       // при OTA_FAST_FSK 0
 #define OTA_FAST_CR         5
-#define OTA_FAST_SETTLE_MS  800
+// сенсор шлёт ackstart трижды (~1.3 с на SF8) и переключается только после третьей копии
+#define OTA_FAST_SETTLE_MS  1200
+// v3: 1 = GFSK 100 кбит/с (LoRa SF7/BW500 ~22 кбит/с, но чувствительность хуже), 0 = LoRa OTA_FAST_SF
+#define OTA_FAST_FSK        1
+#define OTA_FSK_BR          100.0   // кбит/с
+#define OTA_FSK_DEV         50.0    // кГц
+#define OTA_FSK_RXBW        234.3   // кГц
+#define OTA_FSK_PREAMBLE    32      // бит
+// v3: чанков в пачке до подтверждения (<= 16: маска uint16)
+#define OTA_WINDOW          8
+// пауза между кадрами пачки: сенсор должен вычитать кадр и вернуться в RX до следующего
+#define OTA_BURST_GAP_MS    15
 
 // Сенсорная сторона OTA
 #ifdef SENSOR_NODE
 #define OTA_SENSOR_STALL_MS 60000
+#define OTA_SENSOR_FIRST_CHUNK_MS 5000
 #endif
 
 // ===== ЧИСТЫЙ LoRa OTA (сырые фреймы вне meshcore) =====
@@ -141,20 +155,24 @@ struct PeerEntry {
 // (OTA_FAST_*), без группового шифрования и флуд-маршрутизации.
 // Формат кадра:
 //   [magic0][magic1][type][seq4 LE][data...][crc16 2B LE]
-// Фрейм <= 255 Б (лимит SX1262), служебных 9 Б.
+// Фрейм <= 255 Б (лимит SX1262), служебных 11 Б (в DATA ещё MAC 2 Б перед шифром).
 #define OTA_RAW_CHUNK_BYTES 240
-#define OTA_RAW_FRAME_MAX   (9 + OTA_RAW_CHUNK_BYTES)
+#define OTA_RAW_FRAME_MAX   (11 + OTA_RAW_CHUNK_BYTES)   // заголовок 7 + MAC 2 + шифр + crc16 2
 #define RAW_MAGIC0  0xBE
 #define RAW_MAGIC1  0xEF
 // бот -> сенсор
 #define RAW_TYPE_DATA  0x02
 #define RAW_TYPE_DONE  0x03
 #define RAW_TYPE_ABORT 0x04
+#define RAW_TYPE_DATA_LAST 0x05   // v3: последний кадр пачки, ответить WACK
+#define RAW_TYPE_POLL  0x06       // v3: запрос WACK
 // сенсор -> бот
-#define RAW_TYPE_ACK     0x81
-#define RAW_TYPE_NACK    0x82
 #define RAW_TYPE_DONE_ACK 0x83
 #define RAW_TYPE_FAIL    0x84
+#define RAW_TYPE_WACK    0x85     // v3: seq = первый недостающий чанк, данные = маска 2B LE следующих
+// Сжатый файл прошивки (scripts/copy_firmware.py): [OTAZ][размер образа 4B LE][CRC32 образа 4B LE][zlib]
+#define OTA_Z_MAGIC "OTAZ"
+#define OTA_Z_HDR   12
 
 // ===== КАНАЛЫ: struct =====
 struct MeshChannel {
@@ -178,6 +196,10 @@ enum {
 #endif
 
 // Компилятором задавалось BUILD_UNIX_TIME из времени хоста
+// FW_VERSION задаёт scripts/gen_version.py из version.txt
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
 #ifndef BUILD_UNIX_TIME
 #define BUILD_UNIX_TIME 0
 #endif

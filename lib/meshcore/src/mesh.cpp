@@ -422,6 +422,8 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     // Показать сообщение на экране (если экран не погашен автовыключением).
     // Во время mesh OTA экран не трогаем — иначе каждый чанк мигает сообщением
     // между кадрами прогресса (otaDrawProgress/otaSensorDraw).
+    // Сенсор показывает только свой статус (drawIdleStatus), входящие пакеты не рисует.
+    #ifndef SENSOR_NODE
     if (!screenOff && !otaFastMode) {
         display.clearDisplay();
         display.setTextSize(1);
@@ -447,6 +449,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         display.println(showMsg);
         display.display();
     }
+    #endif
 
     // === СЕНСОРНЫЙ КАНАЛ: сообщение уходит в MQTT как отдельное устройство ===
     if (sensorChannelIdx >= 0 && chIdx == sensorChannelIdx) {

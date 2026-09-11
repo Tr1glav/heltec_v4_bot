@@ -37,43 +37,6 @@ uint16_t crc16buf(const uint8_t* data, size_t len) {
     return crc;
 }
 
-uint16_t hexToU16(const char* s) {
-    uint16_t v = 0;
-    for (int i = 0; i < 4 && s[i]; i++) {
-        v <<= 4;
-        char c = s[i];
-        if (c >= '0' && c <= '9') v |= (c - '0');
-        else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
-    }
-    return v;
-}
-
-uint8_t hexToChar(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 0;
-}
-
-int hexToBytes(const char* hex, uint8_t* dst, int maxlen) {
-    int n = 0;
-    while (hex[n * 2] && hex[n * 2 + 1] && n < maxlen) {
-        dst[n] = (uint8_t)(hexToChar(hex[n * 2]) << 4) | hexToChar(hex[n * 2 + 1]);
-        n++;
-    }
-    return n;
-}
-
-void bytesToHex(const uint8_t* src, size_t len, char* dst) {
-    static const char* H = "0123456789ABCDEF";
-    for (size_t i = 0; i < len; i++) {
-        dst[i * 2] = H[(src[i] >> 4) & 0x0F];
-        dst[i * 2 + 1] = H[src[i] & 0x0F];
-    }
-    dst[len * 2] = 0;
-}
-
 int encryptGroupText(const uint8_t* secret32, uint8_t* dest, const uint8_t* src, int src_len) {
     if (src_len <= 0) return 0;
     int padded = (src_len + 15) & ~15;

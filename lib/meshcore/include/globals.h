@@ -93,7 +93,6 @@ extern uint32_t otaSeq;
 extern uint32_t otaSentBytes;
 extern uint8_t otaRetries;
 extern unsigned long otaSince;
-extern bool otaRawMode;              // true = чистая LoRa OTA (senotor подтверждает ackstart:2)
 extern WebServer otaServer;
 extern bool otaFlashing;
 extern unsigned long otaStartMs;
@@ -111,4 +110,5 @@ extern uint32_t otaCrcExp;
 extern uint32_t otaCrcAcc;
 extern uint32_t otaSeqExp;
 extern unsigned long otaLastActivity;
+extern String sensorLastSent;
 #endif
