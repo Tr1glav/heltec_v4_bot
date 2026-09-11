@@ -29,7 +29,7 @@ inline void fetchGlyph(uint8_t cp866, uint8_t (&out)[8]) {
   if (cp866 == 0x98) memcpy(out, OVERRIDE_SH, 8);  // Ш
 }
 
-uint8_t unicodeToCp866(uint32_t cp) {
+inline uint8_t unicodeToCp866(uint32_t cp) {
   if (cp >= 0x0410 && cp <= 0x041F) return 0x80 + (uint8_t)(cp - 0x0410);  // А-П
   if (cp >= 0x0420 && cp <= 0x042F) return 0x90 + (uint8_t)(cp - 0x0420);  // Р-Я
   if (cp >= 0x0430 && cp <= 0x043F) return 0xA0 + (uint8_t)(cp - 0x0430);  // а-п

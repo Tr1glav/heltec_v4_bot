@@ -202,6 +202,17 @@
     #include "sysoled.h"          // own compact SH1106 driver (Heltec V4 panels)
   #else
     #include <Adafruit_SSD1306.h>
+    // Same UTF-8 -> CP866 hook, applied to the Adafruit SSD1306 driver.
+    class RusSSD1306 : public Adafruit_SSD1306 {
+    public:
+      using Adafruit_SSD1306::Adafruit_SSD1306;
+      size_t write(uint8_t c) override {
+        return utf8cp866::processByte(*this, _u8, c, 1, 1, 1);
+      }
+      void setPower(bool on) { ssd1306_command(on ? 0xAF : 0xAE); }
+    private:
+      utf8cp866::Decoder _u8;
+    };
   #endif
 
 #else // no display -> stub with the same API
@@ -231,24 +242,27 @@
   #define SSD1306_SWITCHCAPVCC 1
 #endif
 
-// Instantiate the display object selected above.
-#if HAS_OLED
-  #if OLED_DRIVER_SH1106
-    SysOled display(SCREEN_WIDTH, SCREEN_HEIGHT);
+// Instantiate the display object exactly once. Globals.cpp #defines
+// DISPLAY_DEFINE_HERE before including config.h; everywhere else it's extern,
+// so multiple translation units can use `display` without link errors.
+#ifdef DISPLAY_DEFINE_HERE
+  #if HAS_OLED
+    #if OLED_DRIVER_SH1106
+      SysOled display(SCREEN_WIDTH, SCREEN_HEIGHT);
+    #else
+      RusSSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+    #endif
   #else
-    // Same UTF-8 -> CP866 hook, applied to the Adafruit SSD1306 driver.
-    class RusSSD1306 : public Adafruit_SSD1306 {
-    public:
-      using Adafruit_SSD1306::Adafruit_SSD1306;
-      size_t write(uint8_t c) override {
-        return utf8cp866::processByte(*this, _u8, c, 1, 1, 1);
-      }
-      void setPower(bool on) { ssd1306_command(on ? 0xAF : 0xAE); }
-    private:
-      utf8cp866::Decoder _u8;
-    };
-    RusSSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+    StubDisplay display(SCREEN_WIDTH, SCREEN_HEIGHT);
   #endif
 #else
-  StubDisplay display(SCREEN_WIDTH, SCREEN_HEIGHT);
+  #if HAS_OLED
+    #if OLED_DRIVER_SH1106
+      extern SysOled display;
+    #else
+      extern RusSSD1306 display;
+    #endif
+  #else
+    extern StubDisplay display;
+  #endif
 #endif
