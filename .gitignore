@@ -8,3 +8,4 @@
 .vscode/ipch
 __pycache__
 secrets.ini
+firmware_output/*
