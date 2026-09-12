@@ -10,6 +10,7 @@ void clearLastMsg();
 void clearSensorBtnText();
 void mqttSlug(const char* name, char* out, int maxLen);
 void publishSensorDisc(const String& sender, const char* slug);
+void publishSensorAvailability(int idx);
 bool publishSensorMessage();
 void publishStatus();
 void setupMQTT();

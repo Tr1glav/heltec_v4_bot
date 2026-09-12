@@ -9,3 +9,4 @@
 __pycache__
 secrets.ini
 firmware_output/*
+lib/meshcore/include/build_info.h

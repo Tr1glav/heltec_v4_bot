@@ -7,7 +7,6 @@
 
 float cpuTempC();
 
-uint32_t crc32buf(const uint8_t* data, size_t len);
 uint32_t crc32_upd(uint32_t crc, const uint8_t* data, size_t len);
 uint16_t crc16buf(const uint8_t* data, size_t len);
 

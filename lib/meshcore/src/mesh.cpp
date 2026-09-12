@@ -3,6 +3,7 @@
 #include "crypto.h"
 #include "radio.h"
 #include "mesh.h"
+#include "display.h"
 
 uint8_t* findPeerPub(uint8_t hash) {
     for (int i = 0; i < PEER_CACHE_MAX; i++) {
@@ -84,13 +85,25 @@ bool checkAndMarkSeen(uint8_t* data, int len) {
     return false;
 }
 
-void addChannelKey16(const char* name, const uint8_t* key16) {
-    MeshChannel& ch = channels[numChannels];
+// Секрет канала — 16-байтный ключ, дополненный нулями до 32; hash — первый байт SHA256(ключа)
+static void setChannelKey(MeshChannel& ch, const uint8_t* key16) {
     memset(ch.secret, 0, sizeof(ch.secret));
     memcpy(ch.secret, key16, 16);
-    uint8_t sha256_result[32];
-    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), ch.secret, 16, sha256_result);
-    ch.hash = sha256_result[0];
+    uint8_t sha[32];
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), ch.secret, 16, sha);
+    ch.hash = sha[0];
+}
+
+// Автоключ канала MeshCore: SHA256(имя)[0:16]
+static void autoKey16(const char* name, uint8_t key16[16]) {
+    uint8_t sha[32];
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const uint8_t*)name, strlen(name), sha);
+    memcpy(key16, sha, 16);
+}
+
+void addChannelKey16(const char* name, const uint8_t* key16) {
+    MeshChannel& ch = channels[numChannels];
+    setChannelKey(ch, key16);
     ch.name = name;
     numChannels++;
     Serial.printf("Channel %s: key ", name);
@@ -108,13 +121,9 @@ void deriveChannels() {
     mbedtls_base64_decode(key16, 16, &olen, (const uint8_t*)psk_b64, strlen(psk_b64));
     addChannelKey16("#public", key16);
 
-    // #connections: автоключ = SHA256("#connections")[0:16]
-    const char* name = "#connections";
-    uint8_t sha256_result[32];
-    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-               (const uint8_t*)name, strlen(name), sha256_result);
-    memcpy(key16, sha256_result, 16);
-    addChannelKey16(name, key16);
+    // #connections: автоключ по имени
+    autoKey16("#connections", key16);
+    addChannelKey16("#connections", key16);
 
     // Приватный канал MQTT-бота — из build-флагов.
     #ifdef MQTT_ENABLED
@@ -132,102 +141,47 @@ int findChannelByName(const char* name) {
     return -1;
 }
 
-int setPrivateChannel(const String& name, const String& keyb64) {
+// Канал из build-флагов: PSK в base64 или автоключ по имени. channels[].name указывает
+// в буфер nameStore, поэтому nameStore должен жить всё время работы (глобальный String).
+static int setNamedChannel(const char* tag, const String& name, const String& keyb64,
+                           String& nameStore, int& idxStore) {
     if (name.length() == 0 || name.length() > 32) return -1;
     uint8_t key16[16];
-    int keyType = privateKeyTo16(keyb64, key16);
-    if (keyType < 0) {   // автоключ
-        uint8_t sha256_result[32];
-        mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                   (const uint8_t*)name.c_str(), name.length(), sha256_result);
-        memcpy(key16, sha256_result, 16);
-    }
+    if (privateKeyTo16(keyb64, key16) < 0) autoKey16(name.c_str(), key16);
 
     int idx = findChannelByName(name.c_str());
-    if (idx >= 0) {
-        // канал существует — проверяем, не поменялся ли ключ
-        if (memcmp(channels[idx].secret, key16, 16) != 0) {
-            memset(channels[idx].secret, 0, sizeof(channels[idx].secret));
-            memcpy(channels[idx].secret, key16, 16);
-            uint8_t sha256_result[32];
-            mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                       channels[idx].secret, 16, sha256_result);
-            channels[idx].hash = sha256_result[0];
-            Serial.printf("[PRV] channel %s key UPDATED, hash 0x%02X\n",
-                          name.c_str(), channels[idx].hash);
+    if (idx < 0) {
+        if (numChannels >= MAX_CHANNELS) {
+            Serial.printf("[%s] MAX_CHANNELS reached, channel not added\n", tag);
+            return -1;
         }
-        privateChannelIdx = idx;
-        privateChannelName = channels[idx].name;
-        return idx;
+        nameStore = name;
+        addChannelKey16(nameStore.c_str(), key16);
+        idx = numChannels - 1;
+        Serial.printf("[%s] channel added: %s hash 0x%02X (idx %d)\n",
+                      tag, nameStore.c_str(), channels[idx].hash, idx);
+    } else {
+        if (memcmp(channels[idx].secret, key16, 16) != 0) {
+            setChannelKey(channels[idx], key16);
+            Serial.printf("[%s] channel %s key UPDATED, hash 0x%02X\n", tag, name.c_str(), channels[idx].hash);
+        }
+        if (channels[idx].name != nameStore.c_str()) nameStore = channels[idx].name;
     }
-    if (numChannels >= MAX_CHANNELS) {
-        Serial.println("[PRV] MAX_CHANNELS reached, channel not added");
-        return -1;
-    }
-    privateChannelName = name;             // держим имя в String
-    addChannelKey16(privateChannelName.c_str(), key16);
-    privateChannelIdx = numChannels - 1;
-    Serial.printf("[PRV] private channel added: %s key+hash 0x%02X (idx %d)\n",
-                  privateChannelName.c_str(), channels[privateChannelIdx].hash,
-                  privateChannelIdx);
-    return privateChannelIdx;
+    idxStore = idx;
+    return idx;
 }
 
 void loadPrivateChannel() {
     // Каналы задаются ТОЛЬКО из build-флагов (secrets.ini), не из HA.
-    if (strlen(PRIVATE_CHANNEL_NAME) > 0) {
-        Serial.printf("[PRV] channel from build flags: %s\n", PRIVATE_CHANNEL_NAME);
-        setPrivateChannel(PRIVATE_CHANNEL_NAME, PRIVATE_CHANNEL_KEY);
-    }
-}
-
-int setSensorChannel(const String& name, const String& keyb64) {
-    if (name.length() == 0 || name.length() > 32) return -1;
-    uint8_t key16[16];
-    int keyType = privateKeyTo16(keyb64, key16);
-    if (keyType < 0) {   // автоключ
-        uint8_t sha256_result[32];
-        mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                   (const uint8_t*)name.c_str(), name.length(), sha256_result);
-        memcpy(key16, sha256_result, 16);
-    }
-
-    int idx = findChannelByName(name.c_str());
-    if (idx >= 0) {
-        // канал существует — проверяем, не поменялся ли ключ
-        if (memcmp(channels[idx].secret, key16, 16) != 0) {
-            memset(channels[idx].secret, 0, sizeof(channels[idx].secret));
-            memcpy(channels[idx].secret, key16, 16);
-            uint8_t sha256_result[32];
-            mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                       channels[idx].secret, 16, sha256_result);
-            channels[idx].hash = sha256_result[0];
-            Serial.printf("[SNS] channel %s key UPDATED, hash 0x%02X\n",
-                          name.c_str(), channels[idx].hash);
-        }
-        sensorChannelIdx = idx;
-        sensorChannelName = channels[idx].name;
-        return idx;
-    }
-    if (numChannels >= MAX_CHANNELS) {
-        Serial.println("[SNS] MAX_CHANNELS reached, channel not added");
-        return -1;
-    }
-    sensorChannelName = name;
-    addChannelKey16(sensorChannelName.c_str(), key16);
-    sensorChannelIdx = numChannels - 1;
-    Serial.printf("[SNS] sensor channel added: %s key+hash 0x%02X (idx %d)\n",
-                  sensorChannelName.c_str(), channels[sensorChannelIdx].hash,
-                  sensorChannelIdx);
-    return sensorChannelIdx;
+    if (strlen(PRIVATE_CHANNEL_NAME) == 0) return;
+    Serial.printf("[PRV] channel from build flags: %s\n", PRIVATE_CHANNEL_NAME);
+    setNamedChannel("PRV", PRIVATE_CHANNEL_NAME, PRIVATE_CHANNEL_KEY, privateChannelName, privateChannelIdx);
 }
 
 void loadSensorChannel() {
-    // Каналы задаются ТОЛЬКО из build-флагов (secrets.ini), не из HA.
-    if (strlen(SENSOR_CHANNEL_NAME) > 0) {
-        Serial.printf("[SNS] sensor channel from build flags: %s\n", SENSOR_CHANNEL_NAME);
-        setSensorChannel(SENSOR_CHANNEL_NAME, SENSOR_CHANNEL_KEY);
-    }
+    if (strlen(SENSOR_CHANNEL_NAME) == 0) return;
+    Serial.printf("[SNS] sensor channel from build flags: %s\n", SENSOR_CHANNEL_NAME);
+    setNamedChannel("SNS", SENSOR_CHANNEL_NAME, SENSOR_CHANNEL_KEY, sensorChannelName, sensorChannelIdx);
 }
 
 #ifdef MQTT_ENABLED
@@ -241,32 +195,30 @@ void loadTxChannel() {
 }
 #endif // MQTT_ENABLED
 
+// Формат ответа как в bot.py: "hops:direct" либо "hops:N, route:aa → bb → cc"
 void buildPingReply(char* out, size_t outlen, const uint8_t* path, uint8_t hop_count, uint8_t path_hash_size) {
     if (hop_count == 0) {
         snprintf(out, outlen, "hops:direct");
         return;
     }
-    snprintf(out, outlen, "hops:%u, route:", hop_count);
-    size_t pos = strlen(out);
+    size_t pos = snprintf(out, outlen, "hops:%u, route:", hop_count);
     for (int h = 0; h < hop_count; h++) {
-        if (pos + 3 >= outlen) break;
-        if (h > 0) { out[pos++] = ' '; out[pos++] = 0xE2; out[pos++] = 0x86; out[pos++] = 0x92; }  // →
-        const uint8_t* ph = path + h * path_hash_size;
+        size_t need = (h > 0 ? 4 : 0) + 2 * path_hash_size + 1;
+        if (pos + need > outlen) break;
+        if (h > 0) { out[pos++] = ' '; out[pos++] = 0xE2; out[pos++] = 0x86; out[pos++] = 0x92; }  // " →"
         for (int b = 0; b < path_hash_size; b++) {
-            snprintf(&out[pos], outlen - pos, "%02x", ph[b]);
-            pos += 2;
+            pos += snprintf(out + pos, outlen - pos, "%02x", path[h * path_hash_size + b]);
         }
-        out[pos] = 0;
     }
 }
 
 bool parseMeshCorePacket(uint8_t* data, int len) {
     if (len < 6) return false;
-    
+
     uint8_t header = data[0];
     uint8_t payload_type = (header >> 2) & 0x0F;
     uint8_t route_type = header & 0x03;
-    
+
     // GRP_TXT (0x05) — групповые сообщения, TXT_MSG (0x02) — личные (ДМ).
     if (payload_type != 0x05 && payload_type != 0x02) {
         // ADVERT (0x04): кэшируем публичные ключи нод — без них не ответить
@@ -301,73 +253,74 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         }
         return false;
     }
-    
+
     int offset = 1;
     if (route_type == 0x00 || route_type == 0x03) offset += 4;  // transport codes
-    
+
     if (offset >= len) return false;
     uint8_t path_len = data[offset++];
     uint8_t path_hash_size = (path_len >> 6) + 1;
     uint8_t hop_count = path_len & 0x3F;
-    const uint8_t* path_bytes = &data[offset];
-    
-    // сохраняем путь (хэши ретрансляторов) для отображения
+    int pathBytes = hop_count * path_hash_size;
+    bool pathOk = hop_count > 0 && offset + pathBytes <= len;
+
+    // путь (хэши ретрансляторов) для экрана и MQTT; длина пути приходит из эфира — пишем с проверкой
     lastPath[0] = 0;
-    if (hop_count > 0 && offset + hop_count * path_hash_size <= len) {
-        char tmp[8];
-        for (int h = 0; h < hop_count; h++) {
+    if (pathOk) {
+        size_t pos = 0;
+        for (int h = 0; h < hop_count && pos + 6 < sizeof(lastPath); h++) {
             const uint8_t* ph = &data[offset + h * path_hash_size];
-            if (path_hash_size == 1) {
-                snprintf(tmp, sizeof(tmp), "%02X ", ph[0]);
-            } else {
-                snprintf(tmp, sizeof(tmp), "%02X%02X ", ph[0], ph[1]);
-            }
-            strcat(lastPath, tmp);
+            pos += (path_hash_size == 1)
+                ? snprintf(lastPath + pos, sizeof(lastPath) - pos, "%02X ", ph[0])
+                : snprintf(lastPath + pos, sizeof(lastPath) - pos, "%02X%02X ", ph[0], ph[1]);
         }
     }
 
-    // копия пути для обратного маршрута ответа (хэши ретрансляторов)
-    replyHopCount = (hop_count > 0 && offset + hop_count * path_hash_size <= len) ? hop_count : 0;
-    if (hop_count > 0 && offset + hop_count * path_hash_size <= len) {
-        replyHashSize = path_hash_size;
-        memcpy(replyPath, &data[offset], hop_count * path_hash_size);
+    #ifndef SENSOR_NODE
+    // копия пути для обратного маршрута в ответе на /ping
+    uint8_t replyPath[MAX_REPLY_PATH];
+    uint8_t replyHops = 0;
+    if (pathOk && pathBytes <= MAX_REPLY_PATH) {
+        memcpy(replyPath, &data[offset], pathBytes);
+        replyHops = hop_count;
     }
-    offset += hop_count * path_hash_size;
-    
+    #endif
+    offset += pathBytes;
+
     if (offset >= len) return false;
-    
+
     // === Разбор тела пакета: ДМ (TXT_MSG) или групповое (GRP_TXT) ===
     bool personalDm = false;
+    uint8_t dmSrc = 0;
     int chIdx = -1;
-    
+
     if (payload_type == 0x02) {
         // Личное сообщение: payload = [dest_hash 1B][src_hash 1B][MAC 2B][cipher...].
         // Шифруется общим секретом X25519 — текст без ключей ноды не прочитать,
         // но dest_hash (первый байт) показывает, адресовано ли сообщение НАМ.
         if (offset + 2 > len) return false;
         uint8_t dest_hash = data[offset];
-        uint8_t src_hash  = data[offset + 1];
+        dmSrc = data[offset + 1];
         if (dest_hash != ownShortHash) {
-            Serial.printf("[DM] dest=%02X (не нам, наш=%02X) src=%02X, игнор\n", dest_hash, ownShortHash, src_hash);
+            Serial.printf("[DM] dest=%02X (не нам, наш=%02X) src=%02X, игнор\n", dest_hash, ownShortHash, dmSrc);
             return false;
         }
         personalDm = true;
-        dmSrcHash = src_hash;
-        
+
         // В ДМ нет хэша канала — отвечаем в #connections (личный канал).
         chIdx = 1;
         if (chIdx >= numChannels) chIdx = 0;
         lastChannelIdx = chIdx;
         lastChannelName = "DM #connections";
-        
+
         char senderHex[8];
-        snprintf(senderHex, sizeof(senderHex), "<%02X>", src_hash);
+        snprintf(senderHex, sizeof(senderHex), "<%02X>", dmSrc);
         lastSender = senderHex;
         lastMessage = "(личное сообщение)";
     } else {
         uint8_t channel_hash = data[offset++];
         if (offset + 2 > len) return false;
-        
+
         // ищем канал по хэшу
         for (int i = 0; i < numChannels; i++) {
             if (channel_hash == channels[i].hash) { chIdx = i; break; }
@@ -375,21 +328,21 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         if (chIdx < 0) return false;
         lastChannelIdx = chIdx;
         lastChannelName = channels[chIdx].name;
-        
+
         uint8_t* mac = &data[offset];         // 2 байта MAC
         uint8_t* ciphertext = &data[offset + 2];  // шифротекст после MAC
         int ciphertext_len = len - (offset + 2);
-        
+
         // обрезаем до кратного 16
         int ciphertext_len_trunc = ciphertext_len & ~15;
         if (ciphertext_len_trunc <= 0) return false;
         String message = decryptGroupText(channels[chIdx].secret, mac, ciphertext, ciphertext_len_trunc);
-        
+
         if (message.length() == 0) {
             Serial.println("[!] HMAC не совпал или пустое сообщение");
             return false;
         }
-        
+
         int colonPos = message.indexOf(": ");
         if (colonPos > 0) {
             lastSender = message.substring(0, colonPos);
@@ -399,32 +352,31 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             lastMessage = message;
         }
     }
-    
+
     packetCount++;
     lastRSSI = radio.getRSSI();
     lastSNR = radio.getSNR();
     lastHopCount = hop_count;
-    
+
     // убираем хвостовые пробелы/переносы (у некоторых клиентов "/ping \n")
     lastMessage.trim();
 
     // не обрабатываем собственные сообщения (эхо собственного флуда)
     if (lastSender == DEVICE_NAME) return false;
-    
+
     Serial.printf("\n=== PACKET #%d (%s) ===\n", packetCount, lastChannelName.c_str());
     Serial.printf("From: %s\n", lastSender.c_str());
     Serial.printf("Msg: %s\n", lastMessage.c_str());
     Serial.printf("Route: %s (hops=%u)\n", lastPath[0] ? lastPath : "direct", hop_count);
     Serial.printf("RSSI: %.1f dBm, SNR: %.1f dB\n", lastRSSI, lastSNR);
-    
+
     lastRxDisplay = millis();
-    
-    // Показать сообщение на экране (если экран не погашен автовыключением).
-    // Во время mesh OTA экран не трогаем — иначе каждый чанк мигает сообщением
-    // между кадрами прогресса (otaDrawProgress/otaSensorDraw).
+
+    // Показать сообщение на экране. Во время mesh OTA экран не трогаем — иначе каждый
+    // чанк мигает сообщением между кадрами прогресса (otaDrawProgress/otaSensorDraw).
     // Сенсор показывает только свой статус (drawIdleStatus), входящие пакеты не рисует.
     #ifndef SENSOR_NODE
-    if (!screenOff && !otaFastMode) {
+    if (!otaFastMode) {
         display.clearDisplay();
         display.setTextSize(1);
         display.setCursor(0, 0);
@@ -463,14 +415,29 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             return true;
         }
 
-        // === Синхронизация времени: бот шлёт "time:<epoch>" от NTP ===
+        // === Опрос со страницы OTA: каждый сенсор ответит hello:<версия> со случайной задержкой,
+        //     чтобы ответы нескольких сенсоров не столкнулись в эфире ===
+        if (lastMessage == SENSOR_MSG_HELLO_REQ) {
+            #ifdef SENSOR_NODE
+            sensorHelloDueMs = millis() + random(300, 4000);
+            #endif
+            return true;
+        }
+
+        // === Синхронизация времени: бот шлёт "time:<epoch>:<версия бота>" от NTP ===
         if (lastMessage.startsWith("time:")) {
-            uint64_t epoch = (uint64_t)strtoull(lastMessage.c_str() + 5, NULL, 10);
+            char* end = NULL;
+            uint64_t epoch = (uint64_t)strtoull(lastMessage.c_str() + 5, &end, 10);
+            #ifdef SENSOR_NODE
+            // версия бота не совпала со своей — экран покажет звёздочку у версии
+            if (end && *end == ':') fwVersionDiffers = strcmp(end + 1, FW_VERSION) != 0;
+            #endif
             if (epoch > (uint64_t)BUILD_UNIX_TIME) {
                 struct timeval tv;
                 tv.tv_sec = (time_t)epoch;
                 tv.tv_usec = 0;
                 settimeofday(&tv, NULL);
+                timeSyncMs = millis();
                 time_t local = (time_t)epoch + (time_t)TZ_OFFSET_HOURS * 3600;
                 struct tm tm_now;
                 gmtime_r(&local, &tm_now);
@@ -507,36 +474,28 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         delay(250);
 
         char reply[100];
-        buildPingReply(reply, sizeof(reply), replyPath, replyHopCount, replyHashSize);
+        buildPingReply(reply, sizeof(reply), replyPath, replyHops, path_hash_size);
         Serial.printf("[PING] reply: %s\n", reply);
-        pingReplyText = String(reply);
+        uint8_t frame[256];
 
         // === Личное сообщение: ответ уходит В ЛИЧКУ (TXT_MSG), а не в канал ===
         if (personalDm) {
-            uint8_t* peerPub = findPeerPub(dmSrcHash);
-            if (peerPub != NULL) {
-                int dl = buildPrivateTextFrame(dmSrcHash, peerPub, pingReplyText,
-                                               dmReplyFrame, sizeof(dmReplyFrame));
-                if (dl > 0) {
-                    Serial.printf("\n[TX DM] to <%02X>: %s (%dB, flood x3)\n", dmSrcHash, pingReplyText.c_str(), dl);
-                    floodSend3(-1, dmReplyFrame, dl);
-                }
-            } else {
-                Serial.printf("[DM] pubkey <%02X> неизвестен (нет advert) — ответ не отправлен\n", dmSrcHash);
+            uint8_t* peerPub = findPeerPub(dmSrc);
+            if (peerPub == NULL) {
+                Serial.printf("[DM] pubkey <%02X> неизвестен (нет advert) — ответ не отправлен\n", dmSrc);
+                return true;
+            }
+            int dl = buildPrivateTextFrame(dmSrc, peerPub, reply, frame, sizeof(frame));
+            if (dl > 0) {
+                Serial.printf("\n[TX DM] to <%02X>: %s (%dB, flood x3)\n", dmSrc, reply, dl);
+                floodSend3(-1, frame, dl);
             }
             return true;
         }
 
-        int enclen = buildGroupEnc(chIdx, pingReplyText, pingReplyEnc);
-        if (enclen <= 0) return true;
-        pingReplyEncLen = enclen;
-
-        uint8_t frame[300];
-        int f = buildGroupFrameFlood(chIdx, pingReplyText, frame, sizeof(frame),
-                                     pingReplyEnc, pingReplyEncLen);
+        int f = buildGroupFrameFlood(chIdx, reply, frame, sizeof(frame));
         if (f > 0) {
-            Serial.printf("\n[TX] %s: %s (%dB, flood x3)\n", channels[chIdx].name,
-                          (DEVICE_NAME ": " + pingReplyText).c_str(), f);
+            Serial.printf("\n[TX] %s: %s: %s (%dB, flood x3)\n", channels[chIdx].name, DEVICE_NAME, reply, f);
             floodSend3(chIdx, frame, f);
         }
     }
@@ -583,76 +542,32 @@ void sendAdvert(uint8_t route_type) {
 
 int buildGroupEnc(int chIdx, const String& msg, uint8_t* enc) {
     if (chIdx < 0 || chIdx >= numChannels) return 0;
-    MeshChannel& ch = channels[chIdx];
-
-    uint8_t plaintext[256];
-    int plen = 0;
-    // В ts[4] уходит Unix-время в СЕКУНДАХ (как у adverts и личных сообщений):
-    // epoch-ms не помещается в uint32 (переполняется и клиенты показывают ~2046 год).
-    // Если время синхронизировано/из BUILD_UNIX_TIME — шлём секунды, иначе millis.
-    uint32_t ts = ((uint32_t)time(NULL) > 1000000000)
-        ? (uint32_t)time(NULL)
-        : (uint32_t)millis();
-    memcpy(plaintext, &ts, 4); plen += 4;           // timestamp (LE)
-    plaintext[plen++] = 0;                          // TXT_TYPE_PLAIN
+    uint8_t plaintext[GROUP_TEXT_MAX_PLAIN];
+    // ts — Unix-время в СЕКУНДАХ (как у adverts и личных сообщений): epoch-ms не
+    // помещается в uint32. Пока часы не выставлены — millis.
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t ts = (now > 1000000000) ? now : (uint32_t)millis();
+    memcpy(plaintext, &ts, 4);                      // timestamp (LE)
+    plaintext[4] = 0;                               // TXT_TYPE_PLAIN
+    size_t plen = 5;
     const char* prefix = DEVICE_NAME ": ";
-    memcpy(plaintext + plen, prefix, strlen(prefix)); plen += strlen(prefix);
-    size_t mlen = min((size_t)219, msg.length());
-    memcpy(plaintext + plen, msg.c_str(), mlen); plen += mlen;
+    size_t n = min(strlen(prefix), sizeof(plaintext) - plen);
+    memcpy(plaintext + plen, prefix, n); plen += n;
+    n = min((size_t)msg.length(), sizeof(plaintext) - plen);
+    memcpy(plaintext + plen, msg.c_str(), n); plen += n;
 
-    return encryptGroupText(ch.secret, enc, plaintext, plen);
+    return encryptGroupText(channels[chIdx].secret, enc, plaintext, plen);
 }
 
-int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxlen,
-                         const uint8_t* enc_in, int enc_in_len) {
-    if (chIdx < 0 || chIdx >= numChannels) return 0;
-    uint8_t enc[256];
-    int enclen;
-    if (enc_in != NULL && enc_in_len > 0) {
-        enclen = min(enc_in_len, (int)sizeof(enc));
-        memcpy(enc, enc_in, enclen);
-    } else {
-        enclen = buildGroupEnc(chIdx, msg, enc);
-    }
+int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxlen) {
+    uint8_t enc[GROUP_TEXT_MAX_PLAIN + 2];
+    int enclen = buildGroupEnc(chIdx, msg, enc);
     if (enclen <= 0 || 3 + enclen > maxlen) return 0;
-
-    int f = 0;
-    frame[f++] = 0x15;        // GRP_TXT | ROUTE_TYPE_FLOOD
-    frame[f++] = 0x00;        // path_len: hash_size=1, 0 хопов (построится ретрансляторами)
-    frame[f++] = channels[chIdx].hash;
-    memcpy(frame + f, enc, enclen); f += enclen;
-    return f;
-}
-
-int buildGroupFrameReturnPath(int chIdx, const String& msg,
-                              const uint8_t* path, uint8_t hop_count, uint8_t hash_size,
-                              uint8_t* frame, int maxlen,
-                              const uint8_t* enc_in, int enc_in_len) {
-    if (chIdx < 0 || chIdx >= numChannels) return 0;
-    if (hop_count == 0 || hop_count > 0x3F || hash_size == 0 || hash_size > 8) return 0;
-    uint8_t enc[256];
-    int enclen;
-    if (enc_in != NULL && enc_in_len > 0) {
-        enclen = min(enc_in_len, (int)sizeof(enc));
-        memcpy(enc, enc_in, enclen);
-    } else {
-        enclen = buildGroupEnc(chIdx, msg, enc);
-    }
-    if (enclen <= 0) return 0;
-
-    int pathBytes = hop_count * hash_size;
-    if (3 + pathBytes + enclen > maxlen) return 0;
-
-    int f = 0;
-    frame[f++] = 0x16;        // GRP_TXT | ROUTE_TYPE_DIRECT
-    frame[f++] = (uint8_t)(((hash_size - 1) << 6) | hop_count);
-    for (int h = 0; h < hop_count; h++) {
-        int src = (hop_count - 1 - h) * hash_size;   // разворачиваем путь
-        for (int b = 0; b < hash_size; b++) frame[f++] = path[src + b];
-    }
-    frame[f++] = channels[chIdx].hash;
-    memcpy(frame + f, enc, enclen); f += enclen;
-    return f;
+    frame[0] = 0x15;                    // GRP_TXT | ROUTE_TYPE_FLOOD
+    frame[1] = 0x00;                    // path_len: hash_size=1, 0 хопов (построится ретрансляторами)
+    frame[2] = channels[chIdx].hash;
+    memcpy(frame + 3, enc, enclen);
+    return 3 + enclen;
 }
 
 int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
@@ -665,7 +580,7 @@ int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
     uint32_t ts = (uint32_t)time(NULL);   // Unix-секунды (epoch-ms не лезет в uint32)
     memcpy(data, &ts, 4); dlen += 4;
     data[dlen++] = 0;                        // attempt = 0
-    size_t ml = min((size_t)96, msg.length());
+    size_t ml = min((size_t)96, (size_t)msg.length());
     memcpy(data + dlen, msg.c_str(), ml); dlen += ml;
     data[dlen++] = 0;                        // null terminator
 
@@ -684,8 +599,7 @@ int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
 
 int sendFrame(int chIdx, const uint8_t* frame, int f) {
     if (chIdx < 0 || chIdx >= numChannels) return RADIOLIB_ERR_UNKNOWN;
-    // hex-лог кадра стоит ~40 мс на UART для 245-байтного чанка — при mesh OTA
-    // на каждый аck/чанк это минуты суммарно, поэтому в fast-режиме молчим.
+    // hex-лог кадра стоит ~40 мс на UART для 245-байтного кадра — в fast-режиме молчим
     if (!otaFastMode) {
         for (int i = 0; i < f; i++) Serial.printf("%02X", frame[i]);
         Serial.println();
@@ -701,16 +615,42 @@ void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs) {
     }
 }
 
-void sendSensorTimeSync() {
-    if (sensorChannelIdx < 0) return;
-    uint8_t frame[300];
-    char msg[40];
-    snprintf(msg, sizeof(msg), "time:%llu", (unsigned long long)time(NULL));
-    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), NULL, 0);
-    if (f > 0) {
-        Serial.printf("\n[TIME] -> %s: %s\n", channels[sensorChannelIdx].name, msg);
-        floodSend3(sensorChannelIdx, frame, f);
+void sensorSendMsg(const char* msg, unsigned int gapMs) {
+    if (sensorChannelIdx < 0) {
+        Serial.printf("[SNS] sensor channel not configured, cannot send \"%s\"\n", msg);
+        return;
     }
+    uint8_t frame[256];
+    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame));
+    if (f <= 0) return;
+    floodSend3(-1, frame, f, gapMs);
+    Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
+    #ifdef SENSOR_NODE
+    sensorLastSent = msg;
+    sensorLastSentMs = millis();
+    #endif
+}
+
+// "time:<epoch>:<версия бота>" — сенсор выставляет часы и сверяет свою версию с ботом
+#ifdef SENSOR_NODE
+// hello:<версия>:<заряд %>:<напряжение>:<код платы> — бот публикует эти поля в MQTT.
+// Без измерения батареи вместо значений идёт "-", чтобы позиция кода платы не съезжала.
+void sensorSendHello() {
+    char msg[64];
+    #if HAS_BATTERY
+    snprintf(msg, sizeof(msg), "%s:%s:%d:%.2f:%s", SENSOR_MSG_HELLO, FW_VERSION,
+             batteryPercent(), batteryVoltage(), BOARD_CODE);
+    #else
+    snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
+    #endif
+    sensorSendMsg(msg);
+}
+#endif
+
+void sendSensorTimeSync() {
+    char msg[48];
+    snprintf(msg, sizeof(msg), "time:%llu:%s", (unsigned long long)time(NULL), FW_VERSION);
+    sensorSendMsg(msg);
 }
 
 String channelListStr() {

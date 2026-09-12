@@ -41,11 +41,15 @@
 
 // ===== КАНАЛЫ =====
 #define MAX_CHANNELS 4
+// Открытый текст группового сообщения [ts 4][type 1][«имя: »][текст]:
+// шифр ≤ 240 + MAC 2 + заголовок 3 ≤ 255 Б (лимит кадра SX1262)
+#define GROUP_TEXT_MAX_PLAIN 240
 
 // ---- Сенсорные сообщения ----
 #define SENSOR_MSG_BUTTON "button"
 #define SENSOR_MSG_BUTTON2 "button2"
 #define SENSOR_MSG_HELLO   "hello"
+#define SENSOR_MSG_HELLO_REQ "hello?"   // бот просит сенсоры отметиться (кнопка на странице OTA)
 #ifndef SNS_BTN_DBL_WINDOW_MS
 #define SNS_BTN_DBL_WINDOW_MS 700
 #endif
@@ -74,9 +78,6 @@
 #ifndef SENSOR_OFFLINE_MS
 #define SENSOR_OFFLINE_MS (15UL * 60 * 1000)
 #endif
-
-// ===== АВТОВЫКЛЮЧЕНИЕ ЭКРАНА =====
-#define SCREEN_AUTO_OFF_MS (5UL * 60 * 1000)
 
 // ===== ТЕМПЕРАТУРА =====
 #ifndef TEMP_SENSOR_OFFSET
@@ -128,27 +129,24 @@ struct PeerEntry {
 #define OTA_MAX_FW_BYTES (3UL * 1024 * 1024)
 #define OTA_DRAW_MS 1000
 #define OTA_FAST_FREQ       868.950
-#define OTA_FAST_BW         500.0
-#define OTA_FAST_SF         5       // при OTA_FAST_FSK 0
-#define OTA_FAST_CR         5
+// Ответ сенсора на ota:start; число — версия протокола mesh OTA
+#define OTA_ACKSTART        "ota:ackstart:1"
 // сенсор шлёт ackstart трижды (~1.3 с на SF8) и переключается только после третьей копии
 #define OTA_FAST_SETTLE_MS  1200
-// v3: 1 = GFSK 100 кбит/с (LoRa SF7/BW500 ~22 кбит/с, но чувствительность хуже), 0 = LoRa OTA_FAST_SF
-#define OTA_FAST_FSK        1
+// Быстрый канал — GFSK 100 кбит/с: параметры, на которых прошивка по радио работала
 #define OTA_FSK_BR          100.0   // кбит/с
 #define OTA_FSK_DEV         50.0    // кГц
 #define OTA_FSK_RXBW        234.3   // кГц
 #define OTA_FSK_PREAMBLE    32      // бит
-// v3: чанков в пачке до подтверждения (<= 16: маска uint16)
+// чанков в пачке до подтверждения (<= 16: маска uint16)
 #define OTA_WINDOW          8
 // пауза между кадрами пачки: сенсор должен вычитать кадр и вернуться в RX до следующего
 #define OTA_BURST_GAP_MS    15
 
 // Сенсорная сторона OTA
-#ifdef SENSOR_NODE
 #define OTA_SENSOR_STALL_MS 60000
+// без первого чанка сенсор возвращается на штатный канал; бот выжидает это время перед повтором
 #define OTA_SENSOR_FIRST_CHUNK_MS 5000
-#endif
 
 // ===== ЧИСТЫЙ LoRa OTA (сырые фреймы вне meshcore) =====
 // Данные шлются напрямую radio.transmit/readData на быстрой конфигурации
@@ -164,12 +162,12 @@ struct PeerEntry {
 #define RAW_TYPE_DATA  0x02
 #define RAW_TYPE_DONE  0x03
 #define RAW_TYPE_ABORT 0x04
-#define RAW_TYPE_DATA_LAST 0x05   // v3: последний кадр пачки, ответить WACK
-#define RAW_TYPE_POLL  0x06       // v3: запрос WACK
+#define RAW_TYPE_DATA_LAST 0x05   // последний кадр пачки, ответить WACK
+#define RAW_TYPE_POLL  0x06       // запрос WACK
 // сенсор -> бот
 #define RAW_TYPE_DONE_ACK 0x83
 #define RAW_TYPE_FAIL    0x84
-#define RAW_TYPE_WACK    0x85     // v3: seq = первый недостающий чанк, данные = маска 2B LE следующих
+#define RAW_TYPE_WACK    0x85     // seq = первый недостающий чанк, данные = маска 2B LE следующих
 // Сжатый файл прошивки (scripts/copy_firmware.py): [OTAZ][размер образа 4B LE][CRC32 образа 4B LE][zlib]
 #define OTA_Z_MAGIC "OTAZ"
 #define OTA_Z_HDR   12
@@ -195,14 +193,8 @@ enum {
 #define FLOOD_RETRY_MS 100
 #endif
 
-// Компилятором задавалось BUILD_UNIX_TIME из времени хоста
-// FW_VERSION задаёт scripts/gen_version.py из version.txt
-#ifndef FW_VERSION
-#define FW_VERSION "dev"
-#endif
-#ifndef BUILD_UNIX_TIME
-#define BUILD_UNIX_TIME 0
-#endif
+// FW_VERSION и BUILD_UNIX_TIME генерирует scripts/gen_version.py перед сборкой
+#include "build_info.h"
 
 // ===== Кэш имён датчиков =====
 #define SENSOR_DEV_CACHE_MAX 8

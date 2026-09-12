@@ -8,16 +8,6 @@ float cpuTempC() {
     return temperatureRead() - (float)TEMP_SENSOR_OFFSET;
 }
 
-uint32_t crc32buf(const uint8_t* data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc >> 1) ^ (0xEDB88320UL & -(crc & 1));
-    }
-    return ~crc;
-}
-
 uint32_t crc32_upd(uint32_t crc, const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];

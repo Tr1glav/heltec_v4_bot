@@ -100,7 +100,8 @@ void radioSetNormalConfig() {
 }
 
 void radioSetFastConfig() {
-    #if OTA_FAST_FSK
+    fastRxFrames = 0;
+    fastRxErrors = 0;
     int st = radio.beginFSK(OTA_FAST_FREQ, OTA_FSK_BR, OTA_FSK_DEV, OTA_FSK_RXBW,
                             LORA_TX_POWER, OTA_FSK_PREAMBLE, 1.8);
     if (st != RADIOLIB_ERR_NONE) Serial.printf("[RADIO] beginFSK failed %d\n", st);
@@ -112,7 +113,4 @@ void radioSetFastConfig() {
     lastReArmMs = 0;
     radio.startReceive();
     isListening = true;
-    #else
-    radioSetParams(OTA_FAST_FREQ, OTA_FAST_BW, OTA_FAST_SF, OTA_FAST_CR);
-    #endif
 }

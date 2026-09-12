@@ -17,11 +17,9 @@ String buildDiagReport();
 void setupOtaServer();
 #endif
 #ifdef SENSOR_NODE
-void otaSensorSend(const String& msg);
 void otaSensorDraw();
 void otaSensorAbort(const char* why);
 void otaSensorTick();
 void otaSensorHandle();
 #endif
-void sensorSendMsg(const char* msg);
 void otaHandleRawFrame(const uint8_t* buf, int len);

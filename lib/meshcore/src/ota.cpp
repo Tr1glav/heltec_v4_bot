@@ -4,6 +4,7 @@
 #include "radio.h"
 #include "mesh.h"
 #include "ota.h"
+#include "display.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <esp_system.h>
@@ -41,6 +42,12 @@ int rawTxFrame(const uint8_t* frm, int f) {
 static uint32_t otaImgSize = 0;       // размер прошивки после распаковки
 static uint16_t otaWinAcked = 0;      // бит i — чанк otaSeq+i уже у сенсора
 static unsigned long otaBurstMs = 0;  // когда ушёл последний кадр пачки
+static unsigned long otaSessionMs = 0; // старт сессии — для скорости и длительности на странице
+static unsigned long otaDoneMs = 0;    // когда сенсор подтвердил прошивку
+static char otaLastErr[48] = "";       // причина последнего abort — показывается на странице
+static String otaFwName;               // имя последнего загруженного файла — для страницы
+static uint16_t otaPolls = 0;          // сколько раз пришлось переспрашивать маску за сессию
+static uint16_t otaRetrTotal = 0;      // сколько всего было повторов за сессию
 
 // Для сенсора годится только .otaz (формат OTA_Z_MAGIC); otaFwSize — длина сжатого потока
 void otaInspectStoredFw() {
@@ -57,6 +64,14 @@ void otaInspectStoredFw() {
     }
     if (f) f.close();
     otaFwReady = otaFwSize > 0;
+    // имя файла переживает перезагрузку бота: сам .otaz остаётся, а имя пишется рядом
+    if (otaFwReady && otaFwName.length() == 0) {
+        File n = LittleFS.open("/ota.name", "r");
+        if (n) {
+            otaFwName = n.readStringUntil('\n');
+            n.close();
+        }
+    }
 }
 
 bool otaSessionActive() {
@@ -65,8 +80,8 @@ bool otaSessionActive() {
 
 void otaTxGroup(const String& msg) {
     if (sensorChannelIdx < 0) return;
-    uint8_t frame[300];
-    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), NULL, 0);
+    uint8_t frame[256];
+    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame));
     if (f > 0) {
         sendFrame(sensorChannelIdx, frame, f);
         otaSince = millis();
@@ -74,7 +89,10 @@ void otaTxGroup(const String& msg) {
 }
 
 void otaBotAbort(const char* why) {
+    strlcpy(otaLastErr, why, sizeof(otaLastErr));
     if (otaFastMode) {
+        slog("[OTA] abort (%s): быстрый канал — принято кадров %u, ошибок приёма %u\n",
+             why, (unsigned)fastRxFrames, (unsigned)fastRxErrors);
         uint8_t frame[16];
         int f = rawBuildFrame(frame, RAW_TYPE_ABORT, 0, NULL, 0);
         if (f > 0) rawTxFrame(frame, f);
@@ -152,7 +170,7 @@ static void otaLogProgress() {
     Serial.printf("[OTA] seq=%u %u%% retr=%u\n", (unsigned)otaSeq, (unsigned)pct, otaRetries);
 }
 
-// v3: неподтверждённые чанки окна подряд; последний кадр просит у сенсора маску принятых
+// Неподтверждённые чанки окна подряд; последний кадр просит у сенсора маску принятых
 static void otaSendBurst() {
     uint32_t total = (otaFwSize + OTA_RAW_CHUNK_BYTES - 1) / OTA_RAW_CHUNK_BYTES;
     int last = -1;
@@ -186,7 +204,7 @@ void otaHandleAck() {
     if (!lastMessage.startsWith("ota:ackstart")) return;
     slog("[OTA] <- %s: %s (phase=%d)\n", lastSender.c_str(), lastMessage.c_str(), otaPhase);
     if (otaPhase != OTA_PHASE_WAIT_START || lastSender != otaTarget) return;
-    if (lastMessage != "ota:ackstart:3") {
+    if (lastMessage != OTA_ACKSTART) {
         otaBotAbort("старая прошивка сенсора, нужна USB");
         return;
     }
@@ -223,6 +241,7 @@ void otaHandleRawBot(const uint8_t* buf, int len) {
         bool progress = seq > otaSeq || (mask & ~otaWinAcked) != 0;
         // WACK без прогресса сразу после пачки — запоздалый ответ на прошлую, ждём ответ на эту
         if (!progress && millis() - otaBurstMs < OTA_ACK_TIMEOUT_MS) return;
+        if (!progress) otaRetrTotal++;
         otaRetries = progress ? 0 : otaRetries + 1;
         if (otaRetries > OTA_MAX_RETRIES) { otaBotAbort("no progress"); return; }
         otaSeq = seq;
@@ -242,7 +261,9 @@ void otaHandleRawBot(const uint8_t* buf, int len) {
     if (type == RAW_TYPE_DONE_ACK) {
         if (otaPhase != OTA_PHASE_WAIT_END) return;
         otaPhase = OTA_PHASE_DONE;
-        slog("[OTA] DONE raw: сенсор %s применил прошивку, CRC32 OK\n", otaTarget.c_str());
+        otaDoneMs = millis();
+        slog("[OTA] DONE: сенсор %s применил прошивку, CRC32 OK (кадров %u, ошибок приёма %u)\n",
+             otaTarget.c_str(), (unsigned)fastRxFrames, (unsigned)fastRxErrors);
         #if (HAS_OLED != 0)
         display.clearDisplay();
         display.setCursor(0, 0);
@@ -272,6 +293,7 @@ void otaBotTick() {
     if (millis() - otaSince < timeout) return;
 
     otaRetries++;
+    otaRetrTotal++;
     if (otaRetries > OTA_MAX_RETRIES) {
         char why[24];
         snprintf(why, sizeof(why), "timeout p%d", otaPhase);
@@ -280,6 +302,7 @@ void otaBotTick() {
     }
     if (otaPhase == OTA_PHASE_WAIT_START) otaSendStart();
     else if (otaPhase == OTA_PHASE_DATA) {
+        otaPolls++;
         slog("[OTA] poll seq=%u\n", (unsigned)otaSeq);
         uint8_t frame[16];
         int f = rawBuildFrame(frame, RAW_TYPE_POLL, otaSeq, NULL, 0);
@@ -289,6 +312,9 @@ void otaBotTick() {
     otaDrawProgress();
 }
 
+// Сколько байт лога записано с загрузки — позиция для живого вывода на странице (/logs/tail)
+static uint32_t logTotal = 0;
+
 void slog(const char* fmt, ...) {
     char tmp[512];
     va_list ap;
@@ -296,13 +322,12 @@ void slog(const char* fmt, ...) {
     int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     if (n <= 0) return;
-    Serial.write((const uint8_t*)tmp, n);
-    if (logTail.length() + (size_t)n > LOG_TAIL_MAX) {
-        size_t drop = logTail.length() + (size_t)n - LOG_TAIL_MAX;
-        if (drop < logTail.length()) logTail.remove(0, drop);
-        logTail = "…(обрезано)…" + logTail;
-    }
+    size_t len = min((size_t)n, sizeof(tmp) - 1);   // vsnprintf возвращает длину без учёта обрезки
+    Serial.write((const uint8_t*)tmp, len);
     logTail += tmp;
+    logTotal += len;
+    // logTail — точный хвост потока лога без вставок, иначе позиции /logs/tail разъедутся
+    if (logTail.length() > LOG_TAIL_MAX) logTail.remove(0, logTail.length() - LOG_TAIL_MAX);
 }
 
 static const char* resetReasonStr() {
@@ -344,30 +369,6 @@ String buildDiagReport() {
         }
         if (it) esp_partition_iterator_release(it);
     }
-    r += "-- LittleFS (live probe) --\r\n";
-    {
-        File t = LittleFS.open("/.probe", "w");
-        if (!t) {
-            r += "  open(w) FAILED — LittleFS не работает\r\n";
-        } else {
-            int w = (int)t.write((const uint8_t*)"probe", 5);
-            t.close();
-            if (w != 5) {
-                r += "  write FAILED\r\n";
-            } else {
-                File t2 = LittleFS.open("/.probe", "r");
-                if (!t2) {
-                    r += "  open(r) FAILED\r\n";
-                } else {
-                    char b[8] = {0};
-                    int rd = (int)t2.read((uint8_t*)b, 5);
-                    t2.close();
-                    r += "  read ok: \"" + String(b) + "\" (" + String(rd) + " B)\r\n";
-                }
-                LittleFS.remove("/.probe");
-            }
-        }
-    }
     r += "-- mesh OTA state --\r\n";
     r += "  otaFwReady=" + String(otaFwReady ? "true" : "false");
     r += " otaFwSize=" + String(otaFwSize);
@@ -386,100 +387,451 @@ String buildDiagReport() {
     for (int i = 0; i < sensorDeviceDiscCount; i++) if (sensorOnlineNow[i]) on++;
     r += String(on) + "\r\n";
     r += "\r\n===== LOG TAIL =====\r\n";
+    if (logTotal > logTail.length()) r += "…(начало обрезано)…\r\n";
     r += logTail;
     return r;
 }
 
-void otaHandleRoot() {
-    static const char PAGE[] PROGMEM =
-        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>MeshBot OTA</title><style>"
-        "body{font-family:system-ui,sans-serif;background:#1c2333;color:#e8ecf3;margin:0;min-height:100vh;"
-        "display:flex;align-items:center;justify-content:center;padding:12px}"
-        ".card{background:#242d40;border:1px solid #35405a;border-radius:10px;padding:14px;max-width:440px;width:100%}"
-        "h2{margin:0;font-size:17px;display:inline}h4{margin:0 0 10px;color:#93a4c4;font-weight:400;font-size:13px}"
-        ".row{display:flex;gap:8px;align-items:center}"
-        "select{flex:1;min-width:0;padding:6px;border:1px solid #35405a;border-radius:6px;background:#1e2638;"
-        "color:#e8ecf3;font-size:13px}"
-        "label{font-size:11px;color:#93a4c4}"
-        "#drop{border:2px dashed #4a5775;border-radius:8px;padding:12px;text-align:center;cursor:pointer;"
-        "background:#1e2638;font-size:13px}"
-        "#drop.hover{border-color:#5eead4;background:#1b2233}"
-        "#drop .big{display:inline;font-size:18px;vertical-align:middle}"
-        "#drop span{color:#93a4c4}#fname{display:block;margin-top:6px;color:#5eead4;word-break:break-all;font-size:12px}"
-        "button{flex:1;padding:9px;border:0;border-radius:6px;background:#0ea5e9;color:#fff;font-size:14px;"
-        "font-weight:600;cursor:pointer}"
-        "button:hover{background:#38bdf8}button:disabled{background:#33415c;cursor:not-allowed}"
-        "button.sec{background:#475569}button.sec:hover{background:#64748b}"
-        "#go{display:block;width:100%;margin-top:10px}#secrow{display:flex;gap:8px;margin-top:8px}"
-        "#bar{display:none;margin-top:10px}#bar .t{display:flex;justify-content:space-between;font-size:11px;color:#93a4c4}"
-        "#bar .w{height:7px;background:#33415c;border-radius:5px;overflow:hidden;margin-top:4px}"
-        "#bar .f{height:100%;width:0;background:#0ea5e9;transition:width .15s}"
-        "#st{margin-top:8px;font-size:12px;min-height:15px}#st.err{color:#f87171}#st.ok{color:#5eead4}"
-        "#logs{display:none;max-height:200px;overflow:auto;background:#1e2638;border:1px solid #35405a;"
-        "border-radius:6px;padding:8px;margin-top:10px;font-size:10px;line-height:1.4;"
-        "white-space:pre-wrap;word-break:break-all}"
-        "</style></head><body>"
-        "<div class='card'><div class='row'><h2>MeshBot</h2><h4>" DEVICE_NAME "</h4></div>"
-        "<label>Куда прошиваем:</label><div class='row'><select id='target'>__OPTIONS__</select></div>"
-        "<div id='drop'><span class='big'>&#128190;</span> <span id='hint'>"
-        "Перетащи .bin (бот) или .otaz (сенсор)</span><span id='fname'></span></div>"
-        "<input id='file' type='file' accept='.bin,.otaz' style='display:none'>"
-        "<button id='go' disabled>&#10133; Начать обновление</button>"
-        "<div id='secrow'><button id='ab' class='sec' style='display:none'>&#10060; Прервать</button>"
-        "<button class='sec' onclick='loadLogs()'>&#128220; Логи</button></div>"
-        "<div id='bar'><div class='t'><span id='pc'>0%</span><span id='sz'></span></div>"
-        "<div class='w'><div class='f'></div></div></div>"
-        "<div id='st'></div>"
-        "<pre id='logs'></pre>"
-        "<div style='margin-top:10px;font-size:10px;color:#64748b;text-align:right'>v" FW_VERSION "</div></div>"
-        "<script>var file=null,input=document.getElementById('file'),drop=document.getElementById('drop'),"
-        "go=document.getElementById('go'),ab=document.getElementById('ab'),bar=document.getElementById('bar'),"
-        "st=document.getElementById('st'),sel=document.getElementById('target'),poll=null;"
-        "function setF(f){file=f;if(!f)return;document.getElementById('fname').textContent=f.name+' ('+(f.size/1024|0)+' KB)';"
-        "document.getElementById('hint').style.display='none';go.disabled=false;}"
-        "drop.onclick=function(){input.click()};drop.ondragover=function(e){e.preventDefault();drop.classList.add('hover')};"
-        "drop.ondragleave=function(){drop.classList.remove('hover')};drop.ondrop=function(e){e.preventDefault();"
-        "drop.classList.remove('hover');if(e.dataTransfer.files[0])setF(e.dataTransfer.files[0])};"
-        "input.onchange=function(){setF(input.files[0])};"
-        "function setP(p,s){document.getElementById('pc').textContent=p+'%';document.getElementById('sz').textContent=s;"
-        "document.getElementById('bar').firstElementChild.nextElementSibling.firstElementChild.style.width=p+'%';}"
-        "function loadLogs(){var x=new XMLHttpRequest();x.open('GET','/logs');"
-        "x.onload=function(){document.getElementById('logs').textContent=x.response;"
-        "document.getElementById('logs').style.display='block';};x.send()}"
-        "function pollStatus(){var x=new XMLHttpRequest();x.open('GET','/ota/status');x.onload=function(){"
-        "if(x.status!=200){stopPoll();return;}var j;try{j=JSON.parse(x.response)}catch(e){return;}st.className='ok';"
-        "if(j.phase==4){bar.style.display='block';setP(100,j.msg);st.textContent=j.msg;stopPoll();ab.style.display='none';return;}"
-        "if(j.phase==0){stopPoll();if(!j.fw)st.textContent=j.msg;return;}"
-        "bar.style.display='block';setP(j.pct,j.msg);st.textContent=(j.retr>0)?('retyr '+j.retr):''};"
-        "x.onerror=stopPoll;x.send()}"
-        "function stopPoll(){if(poll){clearInterval(poll);poll=null}}"
-        "ab.onclick=function(){var x=new XMLHttpRequest();x.open('POST','/ota/abort');x.onload=function(){stopPoll();"
-        "st.className='err';st.textContent='Прервано';ab.style.display='none'};x.send()};"
-        "go.onclick=function(){if(!file)return;go.disabled=true;st.className='';st.textContent='Загрузка на бот...';"
-        "bar.style.display='block';var selfMode=sel.value=='__self__';var fd=new FormData();fd.append('fw',file);"
-        "var x=new XMLHttpRequest();x.open('POST',selfMode?'/update':'/savefw');"
-        "x.upload.onprogress=function(e){if(e.lengthComputable){var p=e.loaded/e.total*100|0;setP(p,'upload')}};"
-        "x.onload=function(){if(!selfMode){if(x.response.indexOf('OK')<0){st.className='err';st.textContent=x.response||'FAIL';go.disabled=false;return;}"
-        "var s=new XMLHttpRequest();s.open('POST','/ota/start?target='+encodeURIComponent(sel.value));"
-        "s.onload=function(){if(s.status!=200){st.className='err';st.textContent=s.response;go.disabled=false;return;}"
-        "st.className='ok';st.textContent='Запущено, ждём сенсор...';ab.style.display='block';"
-        "poll=setInterval(pollStatus,2000)};s.onerror=function(){st.className='err';st.textContent='no start';go.disabled=false};s.send()}"
-        "else{st.className=x.response.indexOf('OK')>=0?'ok':'err';st.textContent=x.response;"
-        "if(st.className=='ok')setTimeout(function(){location.reload()},3000)}};x.send(fd)};</script>"
-        "</body></html>";
-
-    String page = FPSTR(PAGE);
-    String opts;
-    opts += "<option value='__self__'>" DEVICE_NAME " (этот бот, HTTP)</option>";
-    for (int i = 0; i < sensorDeviceDiscCount; i++) {
-        String n = sensorDeviceDisc[i];
-        n.replace("'", "");
-        opts += "<option value='" + n + "'>" + n + " (mesh OTA)</option>";
+// Проверка LittleFS по запросу. Раньше шла внутри /logs и писала во flash при каждом
+// открытии страницы — теперь только когда её явно попросили.
+void otaHandleSelfTest() {
+    String r = "LittleFS: ";
+    File t = LittleFS.open("/.probe", "w");
+    if (!t) {
+        r += "open(w) FAILED — файловая система не работает";
+    } else {
+        int w = (int)t.write((const uint8_t*)"probe", 5);
+        t.close();
+        if (w != 5) {
+            r += "write FAILED";
+        } else {
+            File t2 = LittleFS.open("/.probe", "r");
+            if (!t2) {
+                r += "open(r) FAILED";
+            } else {
+                char b[8] = {0};
+                int rd = (int)t2.read((uint8_t*)b, 5);
+                t2.close();
+                r += "OK, прочитано \"" + String(b) + "\" (" + String(rd) + " Б)";
+            }
+            LittleFS.remove("/.probe");
+        }
     }
-    page.replace("__OPTIONS__", opts);
+    slog("[WEB] selftest: %s\n", r.c_str());
+    otaServer.send(200, "text/plain; charset=utf-8", r + "\r\n");
+}
 
+// Состояние бота для шапки страницы
+void otaHandleInfo() {
+    char fwname[64];
+    jsonEscape(otaFwName.c_str(), fwname, sizeof(fwname));
+    char json[384];
+    snprintf(json, sizeof(json),
+             "{\"up\":%lu,\"wifi\":%s,\"mqtt\":%s,\"heap\":%u,\"temp\":%.1f,"
+             "\"bat\":%d,\"volt\":%.2f,\"ip\":\"%s\",\"pkts\":%d,"
+             "\"board\":\"" BOARD_CODE "\",\"ver\":\"" FW_VERSION "\","
+             "\"fwready\":%s,\"fwname\":\"%s\",\"fwsize\":%u,\"fwimg\":%u}",
+             (unsigned long)(millis() / 1000),
+             wifiConnected ? "true" : "false", mqttConnected ? "true" : "false",
+             (unsigned)ESP.getFreeHeap(), cpuTempC(),
+             batteryPercent(), batteryVoltage(),
+             wifiConnected ? WiFi.localIP().toString().c_str() : "-", packetCount,
+             otaFwReady ? "true" : "false", fwname,
+             (unsigned)otaFwSize, (unsigned)otaImgSize);
+    otaServer.send(200, "application/json", json);
+}
+
+// Живой вывод лога: текст, записанный после позиции from (счётчик logTotal)
+void otaHandleLogTail() {
+    uint32_t from = strtoul(otaServer.arg("from").c_str(), NULL, 10);
+    uint32_t tailStart = logTotal - logTail.length();
+    String out;
+    if (from > logTotal) from = tailStart;   // бот перезагрузился — отдаём весь хвост
+    if (from < tailStart) {
+        out = "…(пропущено)…\n";
+        from = tailStart;
+    }
+    out += logTail.substring(from - tailStart);
+    otaServer.sendHeader("X-Log-Pos", String(logTotal));
+    otaServer.send(200, "text/plain; charset=utf-8", out);
+}
+
+void otaHandleSensors() {
+    String json = "[";
+    for (int i = 0; i < sensorDeviceDiscCount; i++) {
+        char name[48], ver[32], board[16], item[240];
+        jsonEscape(sensorDeviceDisc[i].c_str(), name, sizeof(name));
+        jsonEscape(sensorFwVersion[i].c_str(), ver, sizeof(ver));
+        jsonEscape(sensorBoard[i].c_str(), board, sizeof(board));
+        snprintf(item, sizeof(item),
+                 "%s{\"name\":\"%s\",\"ver\":\"%s\",\"board\":\"%s\",\"online\":%s,"
+                 "\"seen_s\":%lu,\"bat\":%d,\"rssi\":%.0f}",
+                 i ? "," : "", name, ver, board, sensorOnlineNow[i] ? "true" : "false",
+                 (millis() - sensorLastActive[i]) / 1000, sensorBattery[i], sensorRssi[i]);
+        json += item;
+    }
+    json += "]";
+    otaServer.send(200, "application/json", json);
+}
+
+void otaHandleSensorsHello() {
+    if (otaSessionActive()) { otaServer.send(409, "text/plain", "идёт прошивка сенсора"); return; }
+    if (sensorChannelIdx < 0) { otaServer.send(503, "text/plain", "канал сенсоров не настроен"); return; }
+    slog("[WEB] опрос сенсоров (%s)\n", SENSOR_MSG_HELLO_REQ);
+    sensorSendMsg(SENSOR_MSG_HELLO_REQ);
+    otaServer.send(200, "text/plain", "sent");
+}
+
+// CSS и JS отдаются отдельными адресами и кэшируются браузером: HTML в памяти бота
+// собирается маленьким, а повторные открытия страницы тянут только его. Версия в адресе
+// (?v=) сбрасывает кэш при обновлении прошивки.
+static const char PAGE_CSS[] PROGMEM = R"CSS(
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#1c2333;color:#e8ecf3;margin:0;padding:10px;display:flex;justify-content:center}
+.wrap{display:grid;grid-template-columns:minmax(320px,390px) 1fr;gap:10px;width:100%;max-width:1220px;align-items:start}
+.card{background:#242d40;border:1px solid #35405a;border-radius:10px;padding:12px}
+.hdr{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+h2{margin:0;font-size:16px}#dev{color:#93a4c4;font-size:12px}
+.info{margin:6px 0 10px;font-size:11px;color:#93a4c4;line-height:1.6}
+label{display:block;font-size:11px;color:#93a4c4;margin:0 0 4px}
+.row{display:flex;gap:6px;margin-top:6px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f87171;margin-right:3px;vertical-align:middle}
+.dot.on{background:#34d399}
+.bat{display:inline-block;width:26px;height:9px;border:1px solid #4a5775;border-radius:2px;vertical-align:middle;overflow:hidden}
+.bat i{display:block;height:100%;background:#34d399}
+.bat.low i{background:#f87171}
+.tgt{display:flex;gap:8px;align-items:center;padding:7px 8px;border:1px solid #35405a;border-radius:8px;background:#1e2638;cursor:pointer;margin-bottom:6px}
+.tgt:hover{border-color:#4a5775}
+.tgt.sel{border-color:#0ea5e9;background:#1b2b3d}
+.tgt .nm{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tgt .meta{font-size:10px;color:#93a4c4;margin-top:2px}
+.tgt .meta b{color:#c7d3e8;font-weight:600}
+.grow{flex:1;min-width:0}
+#drop{margin-top:8px;border:2px dashed #4a5775;border-radius:8px;padding:10px;text-align:center;cursor:pointer;background:#1e2638;font-size:12px;color:#93a4c4}
+#drop.hover{border-color:#5eead4;background:#1b2233}
+#fname{margin-top:4px;color:#5eead4;word-break:break-all;font-size:12px}#fver{font-size:11px}
+.fw{margin-top:8px;font-size:11px;color:#93a4c4;background:#1e2638;border:1px solid #35405a;border-radius:8px;padding:8px}
+.fw b{color:#c7d3e8}
+button{padding:8px;border:0;border-radius:6px;background:#0ea5e9;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+button:hover{background:#38bdf8}button:disabled{background:#33415c;color:#8391ab;cursor:not-allowed}
+button.sec{background:#475569}button.sec:hover{background:#64748b}
+button.sm{padding:5px 10px;font-size:12px;font-weight:500}
+#go{display:block;width:100%;margin-top:8px}
+#prog{margin-top:10px;background:#1e2638;border:1px solid #35405a;border-radius:8px;padding:10px}
+.pct{font-size:34px;font-weight:700;line-height:1}.pct small{font-size:16px;color:#93a4c4;margin-left:2px}
+.w{height:8px;background:#33415c;border-radius:5px;overflow:hidden;margin:8px 0 4px}
+#fill{height:100%;width:0;background:#0ea5e9;transition:width .3s}
+.t{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#93a4c4}
+#ab{width:100%;margin-top:8px}
+#st{margin-top:8px;font-size:12px;min-height:14px}#st.err{color:#f87171}#st.ok{color:#5eead4}
+.ft{margin-top:8px;font-size:10px;color:#64748b;text-align:right}
+.ft a{color:#64748b}
+.tools{display:flex;gap:6px}
+#q{flex:1;min-width:0;padding:5px 8px;border:1px solid #35405a;border-radius:6px;background:#1e2638;color:#e8ecf3;font-size:12px}
+.logwrap{position:relative;margin-top:8px}
+#logs{height:calc(100vh - 108px);min-height:260px;overflow:auto;margin:0;background:#1e2638;border:1px solid #35405a;border-radius:6px;padding:8px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;line-height:1.45}
+#logs div{white-space:pre-wrap;word-break:break-all}
+.l-e{color:#f87171}.l-o{color:#7dd3fc}.l-s{color:#a7f3d0}.l-w{color:#c4b5fd}
+.jump{position:absolute;right:12px;bottom:12px;padding:6px 10px;font-size:11px;background:#0ea5e9}
+@media(max-width:820px){.wrap{grid-template-columns:1fr}#logs{height:52vh}}
+)CSS";
+
+static const char PAGE_JS[] PROGMEM = R"JS(
+const $=id=>document.getElementById(id);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const kb=b=>b>=1048576?(b/1048576).toFixed(2)+' МБ':Math.round(b/1024)+' КБ';
+const dur=s=>{s=Math.max(0,Math.round(s));return s>=60?Math.floor(s/60)+' мин '+(s%60)+' с':s+' с'};
+const ago=s=>s<60?s+' с':s<3600?Math.floor(s/60)+' мин':Math.floor(s/3600)+' ч';
+const upfmt=s=>s>=86400?Math.floor(s/86400)+' д '+Math.floor(s%86400/3600)+' ч':s>=3600?Math.floor(s/3600)+' ч '+Math.floor(s%3600/60)+' мин':Math.floor(s/60)+' мин';
+const ERRS={'timeout p1':'сенсор не ответил на старт','timeout p2':'сенсор перестал отвечать на чанки','timeout p3':'сенсор не подтвердил прошивку','no progress':'сенсор не принимает чанки','sensor fail':'сенсор сообщил об ошибке записи','read err':'не читается файл на боте','encrypt err':'ошибка шифрования чанка','no file':'файл на боте не открыт','новый файл':'сессия прервана загрузкой нового файла','manual':'прервано вручную'};
+const errText=e=>ERRS[e]||e;
+let file=null,poll=null,busy=false,vErr=false,sensors=[],info={},target='__self__';
+const isSelf=()=>target=='__self__';
+function st(t,c){$('st').textContent=t;$('st').className=c||'';vErr=false}
+function bar(p,l,r){$('prog').hidden=false;$('pctv').textContent=Math.round(p);$('fill').style.width=p+'%';$('pl').textContent=l;$('pr').textContent=r||''}
+function batHtml(p){return '<span class="bat'+(p<20?' low':'')+'"><i style="width:'+Math.max(0,Math.min(100,p))+'%"></i></span>'}
+function refresh(){
+  const need=isSelf()?'bin':'otaz';
+  $('hint').textContent=file?'':'Перетащи .'+need+' сюда или нажми';
+  $('file').accept='.'+need;
+  const bad=!!file&&file.name.split('.').pop().toLowerCase()!=need;
+  if(!busy){
+    if(bad){st(isSelf()?'Для бота нужен .bin':'Для сенсора нужен .otaz','err');vErr=true}
+    else if(vErr)st('','');
+  }
+  $('go').textContent=isSelf()?'Прошить бота':'Прошить '+target;
+  $('go').disabled=busy||!file||bad;
+  $('fwgo')&&($('fwgo').disabled=busy||isSelf());
+}
+function setFile(f){
+  if(!f)return;
+  file=f;
+  $('fname').textContent=f.name+' ('+kb(f.size)+')';
+  const m=f.name.match(/_v(\d+\.\d+\.\d+)\./);
+  $('fver').textContent=m?'версия '+m[1]:'';
+  refresh();
+}
+function addTarget(id,name,meta,online,bat){
+  const d=document.createElement('div');
+  d.className='tgt'+(target==id?' sel':'');
+  d.innerHTML='<span class="dot'+(online?' on':'')+'"></span>'
+    +'<span class="grow"><span class="nm">'+name+'</span><div class="meta">'+meta+'</div></span>'
+    +(bat>=0?batHtml(bat):'');
+  d.onclick=()=>{target=id;renderTargets();refresh()};
+  $('targets').appendChild(d);
+}
+function renderTargets(){
+  $('targets').innerHTML='';
+  addTarget('__self__',$('dev').textContent+' — этот бот',
+            '<b>'+(info.board||'?')+'</b> · v'+(info.ver||'?')+' · файл .bin',true,
+            info.bat>=0?info.bat:-1);
+  for(const s of sensors){
+    const meta='<b>'+(s.board||'?')+'</b> · '+(s.ver?'v'+s.ver:'версия ?')
+      +' · '+(s.online?'онлайн':'был '+ago(s.seen_s)+' назад')
+      +(s.rssi?' · '+s.rssi+' dBm':'');
+    addTarget(s.name,s.name,meta,s.online,s.bat);
+  }
+  if(!sensors.length){
+    const d=document.createElement('div');
+    d.style.cssText='font-size:11px;color:#93a4c4;margin-bottom:6px';
+    d.textContent='сенсоры ещё не выходили на связь';
+    $('targets').appendChild(d);
+  }
+}
+async function loadSensors(){
+  try{sensors=await (await fetch('/sensors')).json()}catch(e){return}
+  if(!isSelf()&&!sensors.some(s=>s.name==target))target='__self__';
+  renderTargets();refresh();
+}
+async function loadInfo(){
+  try{
+    info=await (await fetch('/info')).json();
+    $('info').innerHTML='<span class="dot'+(info.wifi?' on':'')+'"></span>WiFi'
+      +' <span class="dot'+(info.mqtt?' on':'')+'"></span>MQTT · '+info.ip
+      +' · '+upfmt(info.up)+' · '+info.temp.toFixed(0)+'°C · heap '+Math.round(info.heap/1024)+' КБ'
+      +(info.bat>=0?' · '+batHtml(info.bat)+' '+info.bat+'% ('+info.volt.toFixed(2)+' V)':'');
+    const fw=$('fw');
+    if(info.fwready){
+      fw.hidden=false;
+      fw.innerHTML='На боте: <b>'+(info.fwname||'файл .otaz')+'</b><br>'+kb(info.fwsize)
+        +' сжато, образ '+kb(info.fwimg)
+        +' <button id="fwgo" class="sec sm" style="margin-top:6px">Прошить сохранённым</button>';
+      $('fwgo').onclick=flashStored;
+    }else fw.hidden=true;
+    renderTargets();refresh();
+  }catch(e){$('info').textContent='нет связи с ботом'}
+}
+function finish(){busy=false;$('ab').hidden=true;clearInterval(poll);poll=null;refresh()}
+$('drop').onclick=()=>$('file').click();
+$('drop').ondragover=e=>{e.preventDefault();$('drop').classList.add('hover')};
+$('drop').ondragleave=()=>$('drop').classList.remove('hover');
+$('drop').ondrop=e=>{e.preventDefault();$('drop').classList.remove('hover');setFile(e.dataTransfer.files[0])};
+$('file').onchange=()=>setFile($('file').files[0]);
+$('ab').onclick=()=>fetch('/ota/abort',{method:'POST'}).catch(()=>{});
+$('ask').onclick=async()=>{
+  $('ask').disabled=true;
+  try{
+    const r=await fetch('/sensors/hello',{method:'POST'});
+    if(!r.ok)throw new Error(await r.text());
+    const t0=Date.now();
+    if(!busy)st('Запрос отправлен, ждём ответы…','ok');
+    for(let i=0;i<3;i++){await sleep(3000);await loadSensors()}
+    const n=sensors.filter(s=>s.seen_s<=(Date.now()-t0)/1000).length;
+    if(!busy)st('Ответили: '+n+' из '+sensors.length,n?'ok':'err');
+  }catch(e){if(!busy)st(e.message,'err')}
+  $('ask').disabled=false;
+};
+let logPos=0,logTimer=null,logAll='',logLines=[],filterQ='';
+const atBottom=()=>{const l=$('logs');return l.scrollTop+l.clientHeight>=l.scrollHeight-12};
+function scrollBottom(){const l=$('logs');l.scrollTop=l.scrollHeight;$('down').hidden=true}
+function lineClass(s){
+  if(/(abort|fail|error|ошиб|timeout|mismatch|прерван)/i.test(s))return 'l-e';
+  if(s.startsWith('[OTA'))return 'l-o';
+  if(s.startsWith('[SNS'))return 'l-s';
+  if(s.startsWith('[WEB')||s.startsWith('[MQTT'))return 'l-w';
+  return '';
+}
+function appendLines(arr){
+  const l=$('logs'),frag=document.createDocumentFragment();
+  for(const s of arr){
+    if(filterQ&&!s.toLowerCase().includes(filterQ))continue;
+    const d=document.createElement('div');
+    d.className=lineClass(s);
+    d.textContent=s;
+    frag.appendChild(d);
+  }
+  l.appendChild(frag);
+  while(l.childElementCount>2000)l.removeChild(l.firstChild);
+}
+function renderLog(){$('logs').textContent='';appendLines(logLines);scrollBottom()}
+function addChunk(t){
+  const stick=atBottom();
+  logAll+=t;
+  if(logAll.length>120000)logAll=logAll.slice(-80000);
+  const lines=t.split('\n').filter(s=>s.length>0);
+  logLines.push(...lines);
+  if(logLines.length>3000)logLines=logLines.slice(-2000);
+  appendLines(lines);
+  if(stick)scrollBottom();else $('down').hidden=false;
+}
+async function pullLog(){
+  try{
+    const r=await fetch('/logs/tail?from='+logPos);
+    const t=await r.text();
+    logPos=+r.headers.get('X-Log-Pos')||logPos;
+    if(t)addChunk(t);
+  }catch(e){}
+}
+async function initLog(){
+  try{
+    const r=await fetch('/logs');
+    logPos=+r.headers.get('X-Log-Pos')||0;
+    logAll=await r.text();
+    logLines=logAll.split('\n').filter(s=>s.length>0);
+    renderLog();
+  }catch(e){$('logs').textContent='нет связи с ботом'}
+  clearInterval(logTimer);
+  logTimer=setInterval(pullLog,1500);
+}
+$('logs').onscroll=()=>{if(atBottom())$('down').hidden=true};
+$('down').onclick=scrollBottom;
+$('q').oninput=()=>{filterQ=$('q').value.trim().toLowerCase();renderLog()};
+$('clr').onclick=()=>{logAll='';logLines=[];renderLog()};
+$('dl').onclick=()=>{
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([logAll],{type:'text/plain'}));
+  a.download='meshbot-log.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+function upload(url){
+  return new Promise((ok,fail)=>{
+    const x=new XMLHttpRequest(),fd=new FormData();
+    fd.append('fw',file);
+    x.open('POST',url);
+    x.upload.onprogress=e=>{if(e.lengthComputable)bar(Math.round(e.loaded*100/e.total),'Загрузка на бот',kb(e.loaded)+' из '+kb(e.total))};
+    x.onload=()=>ok(x.responseText);
+    x.onerror=()=>fail(new Error('нет связи с ботом'));
+    x.send(fd);
+  });
+}
+async function waitBot(){
+  await sleep(4000);
+  for(let i=0;i<30;i++){
+    try{if((await fetch('/info')).ok){location.reload();return}}catch(e){}
+    await sleep(2000);
+  }
+  st('Бот не вернулся за минуту — проверьте питание и WiFi','err');
+}
+function track(){
+  let doneAt=0;
+  poll=setInterval(async()=>{
+    let j;
+    try{j=await (await fetch('/ota/status')).json()}catch(e){return}
+    const sec=j.elapsed_ms/1000;
+    const stats='повторы: '+j.retrs+' · опросы: '+j.polls;
+    if(j.phase==1){bar(0,'Ждём ответ сенсора…',dur(sec))}
+    else if(j.phase==2){
+      const p=j.total?j.sent*100/j.total:0,rate=sec>0?j.sent/sec:0;
+      bar(p,kb(j.sent)+' из '+kb(j.total),rate>0?(rate/1024).toFixed(1)+' КБ/с · осталось '+dur((j.total-j.sent)/rate):'');
+      st(j.retr?'Повторы подряд: '+j.retr:'','');
+    }
+    else if(j.phase==3){bar(100,'Сенсор проверяет прошивку…',dur(sec))}
+    else if(j.phase==4){
+      bar(100,'Передано за '+dur(sec),stats);
+      if(j.back){st('Готово: '+j.target+' загрузился'+(j.ver?' с версией '+j.ver:''),'ok');finish();loadSensors()}
+      else{
+        doneAt=doneAt||Date.now();
+        if(Date.now()-doneAt>120000){st('Прошивка принята, но сенсор пока не вышел на связь','err');finish()}
+        else st('Прошивка принята, ждём перезагрузку сенсора…','ok');
+      }
+    }
+    else{st(j.err?'Ошибка: '+errText(j.err)+' ('+stats+')':'Сессия завершена','err');finish()}
+  },1000);
+}
+async function startSession(){
+  const s=await fetch('/ota/start?target='+encodeURIComponent(target),{method:'POST'});
+  if(!s.ok)throw new Error(await s.text());
+  $('ab').hidden=false;
+  bar(0,'Ждём ответ сенсора…','');
+  track();
+}
+async function flashStored(){
+  if(isSelf())return;
+  busy=true;refresh();
+  try{await startSession()}catch(e){st(e.message,'err');finish()}
+}
+$('go').onclick=async()=>{
+  if(isSelf()&&!confirm('Прошить сам бот? Он перезагрузится, связь ненадолго пропадёт.'))return;
+  busy=true;refresh();
+  try{
+    if(isSelf()){
+      const r=await upload('/update');
+      if(r.indexOf('OK')<0)throw new Error(r||'FAIL');
+      bar(100,'Прошито','');st('Бот перезагружается, страница обновится сама…','ok');
+      waitBot();
+      return;
+    }
+    const r=await upload('/savefw');
+    if(r.indexOf('OK')<0)throw new Error(r||'FAIL');
+    await startSession();
+  }catch(e){st(e.message,'err');finish()}
+};
+loadInfo();
+loadSensors();
+initLog();
+setInterval(loadInfo,5000);
+setInterval(loadSensors,20000);
+fetch('/ota/status').then(r=>r.json()).then(j=>{if(j.phase>=1&&j.phase<=3){busy=true;$('ab').hidden=false;$('prog').hidden=false;refresh();track()}}).catch(()=>{});
+)JS";
+
+static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>MeshBot OTA</title><link rel='stylesheet' href='/style.css?v=__VER__'></head><body>
+<div class='wrap'>
+<section class='card'>
+<div class='hdr'><h2>MeshBot OTA</h2><span id='dev'>__NAME__</span></div>
+<div id='info' class='info'>…</div>
+<label>Куда прошиваем</label>
+<div id='targets'></div>
+<div class='row'><button id='ask' class='sec sm grow'>Опросить сенсоры</button></div>
+<div id='drop'>&#128190; <span id='hint'></span><div id='fname'></div><div id='fver'></div></div>
+<input id='file' type='file' hidden>
+<div id='fw' class='fw' hidden></div>
+<button id='go' disabled>Начать обновление</button>
+<div id='prog' hidden>
+<div class='pct'><span id='pctv'>0</span><small>%</small></div>
+<div class='w'><div id='fill'></div></div>
+<div class='t'><span id='pl'></span><span id='pr'></span></div>
+<button id='ab' class='sec' hidden>Прервать</button>
+</div>
+<div id='st'></div>
+<div class='ft'>MeshBot v__VER__ · <a href='/selftest' target='_blank'>проверить LittleFS</a></div>
+</section>
+<section class='card'>
+<div class='tools'><input id='q' placeholder='фильтр по тексту'><button id='dl' class='sec sm'>Скачать</button><button id='clr' class='sec sm'>Очистить</button></div>
+<div class='logwrap'><pre id='logs'>загрузка…</pre><button id='down' class='jump' hidden>&#8595; новые строки</button></div>
+</section>
+</div>
+<script src='/app.js?v=__VER__'></script>
+</body></html>)HTML";
+
+// Статика отдаётся потоком из флеша, без копии в куче
+static void sendStatic(const char* type, PGM_P body) {
+    otaServer.sendHeader("Cache-Control", "public, max-age=31536000, immutable");
+    otaServer.setContentLength(strlen_P(body));
+    otaServer.send(200, type, "");
+    otaServer.sendContent_P(body);
+}
+
+void otaHandleCss() { sendStatic("text/css; charset=utf-8", PAGE_CSS); }
+void otaHandleJs()  { sendStatic("application/javascript; charset=utf-8", PAGE_JS); }
+
+void otaHandleRoot() {
+    String page = FPSTR(PAGE_HTML);
+    page.replace("__NAME__", DEVICE_NAME);
+    page.replace("__VER__", FW_VERSION);
     otaServer.sendHeader("Connection", "close");
     otaServer.send(200, "text/html", page);
     #if HAS_OLED
@@ -490,48 +842,42 @@ void otaHandleRoot() {
     #endif
 }
 
+// После неудачной самопрошивки возвращаем радио и усилитель, иначе бот оглохнет до перезагрузки
+static void otaSelfUpdateResume() {
+    #if HAS_FEM
+    digitalWrite(FEM_EN_PIN, HIGH);
+    #endif
+    radio.startReceive();
+    isListening = true;
+}
+
 void otaHandleUpdate() {
     HTTPUpload& up = otaServer.upload();
     switch (up.status) {
     case UPLOAD_FILE_START:
-    {
-        otaFlashing = true;
-        otaStartMs = millis();
-        Serial.printf("\n[OTA] загрузка: %s (%u байт)\n", up.filename.c_str(), (unsigned)up.totalSize);
+        Serial.printf("\n[OTA] загрузка: %s\n", up.filename.c_str());
         #if HAS_OLED
         display.clearDisplay();
         display.setCursor(0, 0);
         display.println("OTA update...");
         display.display();
         #endif
-        // NAS: выключаем радио и сеть на время прошивки
+        // на время записи радио и сеть выключены
         radio.sleep();
         isListening = false;
         if (mqttConnected) mqtt.disconnect();
         #if HAS_FEM
         digitalWrite(FEM_EN_PIN, LOW);
         #endif
-        // totalSize на UPLOAD_FILE_START равен 0 в Arduino core (растёт только при
-        // WRITE), поэтому размер берём из свободного места под прошивку.
-        uint32_t otaMax = UPDATE_SIZE_UNKNOWN;
-        if (!Update.begin(otaMax)) {
-            Update.printError(Serial);
-        }
+        // totalSize на START ещё 0 (Arduino core) — размер ограничит сам раздел OTA
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
         break;
-    }
     case UPLOAD_FILE_WRITE:
-    {
-        if (!Update.isRunning()) break;
-        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+        if (Update.isRunning() && Update.write(up.buf, up.currentSize) != up.currentSize) {
             Update.printError(Serial);
         }
-        if ((millis() - otaStartMs) / 1000 > 3) {
-            otaStartMs = millis();   // только для прогресса не критично
-        }
         break;
-    }
     case UPLOAD_FILE_END:
-    {
         if (Update.end(true)) {
             Serial.printf("[OTA] OK, %u bytes, reboot...\n", (unsigned)up.totalSize);
             #if HAS_OLED
@@ -541,27 +887,21 @@ void otaHandleUpdate() {
             otaServer.send(200, "text/plain", "OK rebooting");
             delay(300);
             ESP.restart();
-        } else {
-            Update.printError(Serial);
-            #if HAS_OLED
-            display.println("OTA FAILED!");
-            display.display();
-            #endif
-            otaFlashing = false;
-            radio.startReceive();
-            isListening = true;
         }
+        Update.printError(Serial);
+        #if HAS_OLED
+        display.println("OTA FAILED!");
+        display.display();
+        #endif
+        otaSelfUpdateResume();
         break;
-    }
     case UPLOAD_FILE_ABORTED:
-    {
         Update.abort();
-        otaFlashing = false;
-        radio.startReceive();
-        isListening = true;
+        otaSelfUpdateResume();
         Serial.println("[OTA] прервано");
         break;
-    }
+    default:
+        break;
     }
 }
 
@@ -572,7 +912,7 @@ void otaHandleSaveFw() {
     switch (up.status) {
     case UPLOAD_FILE_START:
     {
-        if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) otaBotAbort("новый .bin");
+        if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) otaBotAbort("новый файл");
         otaSaving = true;
         otaSaveOk = false;
         otaSaveTooBig = false;
@@ -581,6 +921,7 @@ void otaHandleSaveFw() {
         otaWriteSkipped = 0;
         // закрываем любые остатки прошлой сессии, иначе на /ota.bin висит чужой handle
         if (otaFile) { otaFile.close(); otaFile = File(); }
+        otaFwName = up.filename;
         slog("\n[OTA-SAVE] %s (%u байт)\n", up.filename.c_str(), (unsigned)up.totalSize);
         otaFile = LittleFS.open("/ota.bin", "w");
         if (!otaFile) {
@@ -634,6 +975,11 @@ void otaHandleSaveFw() {
                 // Переоткрываем для проверки (flush при close записал на диск)
                 otaInspectStoredFw();
                 otaSaveOk = true;
+                File n = LittleFS.open("/ota.name", "w");
+                if (n) {
+                    n.print(otaFwName);
+                    n.close();
+                }
                 slog("[OTA-SAVE] записано %lu байт, .otaz=%d\n", otaWriteBytes, (int)otaFwReady);
                 if (otaFwReady && otaFwSize + OTA_Z_HDR != (uint32_t)otaWriteBytes) {
                     slog("[OTA-SAVE] ВНИМАНИЕ: size()=%u != writeBytes=%lu\n",
@@ -680,6 +1026,10 @@ void otaHandleStartOta() {
     otaFile = LittleFS.open("/ota.bin", "r");
     if (!otaFile) { slog("[WEB] /ota/start: fs open fail\n"); otaServer.send(500, "text/plain", "fs open fail"); return; }
     otaTarget = target;
+    otaLastErr[0] = 0;
+    otaSessionMs = millis();
+    otaPolls = 0;
+    otaRetrTotal = 0;
     otaPhase = OTA_PHASE_WAIT_START;
     otaSeq = 0;
     otaSentBytes = 0;
@@ -697,31 +1047,27 @@ void otaHandleAbort() {
 }
 
 void otaHandleStatus() {
-    char json[160];
-    if (otaPhase == OTA_PHASE_IDLE) {
-        snprintf(json, sizeof(json),
-                 "{\"phase\":0,\"fw\":%s,\"msg\":\"%s\"}",
-                 otaFwReady ? "true" : "false",
-                 otaFwReady ? "готово, .otaz на боте" : "нет прошивки на боте");
-        otaServer.send(200, "application/json", json);
-        return;
+    int idx = -1;
+    for (int i = 0; i < sensorDeviceDiscCount; i++) {
+        if (sensorDeviceDisc[i] == otaTarget) { idx = i; break; }
     }
-    if (otaPhase == OTA_PHASE_DONE) {
-        snprintf(json, sizeof(json),
-                 "{\"phase\":4,\"pct\":100,\"msg\":\"готово: %s\",\"retr\":0}",
-                 otaTarget.c_str());
-        otaServer.send(200, "application/json", json);
-        return;
-    }
-    uint32_t pct = otaFwSize ? (otaSentBytes * 100 / otaFwSize) : 0;
-    if (pct > 100) pct = 100;
-    const char* ph = "start";
-    if (otaPhase == OTA_PHASE_DATA) ph = "data";
-    else if (otaPhase == OTA_PHASE_WAIT_END) ph = "finalize";
+    char tgt[48], err[64], ver[32];
+    jsonEscape(otaTarget.c_str(), tgt, sizeof(tgt));
+    jsonEscape(otaLastErr, err, sizeof(err));
+    jsonEscape(idx >= 0 ? sensorFwVersion[idx].c_str() : "", ver, sizeof(ver));
+    unsigned long endMs = (otaPhase == OTA_PHASE_DONE) ? otaDoneMs : millis();
+    // back: сенсор прислал hello уже после подтверждения прошивки — значит, загрузился с неё
+    bool back = otaPhase == OTA_PHASE_DONE && idx >= 0 && sensorLastActive[idx] > otaDoneMs;
+    char json[384];
     snprintf(json, sizeof(json),
-             "{\"phase\":%u,\"pct\":%u,\"msg\":\"%s %u%% (%u/%u)\",\"retr\":%u}",
-             otaPhase, pct, ph, pct,
-             (unsigned)otaSentBytes, (unsigned)otaFwSize, otaRetries);
+             "{\"phase\":%u,\"fw\":%s,\"sent\":%u,\"total\":%u,\"elapsed_ms\":%lu,\"retr\":%u,"
+             "\"polls\":%u,\"retrs\":%u,"
+             "\"err\":\"%s\",\"target\":\"%s\",\"ver\":\"%s\",\"back\":%s}",
+             (unsigned)otaPhase, otaFwReady ? "true" : "false",
+             (unsigned)otaSentBytes, (unsigned)otaFwSize,
+             otaSessionMs ? endMs - otaSessionMs : 0UL, (unsigned)otaRetries,
+             (unsigned)otaPolls, (unsigned)otaRetrTotal,
+             err, tgt, ver, back ? "true" : "false");
     otaServer.send(200, "application/json", json);
 }
 
@@ -747,33 +1093,22 @@ void setupOtaServer() {
     otaServer.on("/ota/start", HTTP_POST, otaHandleStartOta);
     otaServer.on("/ota/abort", HTTP_POST, otaHandleAbort);
     otaServer.on("/ota/status", HTTP_GET, otaHandleStatus);
+    otaServer.on("/sensors", HTTP_GET, otaHandleSensors);
+    otaServer.on("/sensors/hello", HTTP_POST, otaHandleSensorsHello);
     otaServer.on("/logs", HTTP_GET, []() {
-        otaServer.sendHeader("Connection", "close");
-        otaServer.send(200, "text/plain", buildDiagReport());
+        otaServer.sendHeader("X-Log-Pos", String(logTotal));
+        otaServer.send(200, "text/plain; charset=utf-8", buildDiagReport());
     });
+    otaServer.on("/logs/tail", HTTP_GET, otaHandleLogTail);
+    otaServer.on("/info", HTTP_GET, otaHandleInfo);
+    otaServer.on("/selftest", HTTP_GET, otaHandleSelfTest);
+    otaServer.on("/style.css", HTTP_GET, otaHandleCss);
+    otaServer.on("/app.js", HTTP_GET, otaHandleJs);
     otaServer.begin();
     Serial.println("OTA server: http://<ip>:3232/update | /ota/start");
 }
 
 #endif // MQTT_ENABLED
-void sensorSendMsg(const char* msg) {
-    if (sensorChannelIdx < 0) {
-        Serial.printf("[SNS] sensor channel not configured, cannot send \"%s\"\n", msg);
-        return;
-    }
-    uint8_t enc[256];
-    int enclen = buildGroupEnc(sensorChannelIdx, msg, enc);
-    if (enclen <= 0) return;
-    uint8_t frame[300];
-    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), enc, enclen);
-    if (f > 0) {
-        floodSend3(-1, frame, f);
-        Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
-        #ifdef SENSOR_NODE
-        sensorLastSent = msg;
-        #endif
-    }
-}
 
 #ifdef SENSOR_NODE
 extern "C" {
@@ -845,16 +1180,6 @@ static void otaRawFail(const char* why) {
     otaSensorAbort(why);
 }
 
-void otaSensorSend(const String& msg) {
-    if (sensorChannelIdx < 0) return;
-    uint8_t enc[256];
-    int enclen = buildGroupEnc(sensorChannelIdx, msg, enc);
-    if (enclen <= 0) return;
-    uint8_t frame[300];
-    int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame), enc, enclen);
-    if (f > 0) floodSend3(-1, frame, f, 20);
-}
-
 // Приём raw-фреймов на сенсоре (бот -> сенсор) во время чистой LoRa OTA
 void otaHandleRawSensor(const uint8_t* buf, int len) {
     if (!otaActive) return;
@@ -911,39 +1236,27 @@ void otaHandleRawSensor(const uint8_t* buf, int len) {
     if (type == RAW_TYPE_DONE) {
         if (otaGot != otaTotal || !otaGotStart) {
             Serial.printf("[OTA] raw DONE size mismatch got=%u total=%u\n", otaGot, otaTotal);
-            uint8_t f[16];
-            int ff = rawBuildFrame(f, RAW_TYPE_FAIL, 0, NULL, 0);
-            if (ff > 0) rawTxFrame(f, ff);
-            otaSensorAbort("size mismatch");
+            otaRawFail("size mismatch");
             return;
         }
         uint32_t actCrc = ~otaCrcAcc;
         if (actCrc != otaCrcExp) {
             Serial.printf("[OTA] CRC MISMATCH exp=%08X got=%08X\n", otaCrcExp, actCrc);
-            uint8_t f[16];
-            int ff = rawBuildFrame(f, RAW_TYPE_FAIL, 0, NULL, 0);
-            if (ff > 0) rawTxFrame(f, ff);
-            otaSensorAbort("crc mismatch");
+            otaRawFail("crc mismatch");
             return;
         }
         if (!Update.end(true)) {
             Update.printError(Serial);
-            uint8_t f[16];
-            int ff = rawBuildFrame(f, RAW_TYPE_FAIL, 0, NULL, 0);
-            if (ff > 0) rawTxFrame(f, ff);
-            otaSensorAbort("end fail");
+            otaRawFail("end fail");
             return;
         }
         otaActive = false;
         otaGotStart = false;
         Serial.println("[OTA] raw DONE, rebooting...");
         uint8_t f[16];
-        int ff = rawBuildFrame(f, RAW_TYPE_DONE_ACK, 0, NULL, 0);
-        if (ff > 0) rawTxFrame(f, ff);
+        rawTxFrame(f, rawBuildFrame(f, RAW_TYPE_DONE_ACK, 0, NULL, 0));
         delay(300);
-        otaFastMode = false;
         ESP.restart();
-        return;
     }
 }
 
@@ -973,6 +1286,10 @@ void otaSensorDraw() {
 }
 
 void otaSensorAbort(const char* why) {
+    if (otaFastMode) {
+        Serial.printf("[OTA] быстрый канал: принято кадров %u, ошибок приёма %u\n",
+                      (unsigned)fastRxFrames, (unsigned)fastRxErrors);
+    }
     radioSetNormalConfig();
     otaFastMode = false;
     Serial.printf("[OTA] abort (%s), остаёмся на текущей прошивке\n", why);
@@ -988,6 +1305,7 @@ void otaSensorAbort(const char* why) {
     display.setCursor(0, 0);
     display.println("OTA ABORT");
     display.println(why);
+    display.printf("rx:%u err:%u\n", (unsigned)fastRxFrames, (unsigned)fastRxErrors);
     display.display();
     #endif
 }
@@ -1047,10 +1365,10 @@ void otaSensorHandle() {
         Serial.printf("[OTA] start %s: %u байт crc=%08X\n", DEVICE_NAME, total, crc);
         otaSensorDraw();
         // ackstart уходит на штатном конфиге; бот после него ждёт OTA_FAST_SETTLE_MS.
-        otaSensorSend("ota:ackstart:3");
+        sensorSendMsg(OTA_ACKSTART, 20);
         radioSetFastConfig();
         otaFastMode = true;
-        Serial.printf("[OTA] fast config %s\n", OTA_FAST_FSK ? "FSK" : "LoRa");
+        Serial.printf("[OTA] fast config: FSK %.0f кбит/с\n", (double)OTA_FSK_BR);
         return;
     }
 }

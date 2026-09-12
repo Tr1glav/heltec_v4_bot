@@ -22,12 +22,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             Serial.println("[MQTT] mesh OTA in progress, ignoring send cmd");
             return;
         }
-        String txt = msg;
-        uint8_t frame[300];
-        int fl = buildGroupFrameFlood(mqttTxChannel, txt, frame, sizeof(frame), NULL, 0);
+        uint8_t frame[256];
+        int fl = buildGroupFrameFlood(mqttTxChannel, msg, frame, sizeof(frame));
         if (fl > 0) {
-            Serial.printf("[MQTT TX] %s: %s (%dB)\n", channels[mqttTxChannel].name,
-                          (String(DEVICE_NAME) + ": " + txt).c_str(), fl);
+            Serial.printf("[MQTT TX] %s: %s: %s (%dB)\n", channels[mqttTxChannel].name, DEVICE_NAME, msg, fl);
             floodSend3(mqttTxChannel, frame, fl);
         }
         return;
@@ -49,12 +47,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         mqtt.publish(stateTopic, isListening ? "ON" : "OFF", true);
         return;
     }
-
 }
 
 void publishDiscovery() {
-    // Префикс HA: homeassistant
-    // Device block общий для всех сущностей
+    // Device block общий для всех сущностей бота
     char devBlock[256];
     snprintf(devBlock, sizeof(devBlock),
         "\"identifiers\":[\"meshcore_bot_%s\"],"
@@ -165,16 +161,6 @@ void publishDiscovery() {
     mqtt.publish(topic, payload, true);
 
     Serial.printf("[MQTT] discovery published for <%s>\n", DEVICE_NAME);
-
-    // Удаляем старый сенсор "Message" (переименован в LastSender): пустой
-    // retained в его discovery-топике убирает сущность из HA. Только один раз,
-    // при первой публикации discovery.
-    if (!discoveryPublished) {
-        char oldTopic[128];
-        snprintf(oldTopic, sizeof(oldTopic),
-                 "homeassistant/sensor/meshcore_%s/message/config", DEVICE_NAME);
-        mqtt.publish(oldTopic, "", true);
-    }
     discoveryPublished = true;
 }
 
@@ -185,7 +171,7 @@ void publishMessage() {
     jsonEscape(lastMessage.c_str(), escText, sizeof(escText));
     jsonEscape(lastChannelName.c_str(), escChan, sizeof(escChan));
     jsonEscape(lastPath[0] ? lastPath : "direct", escRoute, sizeof(escRoute));
-    char topic[96], payload[384];
+    char topic[96], payload[512];
     snprintf(topic, sizeof(topic), "%s/state", mqttPrefix);
     snprintf(payload, sizeof(payload),
         "{\"sender\":\"%s\",\"text\":\"%s\",\"channel\":\"%s\","
@@ -242,13 +228,14 @@ void mqttSlug(const char* name, char* out, int maxLen) {
 }
 
 void publishSensorDisc(const String& sender, const char* slug) {
-    if (!mqttConnected) return;
     char devBlock[160];
     snprintf(devBlock, sizeof(devBlock),
         "\"identifiers\":[\"meshcore_sensor_%s\"],\"name\":\"MeshBot Sensor %s\","
         "\"manufacturer\":\"MeshCore\",\"model\":\"Sensor node\"",
         slug, slug);
+    // Один буфер на все сущности: функция вызывается глубоко из разбора пакета, стек не бесконечен
     char topic[128], payload[512];
+
     // Данные: sensor с текстовым state (HA MQTT text требует command_topic,
     // а у нас сущность read-only — это state от сенсора).
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/text/config", slug);
@@ -259,61 +246,128 @@ void publishSensorDisc(const String& sender, const char* slug) {
         "\"device\":{%s}}",
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
-    Serial.printf("[MQTT] sensor device discovery: %s\n", slug);
 
-    char retTopic[128], retPayload[512];
-    snprintf(retTopic, sizeof(retTopic), "homeassistant/sensor/meshcore_sensor_%s/rssi/config", slug);
-    snprintf(retPayload, sizeof(retPayload),
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/rssi/config", slug);
+    snprintf(payload, sizeof(payload),
         "{\"name\":\"%s RSSI\",\"state_topic\":\"%s/sensor/%s/rssi\","
         "\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\","
         "\"unique_id\":\"meshcore_sensor_%s_rssi\","
         "\"device\":{%s}}",
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
-    mqtt.publish(retTopic, retPayload, true);
-    Serial.printf("[MQTT] sensor rssi discovery: %s\n", slug);
+    mqtt.publish(topic, payload, true);
 
     // Availability: бинарник device_class=connectivity, «online» пока датчик шлёт.
-    char alvTopic[128], alvPayload[512];
-    snprintf(alvTopic, sizeof(alvTopic),
-             "homeassistant/binary_sensor/meshcore_sensor_%s/available/config", slug);
-    snprintf(alvPayload, sizeof(alvPayload),
+    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/meshcore_sensor_%s/available/config", slug);
+    snprintf(payload, sizeof(payload),
         "{\"name\":\"%s available\",\"state_topic\":\"%s/sensor/%s/available\","
         "\"payload_on\":\"online\",\"payload_off\":\"offline\",\"device_class\":\"connectivity\","
         "\"unique_id\":\"meshcore_sensor_%s_available\","
         "\"device\":{%s}}",
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
-    mqtt.publish(alvTopic, alvPayload, true);
-    Serial.printf("[MQTT] sensor availability discovery: %s\n", slug);
+    mqtt.publish(topic, payload, true);
 
-    char verTopic[128], verPayload[512];
-    snprintf(verTopic, sizeof(verTopic), "homeassistant/sensor/meshcore_sensor_%s/version/config", slug);
-    snprintf(verPayload, sizeof(verPayload),
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/version/config", slug);
+    snprintf(payload, sizeof(payload),
         "{\"name\":\"%s firmware\",\"state_topic\":\"%s/sensor/%s/version\","
         "\"icon\":\"mdi:chip\",\"entity_category\":\"diagnostic\","
         "\"unique_id\":\"meshcore_sensor_%s_version\","
         "\"device\":{%s}}",
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
-    mqtt.publish(verTopic, verPayload, true);
+    mqtt.publish(topic, payload, true);
+
+    // Заряд и напряжение батареи сенсора — приходят в hello
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/battery/config", slug);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s battery\",\"state_topic\":\"%s/sensor/%s/battery\","
+        "\"device_class\":\"battery\",\"unit_of_measurement\":\"%%\",\"state_class\":\"measurement\","
+        "\"unique_id\":\"meshcore_sensor_%s_battery\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(topic, payload, true);
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/board/config", slug);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s board\",\"state_topic\":\"%s/sensor/%s/board\","
+        "\"icon\":\"mdi:developer-board\",\"entity_category\":\"diagnostic\","
+        "\"unique_id\":\"meshcore_sensor_%s_board\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(topic, payload, true);
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/voltage/config", slug);
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s voltage\",\"state_topic\":\"%s/sensor/%s/voltage\","
+        "\"device_class\":\"voltage\",\"unit_of_measurement\":\"V\",\"state_class\":\"measurement\","
+        "\"entity_category\":\"diagnostic\","
+        "\"unique_id\":\"meshcore_sensor_%s_voltage\","
+        "\"device\":{%s}}",
+        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+    mqtt.publish(topic, payload, true);
 
     // Event entity: MQTT event platform — появляется как device-trigger "Fired"
-    // в автоматизациях HA.  При нажатии кнопки сенсор шлёт "button", бот
-    // публикует payload "button" в event_type_topic, HA генерирует событие.
-    char evtTopic[128], evtPayload[512];
-    snprintf(evtTopic, sizeof(evtTopic),
-             "homeassistant/event/meshcore_sensor_%s/button/config", slug);
-    snprintf(evtPayload, sizeof(evtPayload),
+    // в автоматизациях HA. При нажатии кнопки сенсор шлёт "button", бот
+    // публикует его в event_type_topic, HA генерирует событие.
+    snprintf(topic, sizeof(topic), "homeassistant/event/meshcore_sensor_%s/button/config", slug);
+    snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Button\","
         "\"state_topic\":\"%s/sensor/%s/button\","
         "\"event_types\":[\"button\",\"button2\"],"
         "\"unique_id\":\"meshcore_sensor_%s_button\","
         "\"device\":{%s}}",
         sender.c_str(), mqttPrefix, slug, slug, devBlock);
-    mqtt.publish(evtTopic, evtPayload, true);
-    Serial.printf("[MQTT] sensor button event discovery: %s\n", slug);
+    mqtt.publish(topic, payload, true);
+
+    Serial.printf("[MQTT] sensor discovery published: %s\n", slug);
+}
+
+// Реестр сенсоров ведётся независимо от MQTT — его показывает страница OTA
+static int sensorIndex(const String& name) {
+    for (int i = 0; i < sensorDeviceDiscCount; i++) {
+        if (sensorDeviceDisc[i] == name) return i;
+    }
+    if (sensorDeviceDiscCount >= SENSOR_DEV_CACHE_MAX) return -1;
+    sensorDeviceDisc[sensorDeviceDiscCount] = name;
+    sensorDiscPublished[sensorDeviceDiscCount] = false;
+    sensorBattery[sensorDeviceDiscCount] = -1;
+    return sensorDeviceDiscCount++;
+}
+
+void publishSensorAvailability(int idx) {
+    if (!mqttConnected) return;
+    char slug[48], topic[128];
+    mqttSlug(sensorDeviceDisc[idx].c_str(), slug, sizeof(slug));
+    snprintf(topic, sizeof(topic), "%s/sensor/%s/available", mqttPrefix, slug);
+    mqtt.publish(topic, sensorOnlineNow[idx] ? "online" : "offline", true);
 }
 
 bool publishSensorMessage() {
-    #ifdef MQTT_ENABLED
+    int idx = sensorIndex(lastSender);
+    bool cameOnline = false;
+    if (idx >= 0) {
+        sensorLastActive[idx] = millis();
+        sensorRssi[idx] = lastRSSI;
+        cameOnline = !sensorOnlineNow[idx];
+        sensorOnlineNow[idx] = true;
+    }
+    // heartbeat "hello:<версия>[:<заряд %>:<напряжение>]"; сенсоры постарше шлют просто "hello"
+    bool hello = lastMessage == SENSOR_MSG_HELLO || lastMessage.startsWith(SENSOR_MSG_HELLO ":");
+    // hello:<версия>:<заряд %>:<напряжение>:<код платы>; "-" = поля нет, у старых сенсоров
+    // полей меньше
+    String ver, batPct, batVolt, board;
+    if (hello) {
+        String rest = lastMessage.substring(strlen(SENSOR_MSG_HELLO) + 1);
+        String* fields[] = { &ver, &batPct, &batVolt, &board };
+        for (int i = 0; i < 4 && rest.length() > 0; i++) {
+            int p = rest.indexOf(':');
+            *fields[i] = (p < 0) ? rest : rest.substring(0, p);
+            rest = (p < 0) ? String() : rest.substring(p + 1);
+            if (*fields[i] == "-") *fields[i] = "";
+        }
+    }
+    if (idx >= 0 && ver.length() > 0) sensorFwVersion[idx] = ver;
+    if (idx >= 0 && board.length() > 0) sensorBoard[idx] = board;
+    if (idx >= 0 && batPct.length() > 0) sensorBattery[idx] = batPct.toInt();
+
     if (!mqttConnected) {
         Serial.printf("[SNS] %s: %s (MQTT not connected, skipped)\n",
                       lastSender.c_str(), lastMessage.c_str());
@@ -321,53 +375,48 @@ bool publishSensorMessage() {
     }
     char slug[48];
     mqttSlug(lastSender.c_str(), slug, sizeof(slug));
-    if (strlen(slug) == 0) snprintf(slug, sizeof(slug), "unknown");
-    // discovery публикуется один раз на отправителя (кэш имён).
-    bool known = false;
-    int discIdx = -1;
-    for (int i = 0; i < sensorDeviceDiscCount; i++) {
-        if (sensorDeviceDisc[i] == lastSender) { known = true; discIdx = i; break; }
-    }
-    if (!known) {
+    // discovery — один раз на сенсор за подключение к брокеру
+    if (idx < 0 || !sensorDiscPublished[idx]) {
         publishSensorDisc(lastSender, slug);
-        if (mqttConnected && sensorDeviceDiscCount < SENSOR_DEV_CACHE_MAX) {
-            discIdx = sensorDeviceDiscCount;
-            sensorDeviceDisc[sensorDeviceDiscCount++] = lastSender;
-        } else {
-            discIdx = -1;
+        if (idx >= 0) {
+            sensorDiscPublished[idx] = true;
+            cameOnline = true;
         }
     }
-    // availability: любой приём от датчика = online.
-    if (discIdx >= 0) {
-        sensorLastActive[discIdx] = millis();
-        if (!sensorOnlineNow[discIdx]) {
-            sensorOnlineNow[discIdx] = true;
-            char tAvail[128];
-            snprintf(tAvail, sizeof(tAvail), "%s/sensor/%s/available", mqttPrefix, slug);
-            mqtt.publish(tAvail, "online", true);
-            Serial.printf("[SNS] %s AVAILABLE (online)\n", lastSender.c_str());
-        }
+    if (cameOnline) {
+        publishSensorAvailability(idx);
+        Serial.printf("[SNS] %s AVAILABLE (online)\n", lastSender.c_str());
     }
-    // --- heartbeat: availability и версия прошивки ("hello:<версия>"; старые сенсоры шлют "hello") ---
-    if (lastMessage == SENSOR_MSG_HELLO || lastMessage.startsWith(SENSOR_MSG_HELLO ":")) {
-        int sep = lastMessage.indexOf(':');
-        if (sep > 0) {
-            char tVer[128];
-            snprintf(tVer, sizeof(tVer), "%s/sensor/%s/version", mqttPrefix, slug);
-            mqtt.publish(tVer, lastMessage.c_str() + sep + 1, true);
+
+    if (hello) {
+        char t[128];
+        if (ver.length() > 0) {
+            snprintf(t, sizeof(t), "%s/sensor/%s/version", mqttPrefix, slug);
+            mqtt.publish(t, ver.c_str(), true);
         }
-        Serial.printf("[SNS] heartbeat from %s\n", lastSender.c_str());
+        if (batPct.length() > 0) {
+            snprintf(t, sizeof(t), "%s/sensor/%s/battery", mqttPrefix, slug);
+            mqtt.publish(t, batPct.c_str(), true);
+        }
+        if (batVolt.length() > 0) {
+            snprintf(t, sizeof(t), "%s/sensor/%s/voltage", mqttPrefix, slug);
+            mqtt.publish(t, batVolt.c_str(), true);
+        }
+        if (board.length() > 0) {
+            snprintf(t, sizeof(t), "%s/sensor/%s/board", mqttPrefix, slug);
+            mqtt.publish(t, board.c_str(), true);
+        }
+        Serial.printf("[SNS] heartbeat from %s: v%s, батарея %s%%\n", lastSender.c_str(),
+                      ver.length() ? ver.c_str() : "?",
+                      batPct.length() ? batPct.c_str() : "?");
         return true;
     }
     // --- данные: text + rssi ---
-    char escText[128];
-    jsonEscape(lastMessage.c_str(), escText, sizeof(escText));
-    char tText[128], tRssi[128];
+    char tText[128], tRssi[128], rssiStr[24];
     snprintf(tText, sizeof(tText), "%s/sensor/%s/text", mqttPrefix, slug);
     snprintf(tRssi, sizeof(tRssi), "%s/sensor/%s/rssi", mqttPrefix, slug);
-    mqtt.publish(tText, escText);
-    char rssiStr[24];
     snprintf(rssiStr, sizeof(rssiStr), "%.1f", lastRSSI);
+    mqtt.publish(tText, lastMessage.c_str());
     mqtt.publish(tRssi, rssiStr);
     // --- button: event entity trigger для автоматизаций ---
     if ((lastMessage == SENSOR_MSG_BUTTON) || (lastMessage == SENSOR_MSG_BUTTON2)) {
@@ -388,10 +437,6 @@ bool publishSensorMessage() {
         Serial.printf("[SNS] %s: %s (rssi %.1f)\n", lastSender.c_str(), lastMessage.c_str(), lastRSSI);
     }
     return true;
-    #else
-    Serial.printf("[SNS] %s: %s (MQTT disabled)\n", lastSender.c_str(), lastMessage.c_str());
-    return false;
-    #endif
 }
 
 void publishStatus() {
@@ -408,7 +453,7 @@ void publishStatus() {
     float tempC = cpuTempC();
     snprintf(topic, sizeof(topic), "%s/status", mqttPrefix);
     snprintf(payload, sizeof(payload),
-        "{\"version\":\"" FW_VERSION "\",\"wifi\":true,\"mqtt\":true,\"lora_rx\":%s,"
+        "{\"version\":\"" FW_VERSION "\",\"board\":\"" BOARD_CODE "\",\"wifi\":true,\"mqtt\":true,\"lora_rx\":%s,"
         "\"uptime\":%lu,\"packets\":%d,\"duplicates\":%lu,"
         "\"temp\":%.1f,\"ip\":\"%s\","
         "\"channel\":\"%s\",\"private\":\"%s\"}",
@@ -426,13 +471,10 @@ void publishStatus() {
 }
 
 void setupMQTT() {
-    // Собираем префиксы топиков
     snprintf(mqttPrefix, sizeof(mqttPrefix), "meshcore/bot/%s", DEVICE_NAME);
-    snprintf(mqttDiscoveryPrefix, sizeof(mqttDiscoveryPrefix), "homeassistant");
-
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setCallback(mqttCallback);
-    mqtt.setBufferSize(768);   // discovery-селект (options) весит до ~600 Б
+    mqtt.setBufferSize(768);   // discovery-конфиг весит до ~600 Б
     mqtt.setSocketTimeout(3);  // ограничиваем блокировку connect() до ~3 с
 }
 
@@ -487,10 +529,16 @@ void tickRetryConnections() {
         snprintf(cmdTopic, sizeof(cmdTopic), "%s/cmd/listening", mqttPrefix);
         mqtt.subscribe(cmdTopic);
 
-        // Discovery публикуем только при ПЕРВОМ подключении (reconnect его
+        // Discovery бота публикуем только при ПЕРВОМ подключении (reconnect его
         // повторяет поток retained-конфигов). Обновления — по факту изменений.
         if (!discoveryPublished) publishDiscovery();
         publishStatus();
+        // Брокер мог потерять retained-состояние, пока нас не было: discovery сенсоров
+        // уйдёт с их следующим сообщением, availability — сразу
+        for (int i = 0; i < sensorDeviceDiscCount; i++) {
+            sensorDiscPublished[i] = false;
+            publishSensorAvailability(i);
+        }
     } else {
         mqttConnected = false;
         Serial.printf(" FAILED (rc=%d)\n", mqtt.state());

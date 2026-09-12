@@ -20,8 +20,9 @@ void initSystemClock() {
     time_t local = (time_t)BUILD_UNIX_TIME + (time_t)TZ_OFFSET_HOURS * 3600;
     struct tm tm_now;
     gmtime_r(&local, &tm_now);
-    strftime(sysTimeStr, sizeof(sysTimeStr), "%Y-%m-%d %H:%M:%S", &tm_now);
-    Serial.printf("[RTC] SysTime set from host: %s (%s)\n", sysTimeStr, LOCAL_TZ);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_now);
+    Serial.printf("[RTC] SysTime set from host: %s (%s)\n", buf, LOCAL_TZ);
     Serial.printf("[RTC] epoch=%lld\n", (long long)time(NULL));
 }
 
@@ -224,7 +225,6 @@ void setup() {
     #endif
     
     Serial.printf("Listening on %s...\n", channelListStr().c_str());
-    lastScreenActivityMs = millis();   // старт таймера автовыключения экрана
 }
 
 void loop() {
@@ -282,7 +282,8 @@ void loop() {
                 }
                 if (pktLen > 0 && otaFastMode &&
                     buffer[0] == RAW_MAGIC0 && buffer[1] == RAW_MAGIC1) {
-                    // чистый LoRa OTA: сырые фреймы вне meshcore
+                    // mesh OTA: сырые кадры вне meshcore
+                    fastRxFrames++;
                     otaRawDidTx = false;
                     otaHandleRawFrame(buffer, pktLen);
                     lastReArmMs = millis();
@@ -297,24 +298,21 @@ void loop() {
                     // (рекламные/служебные пакеты экран не трогаем)
                     #ifndef SENSOR_NODE
                     if (pktLen > 0 && !parsed && !otaFastMode && ((buffer[0] >> 2) & 0x0F) == 0x05) {
-                        if (!screenOff) {
-                            display.setTextSize(1);
-                            display.clearDisplay();
-                            display.setCursor(0, 0);
-                            display.printf("RX %dB RSSI:%.0f\n", pktLen, rssi);
-                            display.printf("SNR:%.0f pkts:%d\n", snr, packetCount);
-                            display.printf("hex:");
-                            for (int i = 0; i < min(pktLen, 21); i++) display.printf("%02X", buffer[i]);
-                            display.display();
-                        }
+                        display.setTextSize(1);
+                        display.clearDisplay();
+                        display.setCursor(0, 0);
+                        display.printf("RX %dB RSSI:%.0f\n", pktLen, rssi);
+                        display.printf("SNR:%.0f pkts:%d\n", snr, packetCount);
+                        display.printf("hex:");
+                        for (int i = 0; i < min(pktLen, 21); i++) display.printf("%02X", buffer[i]);
+                        display.display();
                         lastRxDisplay = millis();
                     }
                     #endif
 
-// не перезатираем экран 5 сек после сообщения
+                    // не перезатираем экран 5 сек после сообщения
                     if (parsed) {
                         lastRxDisplay = millis();
-                        lastScreenActivityMs = millis();   // активность — отодвигает авто-гашение
                         #ifdef MQTT_ENABLED
                         publishMessage();
                         #endif
@@ -326,6 +324,7 @@ void loop() {
                 // Захват сорвался (CRC и т.п.) — флаг RX_DONE мог остаться,
                 // что приведёт к бесконечному циклу. Сбрасываем флаги и ре-армим.
                 Serial.printf("[RX] readData error %d, re-arming\n", state);
+                if (otaFastMode) fastRxErrors++;
                 radio.clearIrqStatus();
                 rearmRadioAGC();
             }
@@ -333,7 +332,7 @@ void loop() {
     }
 
     // Показать статус на экране (обновляем раз в 500мс)
-    if (isListening && !screenOff && (millis() - lastDisplayUpdate > 500)) {
+    if (isListening && (millis() - lastDisplayUpdate > 500)) {
         lastDisplayUpdate = millis();
         #ifdef SENSOR_NODE
         bool rxScreenHeld = false;   // сенсор входящие пакеты не рисует, статус не ждёт паузы после приёма
@@ -352,16 +351,12 @@ void loop() {
         publishStatus();
     }
     // ===== ДОСТУПНОСТЬ ДАТЧИКОВ: если от датчика давно ничего нет — offline =====
-    if (mqttConnected && millis() - lastSensorAvailCheckMs > 10000) {
+    if (millis() - lastSensorAvailCheckMs > 10000) {
         lastSensorAvailCheckMs = millis();
         for (int i = 0; i < sensorDeviceDiscCount; i++) {
             if (sensorOnlineNow[i] && millis() - sensorLastActive[i] > SENSOR_OFFLINE_MS) {
                 sensorOnlineNow[i] = false;
-                char slug[48];
-                mqttSlug(sensorDeviceDisc[i].c_str(), slug, sizeof(slug));
-                char tAvail[128];
-                snprintf(tAvail, sizeof(tAvail), "%s/sensor/%s/available", mqttPrefix, slug);
-                mqtt.publish(tAvail, "offline", true);
+                publishSensorAvailability(i);
                 Serial.printf("[SNS] %s OFFLINE (no data for %lus)\n",
                               sensorDeviceDisc[i].c_str(), (unsigned long)(SENSOR_OFFLINE_MS / 1000));
             }
@@ -415,12 +410,17 @@ void loop() {
     if (!otaActive) {
         if (!bootHelloSent) {
             bootHelloSent = true;
-            sensorSendMsg(SENSOR_MSG_HELLO ":" FW_VERSION);   // стартовый hello сразу после включения
+            sensorSendHello();   // стартовый hello сразу после включения
             // не упреждать первый периодический heartbeat после boot-привета
             lastHeartbeat = millis();
+        } else if (sensorHelloDueMs != 0 && millis() >= sensorHelloDueMs) {
+            // бот попросил отметиться (кнопка «Опросить» на странице OTA)
+            sensorHelloDueMs = 0;
+            lastHeartbeat = millis();
+            sensorSendHello();
         } else if (millis() - lastHeartbeat >= SENSOR_HEARTBEAT_MS) {
             lastHeartbeat = millis();
-            sensorSendMsg(SENSOR_MSG_HELLO ":" FW_VERSION);
+            sensorSendHello();
         }
     }
     if (!otaActive && millis() - lastBtnPress > 5000) {
@@ -448,5 +448,6 @@ void loop() {
     }
 #endif
 
-    delay(10);
+    // во время mesh OTA кадры пачки идут каждые ~40 мс — опрашиваем радио чаще
+    delay(otaFastMode ? 1 : 10);
 }

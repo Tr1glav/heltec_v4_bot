@@ -145,6 +145,36 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Короткий код платы для hello и MQTT: "h43" — Heltec V4.3, "h3" — Heltec V3,
+// "gen" — прочие ESP32-S3. По нему видно железо, не раскрывая имя устройства.
+// Задаётся build-флагом -DBOARD_CODE, схема — производитель + модель.
+// ---------------------------------------------------------------------------
+#ifndef BOARD_CODE
+  #define BOARD_CODE "esp32"
+#endif
+
+// ---------------------------------------------------------------------------
+// Батарея: VBAT через делитель 390k/100k на ADC1_CH0 (GPIO1), делитель включается
+// управляющим пином ADC_CTRL (GPIO37). Полярность разная: на V4 его тянут в HIGH,
+// на V3 — в LOW (см. datasheet платы), поэтому задаётся build-флагом.
+// ---------------------------------------------------------------------------
+#if defined(PIN_VBAT_READ) && defined(PIN_VBAT_CTRL)
+  #define HAS_BATTERY 1
+  #define VBAT_PIN PIN_VBAT_READ
+  #define VBAT_CTRL_PIN PIN_VBAT_CTRL
+  #ifndef PIN_VBAT_CTRL_ACTIVE
+    #define PIN_VBAT_CTRL_ACTIVE HIGH
+  #endif
+  #define VBAT_CTRL_ACTIVE PIN_VBAT_CTRL_ACTIVE
+  #ifndef PIN_VBAT_DIVIDER
+    #define PIN_VBAT_DIVIDER 4.9f      // (390k + 100k) / 100k
+  #endif
+  #define VBAT_DIVIDER PIN_VBAT_DIVIDER
+#else
+  #define HAS_BATTERY 0
+#endif
+
+// ---------------------------------------------------------------------------
 // User button
 // ---------------------------------------------------------------------------
 #ifndef BUTTON_PIN
