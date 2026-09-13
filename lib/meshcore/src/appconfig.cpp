@@ -57,6 +57,7 @@ static const CfgField FIELDS[] = {
     F_I16("tz",        tzOffset,  TZ_OFFSET_HOURS),
     F_U16("disp_bri",  dispBri,   255),
     F_U16("vext_on",   vextOn,    VEXT_EN_ACTIVE),
+    F_U16("auto_upd",  autoUpd,   1),
 };
 static const size_t FIELD_COUNT = sizeof(FIELDS) / sizeof(FIELDS[0]);
 

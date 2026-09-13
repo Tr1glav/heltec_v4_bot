@@ -1299,6 +1299,28 @@ void otaHandleSaveFw() {
     }
 }
 
+// Общий запуск сессии: используется и веб-обработчиком, и автообновлением
+bool otaStartSession(const String& target) {
+    if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) return false;
+    if (!otaFwReady || target.length() == 0 || target.length() > 31) return false;
+    otaFile = LittleFS.open("/ota.bin", "r");
+    if (!otaFile) { slog("[OTA] /ota.bin не открылся\n"); return false; }
+    otaTarget = target;
+    otaLastErr[0] = 0;
+    otaSessionMs = millis();
+    otaPolls = 0;
+    otaRetrTotal = 0;
+    otaPhase = OTA_PHASE_WAIT_START;
+    otaSeq = 0;
+    otaSentBytes = 0;
+    otaRetries = 0;
+    slog("[OTA] старт -> '%s' (%u байт, crc=%08X)\n",
+         otaTarget.c_str(), (unsigned)otaFwSize, (unsigned)otaFwCrc);
+    otaSendStart();
+    otaDrawProgress();
+    return true;
+}
+
 void otaHandleStartOta() {
     String target = otaServer.arg("target");
     if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) {

@@ -9,6 +9,7 @@
 #include "display.h"
 #include "ota.h"
 #include "mqtt.h"
+#include "fwupdate.h"
 
 void initSystemClock() {
     struct timeval tv;
@@ -389,6 +390,8 @@ void loop() {
         lastSensorTimeSyncMs = millis();
         sendSensorTimeSync();
     }
+    fwUpdateTick();   // новые версии из релизов GitHub
+
     // ===== Сброс lastmsg после паузы (чтобы повторный одинаковый текст триггерил HA) =====
     clearLastMsg();
     // ===== Сброс text-топика после триггера "button" (повторное нажатие = новый state_changed) =====

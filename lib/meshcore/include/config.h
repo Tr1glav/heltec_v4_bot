@@ -184,6 +184,16 @@ enum {
 // полуизменённом состоянии, если связь с ботом оборвалась на середине.
 #define CFG_PENDING_REVERT_MS (120UL * 1000)
 
+// ===== АВТООБНОВЛЕНИЕ ПО РЕЛИЗАМ =====
+// Прошивка не содержит секретов, поэтому файлы релиза лежат открыто и качаются без токена.
+#ifndef FW_RELEASE_API
+#define FW_RELEASE_API "https://api.github.com/repos/Tr1glav/meshcore-fork/releases/latest"
+#endif
+#define FW_CHECK_INTERVAL_MS (6UL * 60 * 60 * 1000)   // раз в 6 часов
+#ifndef FW_ENV
+#define FW_ENV "unknown"
+#endif
+
 // ===== Кэш имён датчиков =====
 #define SENSOR_DEV_CACHE_MAX 16
 

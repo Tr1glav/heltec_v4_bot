@@ -36,6 +36,7 @@ struct AppConfig {
     int16_t tzOffset;   // часовой пояс, часы от UTC (для экрана и логов)
     uint16_t dispBri;   // яркость экрана 0..255
     uint16_t vextOn;    // уровень на пине питания периферии, включающий его: 1 = HIGH, 0 = LOW
+    uint16_t autoUpd;   // 1 — сам ставить новые версии из релизов GitHub
 };
 
 extern AppConfig cfg;

@@ -26,6 +26,8 @@ void otaHandleAck();
 void otaBotTick();
 void otaInspectStoredFw();
 bool otaSessionActive();
+// Запуск прошивки сенсора без участия веб-запроса — нужен автообновлению
+bool otaStartSession(const String& target);
 String buildDiagReport();
 void setupOtaServer();
 #endif
