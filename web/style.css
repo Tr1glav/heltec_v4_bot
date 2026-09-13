@@ -1,0 +1,58 @@
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#1c2333;color:#e8ecf3;margin:0;padding:10px;display:flex;justify-content:center}
+.wrap{display:grid;grid-template-columns:minmax(320px,390px) 1fr;gap:10px;width:100%;max-width:1220px;align-items:start}
+.card{background:#242d40;border:1px solid #35405a;border-radius:10px;padding:12px}
+.hdr{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+h2{margin:0;font-size:16px}#dev{color:#93a4c4;font-size:12px}
+.info{margin:6px 0 10px;font-size:11px;color:#93a4c4;line-height:1.6}
+label{display:block;font-size:11px;color:#93a4c4;margin:0 0 4px}
+.row{display:flex;gap:6px;margin-top:6px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f87171;margin-right:3px;vertical-align:middle}
+.dot.on{background:#34d399}
+.bat{display:inline-block;width:26px;height:9px;border:1px solid #4a5775;border-radius:2px;vertical-align:middle;overflow:hidden}
+.bat i{display:block;height:100%;background:#34d399}
+.bat.low i{background:#f87171}
+.tgt{display:flex;gap:8px;align-items:center;padding:7px 8px;border:1px solid #35405a;border-radius:8px;background:#1e2638;cursor:pointer;margin-bottom:6px}
+.tgt:hover{border-color:#4a5775}
+.tgt.sel{border-color:#0ea5e9;background:#1b2b3d}
+.tgt .nm{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tgt .meta{font-size:10px;color:#93a4c4;margin-top:2px}
+.tgt .meta b{color:#c7d3e8;font-weight:600}
+.grow{flex:1;min-width:0}
+#drop{margin-top:8px;border:2px dashed #4a5775;border-radius:8px;padding:10px;text-align:center;cursor:pointer;background:#1e2638;font-size:12px;color:#93a4c4}
+#drop.hover{border-color:#5eead4;background:#1b2233}
+#fname{margin-top:4px;color:#5eead4;word-break:break-all;font-size:12px}#fver{font-size:11px}
+.fw{margin-top:8px;font-size:11px;color:#93a4c4;background:#1e2638;border:1px solid #35405a;border-radius:8px;padding:8px}
+.fw b{color:#c7d3e8}
+button{padding:8px;border:0;border-radius:6px;background:#0ea5e9;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+button:hover{background:#38bdf8}button:disabled{background:#33415c;color:#8391ab;cursor:not-allowed}
+button.sec{background:#475569}button.sec:hover{background:#64748b}
+button.sm{padding:5px 10px;font-size:12px;font-weight:500}
+#go{display:block;width:100%;margin-top:8px}
+#prog{margin-top:10px;background:#1e2638;border:1px solid #35405a;border-radius:8px;padding:10px}
+.pct{font-size:34px;font-weight:700;line-height:1}.pct small{font-size:16px;color:#93a4c4;margin-left:2px}
+.w{height:8px;background:#33415c;border-radius:5px;overflow:hidden;margin:8px 0 4px}
+#fill{height:100%;width:0;background:#0ea5e9;transition:width .3s}
+.t{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#93a4c4}
+#ab{width:100%;margin-top:8px}
+#st{margin-top:8px;font-size:12px;min-height:14px}#st.err{color:#f87171}#st.ok{color:#5eead4}
+.ft{margin-top:8px;font-size:10px;color:#64748b;text-align:right}
+.ft a{color:#64748b}
+details.cfg{margin-top:8px;border:1px solid #35405a;border-radius:8px;background:#1e2638;padding:8px}
+details.cfg summary{cursor:pointer;font-size:12px;color:#93a4c4}
+.cfgrow{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cfgrow span{width:76px;flex:none;font-size:11px;color:#93a4c4}
+.cfgrow input{flex:1;min-width:0;padding:4px 6px;border:1px solid #35405a;border-radius:5px;background:#242d40;color:#e8ecf3;font-size:12px}
+.cfgrow input.dirty{border-color:#0ea5e9}
+.cfghint{margin-top:8px;font-size:10px;color:#64748b;line-height:1.5}
+.chk{display:block;font-size:11px;color:#93a4c4;margin-top:6px}
+.chk input{margin-right:6px;vertical-align:middle}
+.tools{display:flex;gap:6px}
+#q{flex:1;min-width:0;padding:5px 8px;border:1px solid #35405a;border-radius:6px;background:#1e2638;color:#e8ecf3;font-size:12px}
+.logwrap{position:relative;margin-top:8px}
+#logs{height:calc(100vh - 108px);min-height:260px;overflow:auto;margin:0;background:#1e2638;border:1px solid #35405a;border-radius:6px;padding:8px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;line-height:1.45}
+#logs div{white-space:pre-wrap;word-break:break-all}
+.l-e{color:#f87171}.l-o{color:#7dd3fc}.l-s{color:#a7f3d0}.l-w{color:#c4b5fd}
+.jump{position:absolute;right:12px;bottom:12px;padding:6px 10px;font-size:11px;background:#0ea5e9}
+@media(max-width:820px){.wrap{grid-template-columns:1fr}#logs{height:52vh}}

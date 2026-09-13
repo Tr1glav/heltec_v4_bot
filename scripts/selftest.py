@@ -222,8 +222,7 @@ def otaz_test():
 
 
 def page_js_test():
-    src = (ROOT / "lib/meshcore/src/ota.cpp").read_text(encoding="utf-8")
-    js = src[src.index('R"JS(') + 5: src.index(')JS"')]
+    js = (ROOT / "web/app.js").read_text(encoding="utf-8")
     check("JavaScript страницы непустой", len(js) > 1000)
     if not shutil.which("node"):
         print("SKIP node не найден — синтаксис страницы не проверен")

@@ -13,7 +13,7 @@ Import("env")
 PROJECT_DIR = env.subst("$PROJECT_DIR")
 VERSION_FILE = os.path.join(PROJECT_DIR, "version.txt")
 HEADER = os.path.join(PROJECT_DIR, "lib", "meshcore", "include", "build_info.h")
-SOURCE_PATHS = ["src", "lib", "include", "boards", "variants", "platformio.ini"]
+SOURCE_PATHS = ["src", "lib", "web", "include", "boards", "variants", "platformio.ini"]
 
 # Служебные запуски (IntelliSense в IDE, clean) тоже исполняют pre-скрипты — версию не трогаем
 NO_BUMP_TARGETS = {"idedata", "__idedata", "clean", "cleanall", "envdump", "compiledb", "menuconfig", "size"}

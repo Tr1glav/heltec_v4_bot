@@ -8,4 +8,5 @@ secrets.ini
 secrets.json
 firmware_output/*
 lib/meshcore/include/build_info.h
+lib/meshcore/include/web_assets.h
 compile_commands.json
