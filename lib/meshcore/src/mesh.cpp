@@ -390,10 +390,10 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     if (lastSender == cfg.name) return false;
 
     #ifdef COMPANION_NODE
-    // Приложение должно видеть переписку, но не служебный обмен узлов между собой
-    if (chIdx >= 0 && !lastMessage.startsWith("ota:") && !lastMessage.startsWith("cfg:")
-        && !lastMessage.startsWith("time:") && !lastMessage.startsWith("ping:")
-        && !lastMessage.startsWith("pong:") && !lastMessage.startsWith(SENSOR_MSG_HELLO)) {
+    // Показываем всё, что пришло в канал, включая служебный обмен узлов (hello, ping,
+    // pong, time, ota, cfg): по нему видно жизнь сети, а отличить служебное от беседы
+    // можно и по самому тексту.
+    if (chIdx >= 0) {
         // Отправителя приложение достаёт из начала текста ("Имя: сообщение") — так
         // устроен формат группового сообщения в сети. Мы же разбирали строку на имя и
         // текст и отдавали только текст, поэтому в приложении сообщения были безымянными.
@@ -580,7 +580,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             }
             int dl = buildPrivateTextFrame(dmSrc, peerPub, reply, frame, sizeof(frame));
             if (dl > 0) {
-                Serial.printf("\n[TX DM] to <%02X>: %s (%dB, flood x3)\n", dmSrc, reply, dl);
+                Serial.printf("\n[TX DM] to <%02X>: %s (%dB, флудом)\n", dmSrc, reply, dl);
                 floodSend(-1, frame, dl);
             }
             return true;
@@ -588,7 +588,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 
         int f = buildGroupFrameFlood(chIdx, reply, frame, sizeof(frame));
         if (f > 0) {
-            Serial.printf("\n[TX] %s: %s: %s (%dB, flood x3)\n", channels[chIdx].name, cfg.name.c_str(), reply, f);
+            Serial.printf("\n[TX] %s: %s: %s (%dB, флудом)\n", channels[chIdx].name, cfg.name.c_str(), reply, f);
             floodSend(chIdx, frame, f);
         }
     }
@@ -722,6 +722,12 @@ void sensorSendMsg(const char* msg, unsigned int gapMs, int repeats) {
     if (f <= 0) return;
     floodSend(-1, frame, f, gapMs, repeats);
     Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
+    #ifdef COMPANION_NODE
+    // Собственные передачи в приложение иначе не попадают: в очередь кладётся только
+    // принятое из эфира, а свой же флуд отбрасывается как эхо. Кладём прямо здесь, с тем
+    // же префиксом имени, с каким сообщение ушло в эфир.
+    companionOnChannelText(sensorChannelIdx, cfg.name + ": " + msg, 0.0f, PATH_LEN_INIT, false);
+    #endif
     #ifdef SENSOR_NODE
     sensorLastSent = msg;
     sensorLastSentMs = millis();

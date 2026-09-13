@@ -28,6 +28,7 @@
 #define CMD_GET_CHANNEL           31
 #define CMD_SET_CHANNEL           32
 #define CMD_ADD_UPDATE_CONTACT     9
+#define CMD_RESET_PATH            13
 #define CMD_REMOVE_CONTACT        15
 #define CMD_GET_CONTACT_BY_KEY    30
 #define CMD_GET_ADVERT_PATH       42
@@ -45,6 +46,7 @@
 #define RESP_CODE_NO_MORE_MESSAGES 10
 #define RESP_CODE_BATT_AND_STORAGE 12
 #define RESP_CODE_DEVICE_INFO      13
+#define RESP_CODE_CHANNEL_MSG_RECV 8    // формат для приложений до версии 3
 #define RESP_CODE_CHANNEL_MSG_RECV_V3 17
 #define RESP_CODE_CHANNEL_INFO     18
 #define RESP_CODE_ADVERT_PATH      22
@@ -60,11 +62,19 @@
 #define ERR_CODE_ILLEGAL_ARG        6
 
 #define ADV_TYPE_CHAT              1
+// Признаки в первом байте поля адверта. Порядок полей за ним строгий и зависит от
+// признаков: координаты, два необязательных поля, и только потом имя.
+#define ADV_LATLON_MASK         0x10
+#define ADV_FEAT1_MASK          0x20
+#define ADV_FEAT2_MASK          0x40
+#define ADV_NAME_MASK           0x80
 #define COMPANION_VER_CODE        13      // версия протокола, которую мы заявляем
 #define COMPANION_FW_NAME         "meshcore-fork " FW_VERSION
 #define MAX_FRAME_SIZE           176
-#define COMPANION_MAX_CHANNELS     8
 #define MSG_QUEUE_MAX              8
+// Кадры от приложения разбираются в главном цикле, а приходят пачкой из колбэка BLE:
+// без очереди вторая команда затирала первую, и она пропадала молча.
+#define IN_QUEUE_MAX               6
 
 // UUID сервиса Nordic UART — именно по ним приложение ищет устройство
 #define NUS_SERVICE "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -83,13 +93,19 @@ static BLEServer* bleServer = nullptr;
 static BLECharacteristic* txChar = nullptr;
 static volatile bool bleConnected = false;
 static uint32_t blePin = 0;
+static uint8_t appVer = 0;      // версия приложения из APP_START: от неё зависит формат кадров
 // Экран с кодом убираем не по факту соединения, а только когда сопряжение состоялось:
 // код нужен телефону именно в промежутке между подключением и вводом кода.
 static volatile bool blePaired = false;
 static QueuedMsg msgQueue[MSG_QUEUE_MAX];
 static uint8_t msgHead = 0, msgCount = 0;
-static uint8_t inFrame[MAX_FRAME_SIZE + 8];
-static volatile size_t inLen = 0;
+static uint8_t inQueue[IN_QUEUE_MAX][MAX_FRAME_SIZE];
+static uint8_t inQueueLen[IN_QUEUE_MAX];
+static volatile uint8_t inHead = 0, inCount = 0;
+// Колбэк BLE выполняется в своей задаче, разбор — в главном цикле: индексы очереди
+// трогаем только под блокировкой, иначе счётчик разъедется между ядрами.
+static portMUX_TYPE inMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t inDropped = 0;
 static uint8_t out[MAX_FRAME_SIZE + 8];
 
 static void sendFrameToApp(const uint8_t* data, size_t len) {
@@ -149,7 +165,9 @@ static void contactsSave() {
 
 static void contactsLoad() {
     Preferences p;
-    if (!p.begin(COMPANION_NS, true)) return;
+    // На запись, как и конфиг: в режиме только для чтения несуществующее пространство
+    // имён даёт ошибку в журнале при каждом первом запуске устройства.
+    if (!p.begin(COMPANION_NS, false)) return;
     uint8_t n = p.getUChar("ccount", 0);
     if (n > COMPANION_MAX_CONTACTS) n = COMPANION_MAX_CONTACTS;
     // Счётчик и записи — разные ключи NVS, и после смены формата счётчик может пережить
@@ -191,8 +209,16 @@ class RxCallbacks : public BLECharacteristicCallbacks {
         // Писать в эту характеристику разрешено только по зашифрованной связи,
         // так что пришедший кадр сам по себе доказывает состоявшееся сопряжение
         blePaired = true;
-        memcpy(inFrame, c->getData(), n);
-        inLen = n;     // разбираем в главном цикле: в колбэке BLE нельзя работать с радио
+        portENTER_CRITICAL(&inMux);
+        if (inCount >= IN_QUEUE_MAX) {
+            inDropped++;                 // очередь переполнена — кадр потерян, но об этом узнаем
+        } else {
+            uint8_t slot = (inHead + inCount) % IN_QUEUE_MAX;
+            memcpy(inQueue[slot], c->getData(), n);
+            inQueueLen[slot] = (uint8_t)n;
+            inCount++;
+        }
+        portEXIT_CRITICAL(&inMux);
     }
 };
 
@@ -221,6 +247,9 @@ class SrvCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer* s) override {
         bleConnected = false;
         blePaired = false;
+        // Иначе при следующем подключении список контактов поедет с середины,
+        // без начального кадра, и приложение примет обрывок за весь список.
+        contactIterIdx = -1;
         Serial.println("[BLE] приложение отключилось");
         s->startAdvertising();
     }
@@ -228,6 +257,9 @@ class SrvCallbacks : public BLEServerCallbacks {
 
 // Каналы, заведённые из приложения, живут в NVS рядом с контактами: иначе после
 // перезагрузки приложение видело бы пустой список и вступать в канал пришлось бы заново.
+// Номер ячейки не храним: состав каналов из настроек меняется (сегодня добавился
+// приватный), и сохранённый номер попал бы на встроенный канал и затёр его. Храним имя
+// с ключом, а при загрузке дописываем в конец списка.
 struct AppChanRec { uint8_t idx; char name[33]; uint8_t key[16]; };
 
 void appChannelsSave() {
@@ -235,7 +267,7 @@ void appChannelsSave() {
     uint8_t n = 0;
     for (int k = 0; k < numChannels && n < MAX_CHANNELS; k++) {
         if (k < appChanBase) continue;            // каналы из настроек хранит сам конфиг
-        recs[n].idx = (uint8_t)k;
+        recs[n].idx = 0;                          // поле осталось от прежнего формата
         memset(recs[n].name, 0, sizeof(recs[n].name));
         strncpy(recs[n].name, channels[k].name, 32);
         memcpy(recs[n].key, channels[k].secret, 16);
@@ -251,13 +283,17 @@ void appChannelsSave() {
 
 static void appChannelsLoad() {
     Preferences p;
-    if (!p.begin(COMPANION_NS, true)) return;
+    if (!p.begin(COMPANION_NS, false)) return;
     uint8_t n = p.getUChar("chcount", 0);
     if (n > MAX_CHANNELS) n = MAX_CHANNELS;
     AppChanRec recs[MAX_CHANNELS];
     if (n > 0) p.getBytes("chans", recs, sizeof(AppChanRec) * n);
     p.end();
-    for (uint8_t k = 0; k < n; k++) channelSetSlot(recs[k].idx, recs[k].name, recs[k].key);
+    for (uint8_t k = 0; k < n; k++) {
+        recs[k].name[32] = 0;
+        int at = findChannelByName(recs[k].name);          // уже есть — обновим ключ
+        channelSetSlot(at >= 0 ? at : numChannels, recs[k].name, recs[k].key);
+    }
 }
 
 void companionBegin() {
@@ -300,7 +336,8 @@ void companionBegin() {
 uint32_t companionBlePin() { return blePin; }
 bool companionBleLinked() { return blePaired; }
 
-void companionOnChannelText(int channelIdx, const String& text, float snr, uint8_t pathLen) {
+void companionOnChannelText(int channelIdx, const String& text, float snr, uint8_t pathLen,
+                            bool notify) {
     if (msgCount >= MSG_QUEUE_MAX) {   // очередь полна — вытесняем самое старое
         msgHead = (msgHead + 1) % MSG_QUEUE_MAX;
         msgCount--;
@@ -311,10 +348,17 @@ void companionOnChannelText(int channelIdx, const String& text, float snr, uint8
     long s4 = lround(snr * 4.0f);
     m.snr4 = (int8_t)(s4 < -128 ? -128 : (s4 > 127 ? 127 : s4));
     m.ts = (uint32_t)time(NULL);
+    if (text.length() >= sizeof(m.text))
+        Serial.printf("[BLE] сообщение обрезано: %u -> %u байт\n",
+                      text.length(), (unsigned)sizeof(m.text) - 1);
     strlcpy(m.text, text.c_str(), sizeof(m.text));
     msgCount++;
+    // Сигнал «есть новое» рождает в телефоне уведомление. Для того, что устройство
+    // отправило само, это уведомление о собственном действии — кладём в очередь молча,
+    // и приложение покажет сообщение при ближайшей синхронизации.
+    if (!notify) return;
     uint8_t push = PUSH_CODE_MSG_WAITING;
-    sendFrameToApp(&push, 1);   // «есть сообщение» — приложение заберёт его командой 10
+    sendFrameToApp(&push, 1);   // приложение заберёт сообщение командой 10
 }
 
 // По одному контакту за проход главного цикла: пачка кадров подряд переполняет
@@ -336,14 +380,30 @@ static void contactsIterStep() {
 
 void companionOnAdvert(const uint8_t* pub, const uint8_t* app, int applen,
                        uint8_t pathLen, const uint8_t* path) {
-    uint8_t flags = applen > 0 ? (uint8_t)(app[0] & 0xF0) : 0;
-    uint8_t type  = applen > 0 ? (uint8_t)(app[0] & 0x0F) : ADV_TYPE_CHAT;
+    uint8_t advFlags = applen > 0 ? app[0] : 0;
+    uint8_t type = advFlags & 0x0F;
+    // Имя лежит не на втором байте, а после всех присутствующих полей. Раньше мы брали
+    // его со смещения 1 всегда, и у узлов с координатами в начало имени попадали байты
+    // широты и долготы — в приложении это выглядело как мусор перед именем.
+    int o = 1;
+    int32_t lat = 0, lon = 0;
+    bool hasLoc = false;
+    if (advFlags & ADV_LATLON_MASK) {
+        if (o + 8 <= applen) {
+            memcpy(&lat, &app[o], 4);
+            memcpy(&lon, &app[o + 4], 4);
+            hasLoc = true;
+        }
+        o += 8;
+    }
+    if (advFlags & ADV_FEAT1_MASK) o += 2;
+    if (advFlags & ADV_FEAT2_MASK) o += 2;
     char nm[32];
     memset(nm, 0, sizeof(nm));
-    if (applen > 1 && (app[0] & 0x80)) {                  // старший бит — «дальше имя»
-        int n = applen - 1;
+    if ((advFlags & ADV_NAME_MASK) && o < applen) {
+        int n = applen - o;
         if (n > 31) n = 31;
-        memcpy(nm, &app[1], n);
+        memcpy(nm, &app[o], n);
     }
 
     int idx = contactFind(pub);
@@ -362,8 +422,10 @@ void companionOnAdvert(const uint8_t* pub, const uint8_t* app, int applen,
     }
     Contact& c = contacts[idx];
     c.type  = type;
-    c.flags = flags;
+    // c.flags — это флаги контакта в приложении (например «избранный»), а не признаки
+    // адверта: их выставляет само приложение командой 9, и затирать их нельзя.
     if (nm[0]) strncpy(c.name, nm, sizeof(c.name) - 1);
+    if (hasLoc) { c.lat = lat; c.lon = lon; }
     c.lastAdvert = c.lastmod = (uint32_t)time(NULL);
     // Путь запоминаем как пришёл: приложение спрашивает его командой 42, чтобы показать,
     // через каких соседей слышно узел.
@@ -393,6 +455,8 @@ static void handleFrame(const uint8_t* f, size_t len) {
     int i = 0;
     switch (f[0]) {
     case CMD_APP_START: {
+        // [01][версия приложения][6 байт резерва][имя приложения]
+        appVer = (len >= 2) ? f[1] : 0;
         out[i++] = RESP_CODE_SELF_INFO;
         out[i++] = ADV_TYPE_CHAT;
         out[i++] = (uint8_t)cfg.loraTx;
@@ -420,8 +484,10 @@ static void handleFrame(const uint8_t* f, size_t len) {
     case CMD_DEVICE_QUERY: {
         out[i++] = RESP_CODE_DEVICE_INFO;
         out[i++] = COMPANION_VER_CODE;
-        out[i++] = 0;                        // контактов пока не храним
-        out[i++] = COMPANION_MAX_CHANNELS;
+        // В этом кадре — вместимость, а не текущее число: у оригинала здесь
+        // MAX_CONTACTS / 2, то есть предел в единицах по два.
+        out[i++] = COMPANION_MAX_CONTACTS / 2;
+        out[i++] = MAX_CHANNELS;
         uint32_t pin = 0;
         memcpy(&out[i], &pin, 4); i += 4;
         memset(&out[i], 0, 12);
@@ -508,6 +574,20 @@ static void handleFrame(const uint8_t* f, size_t len) {
         sendFrameToApp(out, i);
         break;
     }
+    case CMD_RESET_PATH: {
+        // Забыть маршрут до узла: следующая отправка пойдёт флудом и путь построится заново
+        int idx = (len >= 1 + 32) ? contactFind(&f[1]) : -1;
+        if (idx < 0) {
+            out[i++] = RESP_CODE_ERR;
+            out[i++] = ERR_CODE_NOT_FOUND;
+        } else {
+            contacts[idx].outPathLen = 0xFF;
+            contactTouch();
+            out[i++] = RESP_CODE_OK;
+        }
+        sendFrameToApp(out, i);
+        break;
+    }
     case CMD_REMOVE_CONTACT: {
         int idx = (len >= 33) ? contactFind(&f[1]) : -1;
         if (idx < 0) {
@@ -532,6 +612,9 @@ static void handleFrame(const uint8_t* f, size_t len) {
             const Contact& c = contacts[idx];
             uint8_t hops = c.advPathLen & 0x3F, hsize = (c.advPathLen >> 6) + 1;
             uint16_t bytes = (uint16_t)hops * hsize;
+            // Длина пришла из NVS: запись могла остаться от другой версии, а в кадр
+            // влезает ограниченно — лучше отдать пустой путь, чем выйти за буфер.
+            if (bytes > sizeof(c.advPath)) bytes = 0;
             out[i++] = RESP_CODE_ADVERT_PATH;
             memcpy(&out[i], &c.lastmod, 4); i += 4;
             out[i++] = c.advPathLen;
@@ -568,6 +651,15 @@ static void handleFrame(const uint8_t* f, size_t len) {
         char nm[33];
         memset(nm, 0, sizeof(nm));
         memcpy(nm, &f[2], 32);
+        // Каналы из настроек устройства приложению не отдаём: сохранить такую правку
+        // мы не можем (их держит конфиг), и после перезагрузки она молча откатится.
+        if (f[1] < appChanBase) {
+            Serial.printf("[CH] канал %u задан настройками устройства, из приложения не меняем\n", f[1]);
+            out[i++] = RESP_CODE_ERR;
+            out[i++] = ERR_CODE_ILLEGAL_ARG;
+            sendFrameToApp(out, i);
+            break;
+        }
         int idx = channelSetSlot(f[1], nm, &f[2 + 32]);
         if (idx < 0) {
             out[i++] = RESP_CODE_ERR;
@@ -635,6 +727,8 @@ static void handleFrame(const uint8_t* f, size_t len) {
 
         String text;
         for (size_t k = 13; k < len; k++) text += (char)f[k];
+        if (text.length() > 96)   // столько влезает в кадр личного сообщения
+            Serial.printf("[BLE] текст личного сообщения обрезан: %u -> 96 байт\n", text.length());
 
         bool sent = false;
         if (idx >= 0 && txtType == 0 && text.length() > 0) {   // 0 — обычный текст
@@ -697,9 +791,14 @@ static void handleFrame(const uint8_t* f, size_t len) {
             break;
         }
         QueuedMsg& m = msgQueue[msgHead];
-        out[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
-        out[i++] = (uint8_t)m.snr4;
-        out[i++] = 0; out[i++] = 0;          // зарезервировано
+        // До версии 3 приложение не понимает полей качества связи — шлём короткий кадр
+        if (appVer >= 3) {
+            out[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+            out[i++] = (uint8_t)m.snr4;
+            out[i++] = 0; out[i++] = 0;      // зарезервировано
+        } else {
+            out[i++] = RESP_CODE_CHANNEL_MSG_RECV;
+        }
         out[i++] = m.channelIdx;
         out[i++] = m.pathLen;
         out[i++] = 0;                        // тип текста: обычный
@@ -756,10 +855,23 @@ static void handleFrame(const uint8_t* f, size_t len) {
 void companionTick() {
     if (contactIterIdx >= 0 && blePaired) contactsIterStep();
     if (contactsDirty && millis() - contactsDirtyMs > CONTACTS_SAVE_DELAY_MS) contactsSave();
-    if (inLen == 0) return;
-    size_t n = inLen;
-    inLen = 0;
-    Serial.printf("[BLE] <- команда %u, %u байт\n", inFrame[0], (unsigned)n);
-    handleFrame(inFrame, n);
+
+    static uint8_t frame[MAX_FRAME_SIZE];
+    uint8_t n = 0;
+    portENTER_CRITICAL(&inMux);
+    if (inCount > 0) {
+        n = inQueueLen[inHead];
+        memcpy(frame, inQueue[inHead], n);
+        inHead = (inHead + 1) % IN_QUEUE_MAX;
+        inCount--;
+    }
+    uint32_t dropped = inDropped;
+    inDropped = 0;
+    portEXIT_CRITICAL(&inMux);
+
+    if (dropped) Serial.printf("[BLE] очередь команд переполнена, потеряно кадров: %u\n", dropped);
+    if (n == 0) return;
+    Serial.printf("[BLE] <- команда %u, %u байт\n", frame[0], (unsigned)n);
+    handleFrame(frame, n);
 }
 #endif

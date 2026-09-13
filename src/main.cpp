@@ -416,7 +416,6 @@ void loop() {
     #endif
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
     // Во время OTA mesh-отправки подавляем: радио слушает raw-чанки на быстром канале.
-    static unsigned long lastBtnPress = 0;
     static unsigned long lastHeartbeat = 0;
     static bool bootHelloSent = false;
     if (!otaActive && cfgReady()) {
@@ -435,33 +434,27 @@ void loop() {
             sensorSendHello();
         }
     }
-    if (!otaActive && millis() - lastBtnPress > 5000) {
-        if (digitalRead(BUTTON_PIN) == LOW) {
-            lastBtnPress = millis();
-            // ждём отпускания кнопки (таймаут защиты от залипания)
-            unsigned long heldAt = millis();
-            while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt < 5000) delay(2);
-
-            // Считаем нажатия: каждое следующее должно успеть в окно SNS_BTN_DBL_WINDOW_MS.
-            // Одно — "button", два — "button2", три — проверка связи с координатором.
-            int presses = 1;
-            while (presses < 3) {
-                unsigned long waitUntil = millis() + SNS_BTN_DBL_WINDOW_MS;
-                bool again = false;
-                while ((long)(millis() - waitUntil) < 0) {
-                    if (digitalRead(BUTTON_PIN) == LOW) { again = true; break; }
-                    delay(5);
-                }
-                if (!again) break;
-                presses++;
-                unsigned long heldAt2 = millis();
-                while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt2 < 5000) delay(2);
-            }
-            if (presses >= 3) {
-                sensorPingSend();
-            } else {
-                sensorSendMsg(presses == 2 ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
-            }
+    // Кнопка: нажатия считаем, не останавливая цикл. Прежний вариант ждал второго и
+    // третьего нажатия во вложенных циклах с delay() и задерживал loop() до полутора
+    // секунд — на компаньоне это пауза в обслуживании BLE, на сенсоре пропущенные пакеты.
+    // Одно нажатие — "button", два — "button2", три — проверка связи с координатором.
+    if (!otaActive) {
+        static bool btnDown = false;
+        static unsigned long btnEdgeMs = 0;
+        static int btnPresses = 0;
+        bool down = (digitalRead(BUTTON_PIN) == LOW);
+        unsigned long now = millis();
+        if (down != btnDown && now - btnEdgeMs > 40) {      // 40 мс — подавление дребезга
+            btnDown = down;
+            btnEdgeMs = now;
+            if (down) btnPresses++;
+        }
+        // Серия закончена: кнопка отпущена и окно ожидания следующего нажатия истекло
+        if (btnPresses > 0 && !btnDown && now - btnEdgeMs > SNS_BTN_DBL_WINDOW_MS) {
+            int presses = btnPresses;
+            btnPresses = 0;
+            if (presses >= 3) sensorPingSend();
+            else sensorSendMsg(presses == 2 ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
         }
     }
 #endif
