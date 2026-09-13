@@ -64,7 +64,34 @@ int batteryPercent() { return -1; }
 bool batteryPresent() { return false; }
 #endif
 
+#ifdef SENSOR_NODE
+// Результат проверки связи держим на экране PING_SHOW_MS вместо обычного статуса
+static void drawPingResult() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Проверка связи");
+    if (pingFailed) {
+        display.println("");
+        display.println("ответа нет");
+        display.printf("ждали %lu с\n", PING_TIMEOUT_MS / 1000);
+        display.display();
+        return;
+    }
+    char a[12], b[12];
+    display.printf("ответ: %lu мс\n", pingRttMs);
+    display.printf("я слышу: %s дБм\n", fmtFix(pingRssi, 0, a, sizeof(a)));
+    display.printf("SNR: %s дБ\n", fmtFix(pingSnr, 1, b, sizeof(b)));
+    display.printf("меня: %d дБм\n", pingPeerRssi);
+    display.printf("хопов: %u%s\n", pingHops, pingHops == 0 ? " (напрямую)" : "");
+    display.display();
+}
+#endif
+
 void drawIdleStatus() {
+    #ifdef SENSOR_NODE
+    if (pingShowUntil != 0 && (long)(millis() - pingShowUntil) < 0) { drawPingResult(); return; }
+    #endif
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 0);

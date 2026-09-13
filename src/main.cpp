@@ -404,6 +404,7 @@ void loop() {
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
     otaSensorTick();   // mesh OTA: сторожевое время — при зависании прерываем сессию
+    sensorPingTick();  // не дождались ответа на проверку связи — показать это
     cfgPendingTick();  // правки настроек по радио без "save" откатываются перезагрузкой
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
     // Во время OTA mesh-отправки подавляем: радио слушает raw-чанки на быстром канале.
@@ -433,20 +434,26 @@ void loop() {
             unsigned long heldAt = millis();
             while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt < 5000) delay(2);
 
-            // окно двойного нажатия: если в течение SNS_BTN_DBL_WINDOW_MS
-            // кнопку нажмут снова — это button2
-            bool isDouble = false;
-            unsigned long waitUntil = millis() + SNS_BTN_DBL_WINDOW_MS;
-            while (millis() < waitUntil) {
-                if (digitalRead(BUTTON_PIN) == LOW) {
-                    isDouble = true;
-                    unsigned long heldAt2 = millis();
-                    while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt2 < 5000) delay(2);
-                    break;
+            // Считаем нажатия: каждое следующее должно успеть в окно SNS_BTN_DBL_WINDOW_MS.
+            // Одно — "button", два — "button2", три — проверка связи с координатором.
+            int presses = 1;
+            while (presses < 3) {
+                unsigned long waitUntil = millis() + SNS_BTN_DBL_WINDOW_MS;
+                bool again = false;
+                while ((long)(millis() - waitUntil) < 0) {
+                    if (digitalRead(BUTTON_PIN) == LOW) { again = true; break; }
+                    delay(5);
                 }
-                delay(5);
+                if (!again) break;
+                presses++;
+                unsigned long heldAt2 = millis();
+                while (digitalRead(BUTTON_PIN) == LOW && millis() - heldAt2 < 5000) delay(2);
             }
-            sensorSendMsg(isDouble ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
+            if (presses >= 3) {
+                sensorPingSend();
+            } else {
+                sensorSendMsg(presses == 2 ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
+            }
         }
     }
 #endif

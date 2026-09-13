@@ -43,6 +43,12 @@
 #define SENSOR_MSG_BUTTON2 "button2"
 #define SENSOR_MSG_HELLO   "hello"
 #define SENSOR_MSG_HELLO_REQ "hello?"   // бот просит сенсоры отметиться (кнопка на странице OTA)
+// Тройное нажатие кнопки на сенсоре: эхо-запрос к координатору для проверки связи.
+// Запрос уходит ОДИНОЧНОЙ посылкой — иначе во время ответа мерялись бы повторы.
+#define SENSOR_MSG_PING     "ping:"      // сенсор -> координатор: ping:<номер>
+#define SENSOR_MSG_PONG     "pong:"      // координатор -> сенсор: pong:<номер>:<rssi>:<snr>
+#define PING_TIMEOUT_MS     5000UL       // не дождались ответа — показать это на экране
+#define PING_SHOW_MS        15000UL      // сколько держать результат на экране
 #ifndef SNS_BTN_DBL_WINDOW_MS
 #define SNS_BTN_DBL_WINDOW_MS 700
 #endif

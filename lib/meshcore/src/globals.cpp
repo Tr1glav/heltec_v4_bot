@@ -119,4 +119,12 @@ String sensorLastSent = "";        // последнее сообщение, о�
 unsigned long sensorLastSentMs = 0; // millis() его отправки
 unsigned long sensorHelloDueMs = 0; // когда ответить на "hello?" (0 — запроса нет)
 bool fwVersionDiffers = false;      // версия бота из "time:" не совпала со своей
+uint16_t pingId = 0;
+unsigned long pingSentMs = 0;
+unsigned long pingRttMs = 0;
+float pingRssi = 0, pingSnr = 0;
+int pingPeerRssi = 0;
+uint8_t pingHops = 0;
+unsigned long pingShowUntil = 0;
+bool pingFailed = false;
 #endif // SENSOR_NODE

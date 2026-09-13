@@ -433,6 +433,40 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             return true;
         }
 
+        // === Проверка связи: сенсор шлёт ping:<номер>, координатор сразу отвечает
+        //     pong:<номер>:<свой rssi>:<свой snr>, сенсор считает время обмена ===
+        if (lastMessage.startsWith(SENSOR_MSG_PING)) {
+            #ifdef MQTT_ENABLED
+            char reply[48];
+            snprintf(reply, sizeof(reply), "%s%s:%d:%d", SENSOR_MSG_PONG,
+                     lastMessage.c_str() + strlen(SENSOR_MSG_PING),
+                     (int)lround(lastRSSI), (int)lround(lastSNR));
+            slog("[PING] %s -> %s\n", lastSender.c_str(), reply);
+            sensorSendMsg(reply, FLOOD_RETRY_MS, 1);
+            #endif
+            return true;
+        }
+        if (lastMessage.startsWith(SENSOR_MSG_PONG)) {
+            #ifdef SENSOR_NODE
+            const char* p = lastMessage.c_str() + strlen(SENSOR_MSG_PONG);
+            unsigned id = (unsigned)strtoul(p, NULL, 10);
+            if (pingSentMs != 0 && id == pingId) {
+                pingRttMs = millis() - pingSentMs;
+                pingSentMs = 0;
+                pingRssi = lastRSSI;
+                pingSnr = lastSNR;
+                pingHops = lastHopCount;
+                pingPeerRssi = 0;
+                const char* c1 = strchr(p, ':');
+                if (c1) pingPeerRssi = atoi(c1 + 1);
+                pingFailed = false;
+                pingShowUntil = millis() + PING_SHOW_MS;
+                Serial.printf("[PING] ответ за %lu мс, хопов %u\n", pingRttMs, pingHops);
+            }
+            #endif
+            return true;
+        }
+
         // === Опрос со страницы OTA: каждый сенсор ответит hello:<версия> со случайной задержкой,
         //     чтобы ответы нескольких сенсоров не столкнулись в эфире ===
         if (lastMessage == SENSOR_MSG_HELLO_REQ) {
@@ -672,6 +706,30 @@ void sensorSendHello() {
     snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
     #endif
     sensorSendMsg(msg);
+}
+#endif
+
+#ifdef SENSOR_NODE
+// Эхо-запрос: одиночная посылка, чтобы измерять время одного обмена, а не повторов
+void sensorPingSend() {
+    if (sensorChannelIdx < 0) return;
+    pingId = (uint16_t)millis();
+    if (pingId == 0) pingId = 1;
+    pingFailed = false;
+    pingShowUntil = 0;
+    char msg[24];
+    snprintf(msg, sizeof(msg), "%s%u", SENSOR_MSG_PING, (unsigned)pingId);
+    pingSentMs = millis();
+    sensorSendMsg(msg, FLOOD_RETRY_MS, 1);
+}
+
+void sensorPingTick() {
+    if (pingSentMs == 0) return;
+    if (millis() - pingSentMs < PING_TIMEOUT_MS) return;
+    pingSentMs = 0;
+    pingFailed = true;
+    pingShowUntil = millis() + PING_SHOW_MS;
+    Serial.println("[PING] ответа нет");
 }
 #endif
 

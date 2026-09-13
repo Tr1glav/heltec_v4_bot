@@ -105,4 +105,13 @@ extern String sensorLastSent;
 extern unsigned long sensorLastSentMs;
 extern unsigned long sensorHelloDueMs;
 extern bool fwVersionDiffers;
+// Проверка связи по тройному нажатию: запрос, ответ и что показать на экране
+extern uint16_t pingId;             // номер текущего запроса, 0 — запроса не было
+extern unsigned long pingSentMs;    // когда ушёл запрос; 0 — ответа не ждём
+extern unsigned long pingRttMs;     // время ответа, мс
+extern float pingRssi, pingSnr;     // как сенсор слышит ответ
+extern int pingPeerRssi;            // как координатор слышит сенсор (из ответа)
+extern uint8_t pingHops;            // через сколько ретрансляторов пришёл ответ
+extern unsigned long pingShowUntil; // до какого времени держать результат на экране
+extern bool pingFailed;             // ответа не было
 #endif
