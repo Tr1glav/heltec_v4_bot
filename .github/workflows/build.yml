@@ -1,0 +1,79 @@
+name: build
+
+# Код уезжает в репозиторий на каждой сборке, поэтому проверки гоняем на каждый push.
+# Релиз делается здесь же, а не с машины разработчика: в Actions токен доступен сам собой,
+# и главное — файлы прошивки выкладываются только после того, как тесты и сборка прошли.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # нужно для создания релиза и загрузки файлов
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Пакеты платформы весят сотни мегабайт и скачиваются долго — кешируем между запусками
+      - name: Кеш PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Установка PlatformIO
+        run: pip install --upgrade platformio
+
+      # Проверки на хосте: границы буферов с санитайзерами, формат .otaz, сканер маркера
+      # платы, синтаксис страницы. Им нужны g++ и node — на ubuntu-latest они есть.
+      - name: Проверки на ПК
+        run: python3 scripts/selftest.py
+
+      - name: Сборка прошивок
+        run: pio run -e heltec_v3_mqtt -e heltec_v4_3_sensors
+
+      - name: Версия из version.txt
+        id: ver
+        run: echo "version=$(head -1 version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Список собранного
+        run: ls -la firmware_output/
+
+      # Сборки любой ветки складываем как артефакт — их можно скачать из интерфейса Actions
+      - name: Артефакты сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.ver.outputs.version }}
+          path: |
+            firmware_output/*.bin
+            firmware_output/*.otaz
+          if-no-files-found: error
+
+      # Релиз — только для веток release/v*, и только если всё выше прошло успешно.
+      # Шаги в задании идут последовательно: упал selftest или сборка — сюда не дойдёт.
+      - name: Релиз с файлами прошивки
+        if: startsWith(github.ref, 'refs/heads/release/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "релиз $TAG уже существует, обновляю файлы"
+            gh release upload "$TAG" firmware_output/*.bin firmware_output/*.otaz --clobber
+          else
+            gh release create "$TAG" \
+              --target "${{ github.sha }}" \
+              --title "$TAG" \
+              --notes "Прошивки версии ${{ steps.ver.outputs.version }}. Бот — файл .bin (прошивается через страницу OTA), сенсор — .otaz (уходит по радио)." \
+              firmware_output/*.bin firmware_output/*.otaz
+          fi

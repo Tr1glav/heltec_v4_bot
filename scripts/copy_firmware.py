@@ -67,13 +67,17 @@ def copy_firmware(source, target, env):
 
     print(f"📦 Kept {kept} firmware(s) for '{board_name}'\n")
 
-    # Фиксация версии в git — только по флагу RELEASE=1 и только после успешной сборки:
-    # коммитить код, который не собрался, смысла нет. При сборке нескольких окружений
-    # сработает лишь первое: release.py молча выходит, если ветка версии уже есть.
-    if os.environ.get("RELEASE") == "1":
+    # Код уезжает в репозиторий после каждой успешной сборки — коммитить то, что не
+    # собралось, смысла нет. С RELEASE=1 дополнительно создаётся ветка release/v<версия>:
+    # её появление запускает в GitHub Actions проверки, сборку и выкладку файлов прошивки.
+    # NOGIT=1 отключает работу с git целиком.
+    if os.environ.get("NOGIT") != "1":
         import subprocess, sys
         script = os.path.join(env.subst("$PROJECT_DIR"), "scripts", "release.py")
-        subprocess.run([sys.executable, script, "--quiet-if-exists"], check=False)
+        cmd = [sys.executable, script]
+        if os.environ.get("RELEASE") == "1":
+            cmd.append("--release")
+        subprocess.run(cmd, check=False)
 
 
 # Регистрируем функцию как пост-действие для файла firmware.bin

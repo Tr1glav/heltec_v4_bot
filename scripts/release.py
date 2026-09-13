@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Фиксация версии в git: ветка v<версия>, develop переводится на неё.
+"""Отправка кода в git после сборки и пометка релизных версий.
 
-Замысел: каждая выпущенная версия остаётся отдельной веткой, а develop — основная ветка
-репозитория и всегда указывает на последнюю версию. Ветки main в проекте нет.
+Схема:
+  * каждая успешная сборка коммитит изменения и отправляет текущую ветку (develop);
+  * с флагом --release дополнительно создаётся ветка release/v<версия> и уходит на origin.
 
-Запуск вручную:
-    python3 scripts/release.py                 коммит, ветка, develop, отправка на origin
-    python3 scripts/release.py --no-push       то же, но без отправки
-    python3 scripts/release.py --dry-run       только показать, что будет сделано
+Сами файлы прошивки в репозиторий не кладутся. Их собирает и выкладывает GitHub Actions
+(.github/workflows/build.yml): появление ветки release/* запускает проверки и сборку, и
+только если всё прошло — создаётся релиз с .bin и .otaz. Так в релиз физически не может
+попасть прошивка, которая не собралась или не прошла тесты.
+
+Вручную:
+    python3 scripts/release.py                 коммит + отправка текущей ветки
+    python3 scripts/release.py --release       то же + ветка release/v<версия>
+    python3 scripts/release.py --dry-run       показать, что попадёт в коммит
+    python3 scripts/release.py --no-push       только локально
     python3 scripts/release.py -m "текст"      своё описание коммита
 
-Из сборки вызывается автоматически, но только при RELEASE=1:
-    RELEASE=1 pio run -e heltec_v3_mqtt
-Обычная сборка в git ничего не пишет.
+Из сборки вызывается автоматически (scripts/copy_firmware.py):
+    pio run                     коммит и отправка
+    RELEASE=1 pio run           плюс релизная ветка
+    NOGIT=1 pio run             ничего не трогать в git
 """
 import argparse
 import os
@@ -23,17 +31,24 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Пути, которых в коммите быть не должно ни при каких обстоятельствах. .gitignore их и так
-# исключает, но здесь цена ошибки — утечка паролей и ключей каналов в историю, поэтому
-# проверяем ещё раз перед фиксацией.
+# исключает, но цена ошибки — пароли и ключи каналов в истории публичного репозитория,
+# поэтому проверяем ещё раз перед фиксацией.
 FORBIDDEN = ("secrets.ini", "secrets.json", "firmware_output/", "build_info.h")
 
 
-def git(*args, check=True, capture=True):
+def git(*args, check=True):
     r = subprocess.run(["git", *args], cwd=str(ROOT), check=False, text=True,
-                       capture_output=capture)
+                       capture_output=True)
     if check and r.returncode != 0:
         sys.exit(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
     return (r.stdout or "").strip()
+
+
+def git_try(*args):
+    """Сетевые операции не должны ронять сборку: нет сети — просто сообщаем."""
+    r = subprocess.run(["git", *args], cwd=str(ROOT), check=False, text=True,
+                       capture_output=True, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return r.returncode == 0, ((r.stderr or r.stdout).strip().splitlines() or [""])[-1]
 
 
 def version():
@@ -41,85 +56,64 @@ def version():
         return fh.read().split()[0]
 
 
-def branch_exists(name):
-    return subprocess.run(["git", "rev-parse", "--verify", "--quiet", name],
-                          cwd=str(ROOT), capture_output=True).returncode == 0
-
-
-def staged_files():
-    return [l for l in git("diff", "--cached", "--name-only").splitlines() if l]
-
-
 def main():
-    ap = argparse.ArgumentParser(description="ветка на версию и develop на неё")
+    ap = argparse.ArgumentParser(description="коммит, отправка и релизная ветка")
+    ap.add_argument("--release", action="store_true",
+                    help="создать ветку release/v<версия> — она запускает выкладку в Actions")
     ap.add_argument("--no-push", action="store_true", help="не отправлять на origin")
     ap.add_argument("--dry-run", action="store_true", help="только показать план")
     ap.add_argument("-m", "--message", help="описание коммита")
-    ap.add_argument("--quiet-if-exists", action="store_true",
-                    help="молча выйти, если ветка этой версии уже есть (для вызова из сборки)")
     args = ap.parse_args()
 
     ver = version()
-    branch = f"v{ver}"
-    current = git("rev-parse", "--abbrev-ref", "HEAD")
-
-    if branch_exists(branch):
-        msg = f"ветка {branch} уже существует — версия {ver} уже зафиксирована"
-        if args.quiet_if_exists:
-            print(f"[release] {msg}, пропускаю")
-            return
-        sys.exit(f"[release] {msg}")
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    rel_branch = f"release/v{ver}"
 
     git("add", "-A")
-    files = staged_files()
-    if not files:
-        print("[release] изменений нет, фиксировать нечего")
-        git("reset", check=False)
-        return
+    files = [l for l in git("diff", "--cached", "--name-only").splitlines() if l]
 
     bad = [f for f in files if any(f.startswith(p) or f.endswith(p) for p in FORBIDDEN)]
     if bad:
         git("reset", check=False)
         sys.exit("[release] в коммит попали закрытые файлы, остановлено: " + ", ".join(bad))
 
-    message = args.message or f"v{ver}"
-    print(f"[release] версия {ver}, файлов в коммите: {len(files)}, текущая ветка: {current}")
-    print(f"[release] план: ветка {branch} <- коммит «{message}», develop -> {branch}"
-          + ("" if args.no_push else ", затем отправка на origin"))
-
     if args.dry_run:
-        print("[release] пробный прогон, ничего не меняю")
+        print(f"[release] версия {ver}, ветка {branch}, файлов к коммиту: {len(files)}")
         for f in files[:20]:
             print("   ", f)
         if len(files) > 20:
             print(f"    ... и ещё {len(files) - 20}")
+        if args.release:
+            print(f"[release] была бы создана ветка {rel_branch}")
         git("reset", check=False)
         return
 
-    git("switch", "-c", branch)
-    git("commit", "-m", message)
-    head = git("rev-parse", "HEAD")
-    print(f"[release] коммит {head[:8]} в ветке {branch}")
+    if files:
+        git("commit", "-m", args.message or f"v{ver}")
+        print(f"[release] коммит {git('rev-parse', '--short', 'HEAD')} в {branch}: файлов {len(files)}")
+    else:
+        git("reset", check=False)
+        print(f"[release] изменений нет, коммит не нужен (версия {ver})")
 
-    # develop всегда указывает на последнюю версию
-    git("branch", "-f", "develop", branch)
-    git("switch", "develop")
-    print("[release] develop переведён на " + branch)
+    if args.release:
+        git("branch", "-f", rel_branch, "HEAD")
+        print(f"[release] ветка {rel_branch} указывает на {git('rev-parse', '--short', 'HEAD')}")
 
     if args.no_push:
         print("[release] отправка отключена (--no-push)")
         return
 
-    r = subprocess.run(["git", "push", "origin", branch, "develop"],
-                       cwd=str(ROOT), text=True, capture_output=True,
-                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    if r.returncode == 0:
-        print(f"[release] отправлено на origin: {branch}, develop")
-    else:
-        err = (r.stderr or r.stdout).strip().splitlines()
-        print("[release] отправить не удалось:", err[-1] if err else "неизвестная ошибка")
-        print("[release] коммит и ветки на месте — отправьте вручную:"
-              f" git push origin {branch} develop")
+    ok, msg = git_try("push", "-u", "origin", branch)
+    print(f"[release] отправка {branch}: " + ("готово" if ok else f"не удалась — {msg}"))
+
+    if args.release:
+        # --force-with-lease: релизная ветка всегда указывает на текущую версию, но чужие
+        # изменения на ней перетирать нельзя
+        ok, msg = git_try("push", "--force-with-lease", "origin", rel_branch)
+        if ok:
+            print(f"[release] ветка {rel_branch} отправлена — сборка и выкладка идут в Actions")
+        else:
+            print(f"[release] {rel_branch} отправить не удалось — {msg}")
 
 
 if __name__ == "__main__":
