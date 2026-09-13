@@ -25,15 +25,8 @@
 #endif
 
 #include "board_config.h"
-
-// Имя устройства (идёт в заголовке исходящих сообщений)
-#ifndef DEVICE_NAME
-#define DEVICE_NAME "Tr1glav_esp_bot"
-#endif
-#if defined(SENSOR_NODE) && defined(DEVICE_NAME_SENSOR)
-#undef DEVICE_NAME
-#define DEVICE_NAME DEVICE_NAME_SENSOR
-#endif
+// Имя узла, каналы, WiFi и MQTT берутся из NVS (cfg), а не из build-флагов
+#include "appconfig.h"
 
 // Часовой пояс
 #define TZ_OFFSET_HOURS 3
@@ -55,23 +48,6 @@
 #endif
 #ifndef SENSOR_HEARTBEAT_MS
 #define SENSOR_HEARTBEAT_MS (10UL * 60 * 1000)
-#endif
-
-// ===== ДЕФОЛТЫ ИЗ BUILD-ФЛАГОВ (secrets.ini) =====
-#ifndef PRIVATE_CHANNEL_NAME
-#define PRIVATE_CHANNEL_NAME ""
-#endif
-#ifndef PRIVATE_CHANNEL_KEY
-#define PRIVATE_CHANNEL_KEY ""
-#endif
-#ifndef SENSOR_CHANNEL_NAME
-#define SENSOR_CHANNEL_NAME ""
-#endif
-#ifndef SENSOR_CHANNEL_KEY
-#define SENSOR_CHANNEL_KEY ""
-#endif
-#ifndef TX_CHANNEL
-#define TX_CHANNEL "#connections"
 #endif
 
 // Пауза без сообщений от датчика, после которой его availability уходит в offline
@@ -196,8 +172,20 @@ enum {
 // FW_VERSION и BUILD_UNIX_TIME генерирует scripts/gen_version.py перед сборкой
 #include "build_info.h"
 
+// ===== МАРКЕР ПЛАТЫ В ОБРАЗЕ =====
+// Каждая прошивка несёт строку MBFW:<код платы>:<версия>. Принимающая сторона ищет её
+// в загружаемом образе и отказывается ставить прошивку от другой платы: перепутанный
+// файл не запустится, а снимается такой «кирпич» только USB-кабелем.
+#define FW_MARK_PREFIX "MBFW:"
+#define FW_MARKER      FW_MARK_PREFIX BOARD_CODE ":" FW_VERSION
+
+// Сколько сенсор ждёт подтверждающий "save" после правок настроек по радио. Не дождался —
+// перезагружается и возвращается к сохранённым настройкам, чтобы не остаться в
+// полуизменённом состоянии, если связь с ботом оборвалась на середине.
+#define CFG_PENDING_REVERT_MS (120UL * 1000)
+
 // ===== Кэш имён датчиков =====
-#define SENSOR_DEV_CACHE_MAX 8
+#define SENSOR_DEV_CACHE_MAX 16
 
 // ===== LOG_TAIL =====
 #define LOG_TAIL_MAX 4000

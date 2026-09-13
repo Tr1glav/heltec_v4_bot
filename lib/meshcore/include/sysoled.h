@@ -57,6 +57,28 @@ public:
     command(on ? 0xAF : 0xAE);   // display on / display off
   }
 
+  // Инверсия всей матрицы командой контроллера: буфер при этом не участвует,
+  // поэтому годится для проверки «панель вообще светится?»
+  void invertDisplay(bool i) { command(i ? 0xA7 : 0xA6); }
+
+  // Яркость: контраст + уровень отключения VCOMH. begin() ставит 0xCF, это не максимум.
+  void setBrightness(uint8_t v) {
+        // Порядок и формула как в библиотеке, которую используют Meshtastic и MeshCore:
+        // яркость раскладывается на контраст, предзаряд и уровень VCOMH, а в конце
+        // обязательно идут resume/normal/display-on — без них панель после записи
+        // регистров может остаться погашенной.
+        uint8_t contrast  = (v < 128) ? (uint8_t)(v * 1.171f) : (uint8_t)(v * 1.171f - 43);
+        uint8_t precharge = (v == 0) ? 0x00 : 0xF1;
+        uint8_t comdetect = v / 8;
+    _contrast = contrast;
+    command(0xD9); command(precharge);
+    command(0x81); command(contrast);
+    command(0xDB); command(comdetect);
+    command(0xA4);
+    command(0xA6);
+    command(0xAF);
+  }
+
   void clearDisplay(void) {
     memset(_buf, 0, sizeof(_buf));
   }

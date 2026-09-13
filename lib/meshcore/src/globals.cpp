@@ -51,11 +51,13 @@ uint8_t seen_advert_hashes[SEEN_ADVERT_HASH_COUNT * SEEN_HASH_SIZE];
 int seen_advert_next_idx = 0;
 uint32_t duplicateCount = 0;
 String logTail;
+// used + печать в setup(): иначе линковщик с --gc-sections выбросит строку из образа
+const char fwMarker[] __attribute__((used)) = FW_MARKER;
 #ifdef MQTT_ENABLED
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
-// Префикс топиков: meshcore/bot/{DEVICE_NAME}/
+// Префикс топиков: meshcore/bot/{имя узла из настроек}/
 char mqttPrefix[64];
 
 // Состояние

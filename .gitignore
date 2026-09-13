@@ -8,5 +8,6 @@
 .vscode/ipch
 __pycache__
 secrets.ini
+secrets.json
 firmware_output/*
 lib/meshcore/include/build_info.h

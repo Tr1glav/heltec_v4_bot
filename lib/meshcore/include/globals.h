@@ -50,6 +50,7 @@ extern uint8_t seen_advert_hashes[SEEN_ADVERT_HASH_COUNT * SEEN_HASH_SIZE];
 extern int seen_advert_next_idx;
 extern uint32_t duplicateCount;
 extern String logTail;
+extern const char fwMarker[];   // FW_MARKER, зашит в образ для проверки платы
 
 #ifdef MQTT_ENABLED
 extern WiFiClient wifiClient;

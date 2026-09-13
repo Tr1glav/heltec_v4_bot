@@ -17,7 +17,7 @@ void initSystemClock() {
     settimeofday(&tv, NULL);
 
     // Локальное время считаем вручную: UTC + фиксированное смещение.
-    time_t local = (time_t)BUILD_UNIX_TIME + (time_t)TZ_OFFSET_HOURS * 3600;
+    time_t local = (time_t)BUILD_UNIX_TIME + (time_t)cfg.tzOffset * 3600;
     struct tm tm_now;
     gmtime_r(&local, &tm_now);
     char buf[32];
@@ -30,13 +30,20 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== MESHCORE LISTENER ===\n");
+    Serial.printf("[FW] %s\n", fwMarker);
+
+    // Настройки читаются до радио и каналов: от них зависят имя узла и ключи каналов
+    if (!cfgLoad()) {
+        Serial.println("\n[CFG] устройство не настроено — наберите help в этой консоли");
+    }
+    cfgPrint(false);
     
     initSystemClock();
     
     // ===== ПИТАНИЕ ПЕРИФЕРИИ (VEXT) =====
     #if HAS_OLED && defined(VEXT_PIN)
     pinMode(VEXT_PIN, OUTPUT);
-    digitalWrite(VEXT_PIN, VEXT_EN_ACTIVE);
+    digitalWrite(VEXT_PIN, cfg.vextOn ? HIGH : LOW);
     delay(300);
     #endif
     
@@ -174,29 +181,8 @@ void setup() {
     // хранилище /ota.bin для mesh OTA сенсоров (partition "spiffs", 1.5 MB)
     if (LittleFS.begin(true)) {
         slog("[LITTLEFS] OK\n");
-        // Самотест: write/read/remove — доказывает, что ФС реально работает.
-        {
-            File t = LittleFS.open("/.selftest", "w");
-            if (!t) {
-                slog("[LITTLEFS] self-test: open(w) FAILED\n");
-            } else if (t.write((const uint8_t*)"meshcore", 8) != 8) {
-                slog("[LITTLEFS] self-test: write FAILED\n");
-                t.close();
-            } else {
-                t.close();
-                File t2 = LittleFS.open("/.selftest", "r");
-                if (!t2) {
-                    slog("[LITTLEFS] self-test: open(r) FAILED\n");
-                } else {
-                    char buf[16] = {0};
-                    int n = t2.read((uint8_t*)buf, sizeof(buf) - 1);
-                    t2.close();
-                    slog("[LITTLEFS] self-test: read %d bytes = \"%s\"\n",
-                         n, (n > 0) ? buf : "(fail)");
-                }
-                LittleFS.remove("/.selftest");
-            }
-        }
+        // Проверка записи вынесена на /selftest: она пишет во флеш, а результат нужен
+        // только при разборе проблем, не при каждом старте.
     } else {
         slog("[LITTLEFS] FAILED (begin) — mesh OTA недоступен\n");
     }
@@ -224,6 +210,13 @@ void setup() {
     display.display();
     #endif
     
+    // Яркость применяем в самом конце инициализации, а не сразу после display.begin():
+    // ранняя запись в регистры панель гасила. Проверено: контраст выше штатного 0xCF
+    // прибавки не даёт, поэтому настройка полезна в основном для затемнения.
+    #if HAS_OLED
+    display.setBrightness((uint8_t)cfg.dispBri);
+    #endif
+
     Serial.printf("Listening on %s...\n", channelListStr().c_str());
 }
 
@@ -240,8 +233,11 @@ void loop() {
     if (mqttConnected) mqtt.loop();
     #endif
 
+    cfgConsoleTick();   // настройка через USB-консоль, не блокирует радио
+
     // ===== ADVERT (периодический) =====
-    if (isListening && !otaFastMode) {
+    // без настроек в эфир не выходим: имя узла пустое, каналов нет
+    if (isListening && !otaFastMode && cfgReady()) {
         if (!advertBootSent && millis() > 6000) {   // стартовый beacon
             advertBootSent = true;
             sendAdvert(ADV_ROUTE_DIRECT);
@@ -373,7 +369,7 @@ void loop() {
     if (ntpStarted && !ntpSyncedLogged &&
         sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
         ntpSyncedLogged = true;
-        time_t local = time(NULL) + (time_t)TZ_OFFSET_HOURS * 3600;
+        time_t local = time(NULL) + (time_t)cfg.tzOffset * 3600;
         struct tm tm_now;
         gmtime_r(&local, &tm_now);
         char tbuf[32];
@@ -402,12 +398,13 @@ void loop() {
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
     otaSensorTick();   // mesh OTA: сторожевое время — при зависании прерываем сессию
+    cfgPendingTick();  // правки настроек по радио без "save" откатываются перезагрузкой
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
     // Во время OTA mesh-отправки подавляем: радио слушает raw-чанки на быстром канале.
     static unsigned long lastBtnPress = 0;
     static unsigned long lastHeartbeat = 0;
     static bool bootHelloSent = false;
-    if (!otaActive) {
+    if (!otaActive && cfgReady()) {
         if (!bootHelloSent) {
             bootHelloSent = true;
             sensorSendHello();   // стартовый hello сразу после включения

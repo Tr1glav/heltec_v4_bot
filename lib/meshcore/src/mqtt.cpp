@@ -25,7 +25,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         uint8_t frame[256];
         int fl = buildGroupFrameFlood(mqttTxChannel, msg, frame, sizeof(frame));
         if (fl > 0) {
-            Serial.printf("[MQTT TX] %s: %s: %s (%dB)\n", channels[mqttTxChannel].name, DEVICE_NAME, msg, fl);
+            Serial.printf("[MQTT TX] %s: %s: %s (%dB)\n", channels[mqttTxChannel].name, cfg.name.c_str(), msg, fl);
             floodSend3(mqttTxChannel, frame, fl);
         }
         return;
@@ -58,12 +58,12 @@ void publishDiscovery() {
         "\"manufacturer\":\"MeshCore\","
         "\"model\":\"ESP32-S3 Listener\","
         "\"sw_version\":\"" FW_VERSION "\"",
-        DEVICE_NAME, DEVICE_NAME);
+        cfg.name.c_str(), cfg.name.c_str());
 
     char topic[128], payload[512];
 
     // --- Sensor: последний отправитель (state = имя отправителя) ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/last_sender/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/last_sender/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s LastSender\","
         "\"state_topic\":\"%s/state\","
@@ -71,11 +71,11 @@ void publishDiscovery() {
         "\"json_attributes_topic\":\"%s/state\","
         "\"unique_id\":\"meshcore_%s_lastsender\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Sensor: статус ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/status/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/status/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Status\","
         "\"state_topic\":\"%s/status\","
@@ -84,11 +84,11 @@ void publishDiscovery() {
         "\"unique_id\":\"meshcore_%s_stat\","
         "\"icon\":\"mdi:server\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Sensor: IP адрес _mqtt (атрибут ip из /status) ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/ip/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/ip/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s IP\","
         "\"state_topic\":\"%s/status\","
@@ -96,11 +96,11 @@ void publishDiscovery() {
         "\"unique_id\":\"meshcore_%s_ip\","
         "\"icon\":\"mdi:ip-network\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Sensor: температура CPU (встроенный датчик ESP32-S3) ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/temp/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/temp/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Temp\","
         "\"state_topic\":\"%s/status\","
@@ -109,11 +109,11 @@ void publishDiscovery() {
         "\"unique_id\":\"meshcore_%s_temp\","
         "\"icon\":\"mdi:thermometer\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Sensor: версия прошивки (поле version из /status) ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/version/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/version/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Firmware\","
         "\"state_topic\":\"%s/status\","
@@ -122,11 +122,11 @@ void publishDiscovery() {
         "\"icon\":\"mdi:chip\","
         "\"entity_category\":\"diagnostic\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Sensor: last_msg выбранного канала (для триггеров) ---
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/lastmsg/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_%s/lastmsg/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s LastMsg\","
         "\"state_topic\":\"%s/lastmsg\","
@@ -134,22 +134,22 @@ void publishDiscovery() {
         "\"unique_id\":\"meshcore_%s_lastmsg\","
         "\"icon\":\"mdi:message-arrow-right\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Text: отправка сообщения ---
-    snprintf(topic, sizeof(topic), "homeassistant/text/meshcore_%s/send/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/text/meshcore_%s/send/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Send\","
         "\"command_topic\":\"%s/cmd/send\","
         "\"unique_id\":\"meshcore_%s_send\","
         "\"icon\":\"mdi:message-text\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
     // --- Switch: listening ---
-    snprintf(topic, sizeof(topic), "homeassistant/switch/meshcore_%s/listening/config", DEVICE_NAME);
+    snprintf(topic, sizeof(topic), "homeassistant/switch/meshcore_%s/listening/config", cfg.name.c_str());
     snprintf(payload, sizeof(payload),
         "{\"name\":\"%s Listening\","
         "\"command_topic\":\"%s/cmd/listening\","
@@ -157,10 +157,10 @@ void publishDiscovery() {
         "\"unique_id\":\"meshcore_%s_sw\","
         "\"icon\":\"mdi:radio\","
         "\"device\":{%s}}",
-        DEVICE_NAME, mqttPrefix, mqttPrefix, DEVICE_NAME, devBlock);
+        cfg.name.c_str(), mqttPrefix, mqttPrefix, cfg.name.c_str(), devBlock);
     mqtt.publish(topic, payload, true);
 
-    Serial.printf("[MQTT] discovery published for <%s>\n", DEVICE_NAME);
+    Serial.printf("[MQTT] discovery published for <%s>\n", cfg.name.c_str());
     discoveryPublished = true;
 }
 
@@ -376,12 +376,19 @@ bool publishSensorMessage() {
     char slug[48];
     mqttSlug(lastSender.c_str(), slug, sizeof(slug));
     // discovery — один раз на сенсор за подключение к брокеру
-    if (idx < 0 || !sensorDiscPublished[idx]) {
-        publishSensorDisc(lastSender, slug);
-        if (idx >= 0) {
-            sensorDiscPublished[idx] = true;
-            cameOnline = true;
+    if (idx < 0) {
+        // Реестр полон: публиковать discovery некуда — иначе каждое сообщение такого
+        // сенсора заново рассылало бы весь набор retained-конфигов в брокер.
+        static bool regFullWarned = false;
+        if (!regFullWarned) {
+            regFullWarned = true;
+            slog("[SNS] реестр сенсоров полон (%d) — %s остаётся без сущностей в HA\n",
+                 SENSOR_DEV_CACHE_MAX, lastSender.c_str());
         }
+    } else if (!sensorDiscPublished[idx]) {
+        publishSensorDisc(lastSender, slug);
+        sensorDiscPublished[idx] = true;
+        cameOnline = true;
     }
     if (cameOnline) {
         publishSensorAvailability(idx);
@@ -471,14 +478,16 @@ void publishStatus() {
 }
 
 void setupMQTT() {
-    snprintf(mqttPrefix, sizeof(mqttPrefix), "meshcore/bot/%s", DEVICE_NAME);
-    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    snprintf(mqttPrefix, sizeof(mqttPrefix), "meshcore/bot/%s", cfg.name.c_str());
+    mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
     mqtt.setCallback(mqttCallback);
     mqtt.setBufferSize(768);   // discovery-конфиг весит до ~600 Б
     mqtt.setSocketTimeout(3);  // ограничиваем блокировку connect() до ~3 с
 }
 
 void tickRetryConnections() {
+    // без настроек подключаться некуда: устройство ждёт настройки в консоли
+    if (cfg.wifiSsid.length() == 0) return;
     // ===== WiFi =====
     bool connectedNow = (WiFi.status() == WL_CONNECTED);
     if (wifiConnected && !connectedNow) {
@@ -492,7 +501,7 @@ void tickRetryConnections() {
             wifiConnStartMs = millis();
             Serial.println("[WiFi] connecting...");
             WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASS);
+            WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
         } else if ((int32_t)(millis() - wifiConnStartMs) > 15000) {
             Serial.println("[WiFi] timeout, retry in 5s");
             wifiConnInProgress = false;
@@ -513,14 +522,17 @@ void tickRetryConnections() {
     }
 
     // ===== MQTT =====
+    if (cfg.mqttHost.length() == 0) return;
     if (mqttConnected && mqtt.connected()) return;
     if (mqttConnected) mqttConnected = false;
 
-    Serial.printf("[MQTT] connecting to %s:%d ...", MQTT_BROKER, MQTT_PORT);
+    Serial.printf("[MQTT] connecting to %s:%d ...", cfg.mqttHost.c_str(), cfg.mqttPort);
     char clientId[48];
-    snprintf(clientId, sizeof(clientId), "meshcore_%s_%lu", DEVICE_NAME, millis() % 100000);
+    snprintf(clientId, sizeof(clientId), "meshcore_%s_%lu", cfg.name.c_str(), millis() % 100000);
 
-    if (mqtt.connect(clientId, MQTT_USER, MQTT_PASS)) {
+    const char* mqUser = cfg.mqttUser.length() ? cfg.mqttUser.c_str() : NULL;
+    const char* mqPass = cfg.mqttPass.length() ? cfg.mqttPass.c_str() : NULL;
+    if (mqtt.connect(clientId, mqUser, mqPass)) {
         mqttConnected = true;
         Serial.println(" OK");
         char cmdTopic[96];

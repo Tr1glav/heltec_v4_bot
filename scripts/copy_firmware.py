@@ -67,6 +67,14 @@ def copy_firmware(source, target, env):
 
     print(f"📦 Kept {kept} firmware(s) for '{board_name}'\n")
 
+    # Фиксация версии в git — только по флагу RELEASE=1 и только после успешной сборки:
+    # коммитить код, который не собрался, смысла нет. При сборке нескольких окружений
+    # сработает лишь первое: release.py молча выходит, если ветка версии уже есть.
+    if os.environ.get("RELEASE") == "1":
+        import subprocess, sys
+        script = os.path.join(env.subst("$PROJECT_DIR"), "scripts", "release.py")
+        subprocess.run([sys.executable, script, "--quiet-if-exists"], check=False)
+
 
 # Регистрируем функцию как пост-действие для файла firmware.bin
 env.AddPostAction("$BUILD_DIR/firmware.bin", copy_firmware)

@@ -4,6 +4,7 @@
 #include "radio.h"
 #include "mesh.h"
 #include "display.h"
+#include "ota.h"   // slog: журнал бота, он же виден на странице
 
 uint8_t* findPeerPub(uint8_t hash) {
     for (int i = 0; i < PEER_CACHE_MAX; i++) {
@@ -26,7 +27,7 @@ void rememberPeerPub(uint8_t hash, const uint8_t* pub) {
 
 void initAdvertIdentity() {
     mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-               (const uint8_t*)DEVICE_NAME, strlen(DEVICE_NAME), bot_priv);
+               (const uint8_t*)cfg.name.c_str(), cfg.name.length(), bot_priv);
     Ed25519::derivePublicKey(bot_pub, bot_priv);
 
     // Ed25519 private key (64 Б) для X25519-обмена при ответе в личку.
@@ -172,25 +173,25 @@ static int setNamedChannel(const char* tag, const String& name, const String& ke
 }
 
 void loadPrivateChannel() {
-    // Каналы задаются ТОЛЬКО из build-флагов (secrets.ini), не из HA.
-    if (strlen(PRIVATE_CHANNEL_NAME) == 0) return;
-    Serial.printf("[PRV] channel from build flags: %s\n", PRIVATE_CHANNEL_NAME);
-    setNamedChannel("PRV", PRIVATE_CHANNEL_NAME, PRIVATE_CHANNEL_KEY, privateChannelName, privateChannelIdx);
+    // Каналы задаются ТОЛЬКО настройками устройства (NVS), не из HA.
+    if (cfg.prvName.length() == 0) return;
+    Serial.printf("[PRV] channel from config: %s\n", cfg.prvName.c_str());
+    setNamedChannel("PRV", cfg.prvName, cfg.prvKey, privateChannelName, privateChannelIdx);
 }
 
 void loadSensorChannel() {
-    if (strlen(SENSOR_CHANNEL_NAME) == 0) return;
-    Serial.printf("[SNS] sensor channel from build flags: %s\n", SENSOR_CHANNEL_NAME);
-    setNamedChannel("SNS", SENSOR_CHANNEL_NAME, SENSOR_CHANNEL_KEY, sensorChannelName, sensorChannelIdx);
+    if (cfg.snsName.length() == 0) return;
+    Serial.printf("[SNS] sensor channel from config: %s\n", cfg.snsName.c_str());
+    setNamedChannel("SNS", cfg.snsName, cfg.snsKey, sensorChannelName, sensorChannelIdx);
 }
 
 #ifdef MQTT_ENABLED
 void loadTxChannel() {
-    int idx = findChannelByName(TX_CHANNEL);
+    int idx = findChannelByName(cfg.txChannel.c_str());
     if (idx < 0) idx = 1;   // #connections
     if (idx < numChannels) {
         mqttTxChannel = idx;
-        Serial.printf("[MQTT] TX channel from build flags: %s\n", channels[idx].name);
+        Serial.printf("[MQTT] TX channel from config: %s\n", channels[idx].name);
     }
 }
 #endif // MQTT_ENABLED
@@ -362,7 +363,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     lastMessage.trim();
 
     // не обрабатываем собственные сообщения (эхо собственного флуда)
-    if (lastSender == DEVICE_NAME) return false;
+    if (lastSender == cfg.name) return false;
 
     Serial.printf("\n=== PACKET #%d (%s) ===\n", packetCount, lastChannelName.c_str());
     Serial.printf("From: %s\n", lastSender.c_str());
@@ -415,6 +416,19 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             return true;
         }
 
+        // === Настройка по радио: команда адресована конкретному узлу по имени ===
+        if (lastMessage.startsWith("cfg:")) {
+            #ifdef SENSOR_NODE
+            String rest = lastMessage.substring(4);
+            int p = rest.indexOf(':');
+            if (p > 0 && rest.substring(0, p) == cfg.name) cfgHandleMeshCfg(rest.substring(p + 1));
+            #elif defined(MQTT_ENABLED)
+            // ответы сенсора видно в журнале на странице, в MQTT их не публикуем
+            slog("[CFG] %s: %s\n", lastSender.c_str(), lastMessage.c_str());
+            #endif
+            return true;
+        }
+
         // === Опрос со страницы OTA: каждый сенсор ответит hello:<версия> со случайной задержкой,
         //     чтобы ответы нескольких сенсоров не столкнулись в эфире ===
         if (lastMessage == SENSOR_MSG_HELLO_REQ) {
@@ -438,7 +452,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
                 tv.tv_usec = 0;
                 settimeofday(&tv, NULL);
                 timeSyncMs = millis();
-                time_t local = (time_t)epoch + (time_t)TZ_OFFSET_HOURS * 3600;
+                time_t local = (time_t)epoch + (time_t)cfg.tzOffset * 3600;
                 struct tm tm_now;
                 gmtime_r(&local, &tm_now);
                 char tbuf[32];
@@ -495,7 +509,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 
         int f = buildGroupFrameFlood(chIdx, reply, frame, sizeof(frame));
         if (f > 0) {
-            Serial.printf("\n[TX] %s: %s: %s (%dB, flood x3)\n", channels[chIdx].name, DEVICE_NAME, reply, f);
+            Serial.printf("\n[TX] %s: %s: %s (%dB, flood x3)\n", channels[chIdx].name, cfg.name.c_str(), reply, f);
             floodSend3(chIdx, frame, f);
         }
     }
@@ -508,8 +522,8 @@ void sendAdvert(uint8_t route_type) {
     uint8_t app[32];
     int applen = 0;
     app[applen++] = 0x80 | 0x01;  // ADV_TYPE_CHAT + имя
-    const char* name = DEVICE_NAME;
-    int nlen = strlen(name);
+    const char* name = cfg.name.c_str();
+    int nlen = (int)cfg.name.length();
     if (nlen > 31) nlen = 31;
     memcpy(app + applen, name, nlen);
     applen += nlen;
@@ -550,8 +564,12 @@ int buildGroupEnc(int chIdx, const String& msg, uint8_t* enc) {
     memcpy(plaintext, &ts, 4);                      // timestamp (LE)
     plaintext[4] = 0;                               // TXT_TYPE_PLAIN
     size_t plen = 5;
-    const char* prefix = DEVICE_NAME ": ";
-    size_t n = min(strlen(prefix), sizeof(plaintext) - plen);
+    // "имя: " собирается в рантайме: имя приходит из настроек, а не из макроса
+    char prefix[48];
+    int pn = snprintf(prefix, sizeof(prefix), "%s: ", cfg.name.c_str());
+    if (pn < 0) pn = 0;
+    if (pn > (int)sizeof(prefix) - 1) pn = (int)sizeof(prefix) - 1;
+    size_t n = min((size_t)pn, sizeof(plaintext) - plen);
     memcpy(plaintext + plen, prefix, n); plen += n;
     n = min((size_t)msg.length(), sizeof(plaintext) - plen);
     memcpy(plaintext + plen, msg.c_str(), n); plen += n;
@@ -638,8 +656,12 @@ void sensorSendMsg(const char* msg, unsigned int gapMs) {
 void sensorSendHello() {
     char msg[64];
     #if HAS_BATTERY
-    snprintf(msg, sizeof(msg), "%s:%s:%d:%.2f:%s", SENSOR_MSG_HELLO, FW_VERSION,
-             batteryPercent(), batteryVoltage(), BOARD_CODE);
+    if (batteryPresent()) {
+        snprintf(msg, sizeof(msg), "%s:%s:%d:%.2f:%s", SENSOR_MSG_HELLO, FW_VERSION,
+                 batteryPercent(), batteryVoltage(), BOARD_CODE);
+    } else {
+        snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
+    }
     #else
     snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
     #endif

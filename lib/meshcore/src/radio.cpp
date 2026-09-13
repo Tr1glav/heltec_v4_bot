@@ -58,9 +58,12 @@ bool initLoRa() {
     // Вызов begin() БЕЗ параметра TCXO.
     // RadioLib возьмёт значение из макроса SX126X_DIO3_TCXO_VOLTAGE,
     // который мы определим в platformio.ini.
+    Serial.printf("[RADIO] %.4f МГц BW %.1f SF%u CR%u sync 0x%02X %d дБм\n",
+                  (double)cfg.loraFreq, (double)cfg.loraBw, cfg.loraSf, cfg.loraCr,
+                  cfg.loraSync, cfg.loraTx);
     int state = radio.begin(
-        LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
-        LORA_SYNC_WORD, LORA_TX_POWER, LORA_PREAMBLE, 1.8
+        cfg.loraFreq, cfg.loraBw, (uint8_t)cfg.loraSf, (uint8_t)cfg.loraCr,
+        (uint8_t)cfg.loraSync, (int8_t)cfg.loraTx, (uint16_t)cfg.loraPre, 1.8
     );
     
     if (state == RADIOLIB_ERR_NONE) {
@@ -96,14 +99,14 @@ void radioSetNormalConfig() {
         isListening = true;
         return;
     }
-    radioSetParams(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
+    radioSetParams(cfg.loraFreq, cfg.loraBw, (int)cfg.loraSf, (int)cfg.loraCr);
 }
 
 void radioSetFastConfig() {
     fastRxFrames = 0;
     fastRxErrors = 0;
     int st = radio.beginFSK(OTA_FAST_FREQ, OTA_FSK_BR, OTA_FSK_DEV, OTA_FSK_RXBW,
-                            LORA_TX_POWER, OTA_FSK_PREAMBLE, 1.8);
+                            (int8_t)cfg.loraTx, OTA_FSK_PREAMBLE, 1.8);
     if (st != RADIOLIB_ERR_NONE) Serial.printf("[RADIO] beginFSK failed %d\n", st);
     radioFsk = true;
     applyBoardRadioOptions();

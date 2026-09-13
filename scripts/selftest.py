@@ -5,6 +5,8 @@
   * вырезает из исходников настоящие функции (CRC, jsonEscape, buildPingReply, rawBuildFrame),
     собирает их хостовым компилятором с санитайзерами и гоняет на граничных данных —
     так ловятся переполнения буферов, которые на плате проявились бы падением;
+  * проверяет сканер маркера платы: маркер должен находиться при любой нарезке образа
+    на куски, чужой код платы — отвергаться, отсутствие маркера — не считаться отказом;
   * проверяет формат .otaz (заголовок, CRC32, распаковка кусками по 240 Б, как на сенсоре);
   * проверяет синтаксис JavaScript страницы OTA.
 
@@ -125,6 +127,86 @@ def host_functions_test():
               "получено %s, ожидалось %s" % (got.get("crc32"), expect))
 
 
+MARKER_PRELUDE = (
+    "#include <cstdint>\n#include <cstdio>\n#include <cstring>\n"
+    "#define BOARD_CODE \"h3\"\n"
+    "#define FW_MARK_PREFIX \"MBFW:\"\n"
+    "#define min(a,b) ((a)<(b)?(a):(b))\n"
+    "struct FwScan { char carry[40]; uint8_t carryLen; bool mine; char other[12]; };\n"
+)
+
+MARKER_MAIN = r"""
+static void feedAll(FwScan* s, const char* img, size_t n, size_t chunk) {
+    fwScanReset(s);
+    for (size_t i = 0; i < n; i += chunk) {
+        size_t k = (n - i < chunk) ? (n - i) : chunk;
+        fwScanFeed(s, (const uint8_t*)img + i, k);
+    }
+}
+
+int main() {
+    char img[4096];
+    FwScan s;
+    // маркер своей платы обязан находиться при любом размере куска, в том числе
+    // когда он лёг на границу двух кусков — это и есть главный риск сканера
+    const char* mine = "MBFW:" BOARD_CODE ":1.0.27";
+    for (size_t at = 0; at + 64 < sizeof(img); at += 37) {
+        memset(img, 0xA5, sizeof(img));
+        memcpy(img + at, mine, strlen(mine));
+        for (size_t chunk = 1; chunk <= 64; chunk++) {
+            feedAll(&s, img, sizeof(img), chunk);
+            if (fwScanVerdict(&s) != 1) {
+                printf("свой маркер не найден: смещение %zu, кусок %zu\n", at, chunk);
+                return 1;
+            }
+        }
+    }
+    // образ чужой платы должен быть отвергнут с указанием её кода
+    memset(img, 0xA5, sizeof(img));
+    memcpy(img + 700, "MBFW:zz9:1.0.27", 15);
+    feedAll(&s, img, sizeof(img), 512);
+    if (fwScanVerdict(&s) != -1 || strcmp(s.other, "zz9") != 0) {
+        printf("чужая плата не распознана: verdict=%d other=%s\n", fwScanVerdict(&s), s.other);
+        return 1;
+    }
+    // без маркера и голый префикс без кода — «неизвестная» прошивка, а не отказ
+    memset(img, 0xA5, sizeof(img));
+    feedAll(&s, img, sizeof(img), 512);
+    if (fwScanVerdict(&s) != 0) { printf("образ без маркера принят за чужой\n"); return 1; }
+    memcpy(img + 100, "MBFW:", 6);
+    feedAll(&s, img, sizeof(img), 512);
+    if (fwScanVerdict(&s) != 0) { printf("голый префикс принят за маркер\n"); return 1; }
+    printf("ok\n");
+    return 0;
+}
+"""
+
+
+def marker_scan_test():
+    if not shutil.which("g++"):
+        print("SKIP g++ не найден — сканер маркера платы не проверен")
+        return
+    code = (MARKER_PRELUDE
+            + grab("lib/meshcore/src/ota.cpp", "void fwScanReset(") + "\n"
+            + grab("lib/meshcore/src/ota.cpp", "static void fwScanBuf(") + "\n"
+            + grab("lib/meshcore/src/ota.cpp", "void fwScanFeed(") + "\n"
+            + grab("lib/meshcore/src/ota.cpp", "int fwScanVerdict(") + "\n"
+            + MARKER_MAIN)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = pathlib.Path(tmp) / "m.cpp"
+        exe = pathlib.Path(tmp) / "m"
+        src.write_text(code, encoding="utf-8")
+        build = subprocess.run(
+            ["g++", "-std=c++17", "-fsanitize=address,undefined", "-g", str(src), "-o", str(exe)],
+            capture_output=True, text=True)
+        if build.returncode != 0:
+            check("сборка теста маркера платы", False, build.stderr.strip()[:400])
+            return
+        run = subprocess.run([str(exe)], capture_output=True, text=True)
+        check("маркер платы: поиск в потоке, в том числе на границах кусков",
+              run.returncode == 0, (run.stdout + run.stderr).strip()[:400])
+
+
 def otaz_test():
     raw = bytes(random.getrandbits(8) for _ in range(50000))
     packed = (b"OTAZ" + struct.pack("<II", len(raw), zlib.crc32(raw) & 0xFFFFFFFF)
@@ -155,6 +237,7 @@ def page_js_test():
 
 if __name__ == "__main__":
     host_functions_test()
+    marker_scan_test()
     otaz_test()
     page_js_test()
     print()

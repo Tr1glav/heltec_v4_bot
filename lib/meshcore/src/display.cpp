@@ -34,8 +34,15 @@ float batteryVoltage() {
     return volts;
 }
 
+// Без аккумулятора делитель даёт около нуля: на V3 это выглядело как "0.00V" на
+// экране и 0% в сообщениях. Порог заведомо ниже любого рабочего LiPo.
+bool batteryPresent() {
+    return batteryVoltage() > 2.5f;
+}
+
 // Кривая разряда LiPo: напряжение к проценту заряда нелинейно
 int batteryPercent() {
+    if (!batteryPresent()) return -1;
     static const float curve[][2] = {
         { 3.30f, 0 }, { 3.55f, 10 }, { 3.65f, 25 }, { 3.75f, 50 },
         { 3.90f, 75 }, { 4.05f, 90 }, { 4.20f, 100 },
@@ -54,6 +61,7 @@ int batteryPercent() {
 #else
 float batteryVoltage() { return 0; }
 int batteryPercent() { return -1; }
+bool batteryPresent() { return false; }
 #endif
 
 void drawIdleStatus() {
@@ -61,14 +69,14 @@ void drawIdleStatus() {
     display.setTextSize(1);
     display.setCursor(0, 0);
     // часы из системного времени (обновляются каждые 500 мс вместе с экраном)
-    time_t now = time(NULL) + (time_t)TZ_OFFSET_HOURS * 3600;
+    time_t now = time(NULL) + (time_t)cfg.tzOffset * 3600;
     struct tm tm_now;
     gmtime_r(&now, &tm_now);
     char tbuf[32];
     strftime(tbuf, sizeof(tbuf), "%H:%M:%S  %d.%m", &tm_now);
     unsigned long up = millis() / 1000;
     #ifdef SENSOR_NODE
-    display.println(DEVICE_NAME);
+    display.println(cfgReady() ? cfg.name.c_str() : "NO CONFIG");
     display.println(tbuf);
     if (timeSyncMs) display.printf("sync %s ago\n", agoStr(timeSyncMs).c_str());
     else            display.println("sync: never");
@@ -102,11 +110,13 @@ void drawIdleStatus() {
     if (fwVersionDiffers) display.print("*");
     #endif
     #if HAS_BATTERY
-    // заряд справа внизу: 6 px на символ при setTextSize(1)
-    char bat[16];
-    snprintf(bat, sizeof(bat), "%d%% %.2fV", batteryPercent(), batteryVoltage());
-    display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
-    display.print(bat);
+    // без аккумулятора индикатор не рисуем вовсе, чтобы не показывать "0% 0.00V"
+    if (batteryPresent()) {
+        char bat[16];
+        snprintf(bat, sizeof(bat), "%d%% %.2fV", batteryPercent(), batteryVoltage());
+        display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
+        display.print(bat);
+    }
     #endif
     display.display();
 }

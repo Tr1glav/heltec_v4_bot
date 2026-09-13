@@ -38,6 +38,60 @@ int rawTxFrame(const uint8_t* frm, int f) {
     return st;
 }
 
+// ==== Маркер платы в образе ====
+// Прошивка каждой платы несёт строку FW_MARKER. И бот (HTTP /update), и сенсор
+// (mesh OTA) сканируют принимаемый образ и отказываются писать чужой: неподходящая
+// прошивка не запустится, а снимать её придётся USB-кабелем.
+void fwScanReset(FwScan* s) {
+    memset(s, 0, sizeof(*s));
+}
+
+// Поиск внутри одного непрерывного куска: после префикса читаем код платы до ':'
+static void fwScanBuf(FwScan* s, const char* p, size_t n) {
+    const size_t pl = sizeof(FW_MARK_PREFIX) - 1;
+    for (size_t i = 0; i + pl < n; i++) {
+        if (memcmp(p + i, FW_MARK_PREFIX, pl) != 0) continue;
+        const char* code = p + i + pl;
+        size_t avail = n - (i + pl);
+        size_t c = 0;
+        while (c < avail && c < sizeof(s->other) - 1 && code[c] > 0x20 && code[c] != ':') c++;
+        // в образе есть и сам префикс-иголка из этого кода — он без кода платы, пропускаем
+        if (c == 0 || c >= avail || code[c] != ':') continue;
+        if (c == strlen(BOARD_CODE) && memcmp(code, BOARD_CODE, c) == 0) s->mine = true;
+        else if (s->other[0] == 0) { memcpy(s->other, code, c); s->other[c] = 0; }
+    }
+}
+
+void fwScanFeed(FwScan* s, const uint8_t* data, size_t n) {
+    const size_t cap = sizeof(s->carry);
+    if (n == 0) return;
+    // Стык: хвост предыдущих кусков + начало текущего. Маркер короче cap, поэтому
+    // любой разрыв попадает в это окно целиком.
+    char joined[sizeof(s->carry) * 2];
+    size_t head = min((size_t)n, cap);
+    memcpy(joined, s->carry, s->carryLen);
+    memcpy(joined + s->carryLen, data, head);
+    size_t jl = s->carryLen + head;
+    fwScanBuf(s, joined, jl);
+    if (n > head) fwScanBuf(s, (const char*)data, n);   // длинный кусок смотрим целиком
+    // Новый хвост — последние cap байт ПОТОКА, а не текущего куска: иначе при мелкой
+    // нарезке (по байту) хвост не накапливается и маркер на стыке теряется.
+    if (n >= cap) {
+        memcpy(s->carry, data + n - cap, cap);
+        s->carryLen = (uint8_t)cap;
+    } else {
+        size_t keep = min(jl, cap);
+        memmove(s->carry, joined + jl - keep, keep);
+        s->carryLen = (uint8_t)keep;
+    }
+}
+
+int fwScanVerdict(const FwScan* s) {
+    if (s->mine) return 1;
+    if (s->other[0]) return -1;
+    return 0;
+}
+
 #ifdef MQTT_ENABLED
 static uint32_t otaImgSize = 0;       // размер прошивки после распаковки
 static uint16_t otaWinAcked = 0;      // бит i — чанк otaSeq+i уже у сенсора
@@ -201,6 +255,14 @@ void otaSendEnd() {
 }
 
 void otaHandleAck() {
+    // Сенсор сообщает причину отказа текстом: без этого на боте виден только таймаут
+    if (lastMessage.startsWith("ota:fail:")) {
+        if (otaSessionActive() && lastSender == otaTarget) {
+            slog("[OTA] <- %s: отказ сенсора «%s»\n", lastSender.c_str(), lastMessage.c_str() + 9);
+            otaBotAbort(lastMessage.c_str() + 9);
+        }
+        return;
+    }
     if (!lastMessage.startsWith("ota:ackstart")) return;
     slog("[OTA] <- %s: %s (phase=%d)\n", lastSender.c_str(), lastMessage.c_str(), otaPhase);
     if (otaPhase != OTA_PHASE_WAIT_START || lastSender != otaTarget) return;
@@ -421,6 +483,53 @@ void otaHandleSelfTest() {
     otaServer.send(200, "text/plain; charset=utf-8", r + "\r\n");
 }
 
+// Настройки бота: тот же набор полей, что и в консоли. Секреты отдаются маской,
+// поэтому страница не может их показать — только перезаписать.
+void otaHandleConfigGet() {
+    String json = "[";
+    for (int i = 0; i < cfgFieldCount(); i++) {
+        char name[24], val[96], item[200];
+        jsonEscape(cfgFieldName(i), name, sizeof(name));
+        jsonEscape(cfgFieldValue(i, false).c_str(), val, sizeof(val));
+        snprintf(item, sizeof(item), "%s{\"f\":\"%s\",\"v\":\"%s\",\"s\":%s}",
+                 i ? "," : "", name, val, cfgFieldSecret(i) ? "true" : "false");
+        json += item;
+    }
+    json += "]";
+    otaServer.send(200, "application/json", json);
+}
+
+void otaHandleConfigPost() {
+    if (otaSessionActive()) {
+        otaServer.send(409, "text/plain; charset=utf-8", "идёт прошивка сенсора");
+        return;
+    }
+    int changed = 0;
+    String unknown;
+    for (int i = 0; i < otaServer.args(); i++) {
+        String n = otaServer.argName(i);
+        if (n == "reboot" || n == "plain") continue;
+        if (cfgApply(n, otaServer.arg(i))) { changed++; slog("[WEB] настройка %s изменена\n", n.c_str()); }
+        else unknown += " " + n;
+    }
+    if (unknown.length() > 0) {
+        otaServer.send(400, "text/plain; charset=utf-8", "неизвестные поля:" + unknown);
+        return;
+    }
+    if (changed == 0) {
+        otaServer.send(200, "text/plain; charset=utf-8", "нечего менять");
+        return;
+    }
+    cfgSave();
+    bool reboot = otaServer.arg("reboot") == "1";
+    otaServer.send(200, "text/plain; charset=utf-8",
+                   String("OK, изменено полей: ") + changed + (reboot ? ", перезагрузка" : ""));
+    if (reboot) {
+        delay(300);
+        ESP.restart();
+    }
+}
+
 // Состояние бота для шапки страницы
 void otaHandleInfo() {
     char fwname[64];
@@ -472,6 +581,48 @@ void otaHandleSensors() {
     }
     json += "]";
     otaServer.send(200, "application/json", json);
+}
+
+// Настройка сенсора по радио. Поля уходят по одному с большой паузой: на каждое
+// сенсор отвечает подтверждением, а оно шлётся тройным флудом и занимает эфир около
+// полутора секунд. Радио полудуплексное — пока сенсор передаёт, он не слышит ничего,
+// поэтому следующая команда, посланная раньше, просто пропадёт.
+#define CFG_MSG_GAP_MS 2000
+void otaHandleSensorsConfig() {
+    if (otaSessionActive()) { otaServer.send(409, "text/plain; charset=utf-8", "идёт прошивка сенсора"); return; }
+    if (sensorChannelIdx < 0) { otaServer.send(503, "text/plain; charset=utf-8", "канал сенсоров не настроен"); return; }
+    String target = otaServer.arg("target");
+    if (target.length() == 0 || target.length() > 31) {
+        otaServer.send(400, "text/plain; charset=utf-8", "не указан сенсор");
+        return;
+    }
+    if (otaServer.arg("get") == "1") {
+        slog("[CFG] -> %s: get\n", target.c_str());
+        otaTxGroup("cfg:" + target + ":get");
+        otaServer.send(200, "text/plain; charset=utf-8", "запрошены настройки, ответ в журнале");
+        return;
+    }
+    int sent = 0;
+    for (int i = 0; i < otaServer.args(); i++) {
+        String n = otaServer.argName(i);
+        if (n == "target" || n == "save" || n == "reboot" || n == "get" || n == "plain") continue;
+        String msg = "cfg:" + target + ":" + n + "=" + otaServer.arg(i);
+        slog("[CFG] -> %s: %s\n", target.c_str(), n.c_str());
+        otaTxGroup(msg);
+        sent++;
+        delay(CFG_MSG_GAP_MS);
+    }
+    if (otaServer.arg("save") == "1") {
+        slog("[CFG] -> %s: save\n", target.c_str());
+        otaTxGroup("cfg:" + target + ":save");
+        delay(CFG_MSG_GAP_MS);
+    }
+    if (otaServer.arg("reboot") == "1") {
+        slog("[CFG] -> %s: reboot\n", target.c_str());
+        otaTxGroup("cfg:" + target + ":reboot");
+    }
+    otaServer.send(200, "text/plain; charset=utf-8",
+                   String("отправлено полей: ") + sent + ", ответы смотрите в журнале");
 }
 
 void otaHandleSensorsHello() {
@@ -526,6 +677,15 @@ button.sm{padding:5px 10px;font-size:12px;font-weight:500}
 #st{margin-top:8px;font-size:12px;min-height:14px}#st.err{color:#f87171}#st.ok{color:#5eead4}
 .ft{margin-top:8px;font-size:10px;color:#64748b;text-align:right}
 .ft a{color:#64748b}
+details.cfg{margin-top:8px;border:1px solid #35405a;border-radius:8px;background:#1e2638;padding:8px}
+details.cfg summary{cursor:pointer;font-size:12px;color:#93a4c4}
+.cfgrow{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cfgrow span{width:76px;flex:none;font-size:11px;color:#93a4c4}
+.cfgrow input{flex:1;min-width:0;padding:4px 6px;border:1px solid #35405a;border-radius:5px;background:#242d40;color:#e8ecf3;font-size:12px}
+.cfgrow input.dirty{border-color:#0ea5e9}
+.cfghint{margin-top:8px;font-size:10px;color:#64748b;line-height:1.5}
+.chk{display:block;font-size:11px;color:#93a4c4;margin-top:6px}
+.chk input{margin-right:6px;vertical-align:middle}
 .tools{display:flex;gap:6px}
 #q{flex:1;min-width:0;padding:5px 8px;border:1px solid #35405a;border-radius:6px;background:#1e2638;color:#e8ecf3;font-size:12px}
 .logwrap{position:relative;margin-top:8px}
@@ -544,7 +704,7 @@ const kb=b=>b>=1048576?(b/1048576).toFixed(2)+' МБ':Math.round(b/1024)+' КБ'
 const dur=s=>{s=Math.max(0,Math.round(s));return s>=60?Math.floor(s/60)+' мин '+(s%60)+' с':s+' с'};
 const ago=s=>s<60?s+' с':s<3600?Math.floor(s/60)+' мин':Math.floor(s/3600)+' ч';
 const upfmt=s=>s>=86400?Math.floor(s/86400)+' д '+Math.floor(s%86400/3600)+' ч':s>=3600?Math.floor(s/3600)+' ч '+Math.floor(s%3600/60)+' мин':Math.floor(s/60)+' мин';
-const ERRS={'timeout p1':'сенсор не ответил на старт','timeout p2':'сенсор перестал отвечать на чанки','timeout p3':'сенсор не подтвердил прошивку','no progress':'сенсор не принимает чанки','sensor fail':'сенсор сообщил об ошибке записи','read err':'не читается файл на боте','encrypt err':'ошибка шифрования чанка','no file':'файл на боте не открыт','новый файл':'сессия прервана загрузкой нового файла','manual':'прервано вручную'};
+const ERRS={'timeout p1':'сенсор не ответил на старт','timeout p2':'сенсор перестал отвечать на чанки','timeout p3':'сенсор не подтвердил прошивку','no progress':'сенсор не принимает чанки','sensor fail':'сенсор сообщил об ошибке записи','read err':'не читается файл на боте','encrypt err':'ошибка шифрования чанка','no file':'файл на боте не открыт','новый файл':'сессия прервана загрузкой нового файла','manual':'прервано вручную','no RAM':'на сенсоре не хватило памяти','begin fail':'сенсор не смог открыть раздел прошивки','no first chunk':'сенсор не дождался первого чанка','stall timeout':'сенсор перестал получать данные','write fail':'сенсор не смог записать образ','size mismatch':'на сенсор пришло не столько байт','crc mismatch':'контрольная сумма образа не совпала','end fail':'сенсор забраковал образ при записи','board mismatch':'образ собран для другой платы','from bot':'сессию прервал бот'};
 const errText=e=>ERRS[e]||e;
 let file=null,poll=null,busy=false,vErr=false,sensors=[],info={},target='__self__';
 const isSelf=()=>target=='__self__';
@@ -563,6 +723,7 @@ function refresh(){
   $('go').textContent=isSelf()?'Прошить бота':'Прошить '+target;
   $('go').disabled=busy||!file||bad;
   $('fwgo')&&($('fwgo').disabled=busy||isSelf());
+  $('scfgbox').hidden=isSelf();
 }
 function setFile(f){
   if(!f)return;
@@ -778,8 +939,101 @@ $('go').onclick=async()=>{
     await startSession();
   }catch(e){st(e.message,'err');finish()}
 };
+async function loadCfg(){
+  let list;
+  try{list=await (await fetch('/config')).json()}catch(e){return}
+  const box=$('cfg');
+  box.innerHTML='';
+  for(const it of list){
+    const row=document.createElement('div');
+    row.className='cfgrow';
+    const lab=document.createElement('span');
+    lab.textContent=it.f;
+    const inp=document.createElement('input');
+    // секрет приходит маской: показываем её подсказкой, а значение оставляем пустым,
+    // чтобы случайно не записать маску вместо пароля
+    if(it.s){inp.placeholder=it.v;inp.value=''}
+    else{inp.value=(it.v=='(пусто)')?'':it.v}
+    inp.dataset.f=it.f;
+    inp.oninput=()=>{inp.dataset.dirty='1';inp.classList.add('dirty')};
+    row.appendChild(lab);row.appendChild(inp);
+    box.appendChild(row);
+  }
+}
+$('cfgsave').onclick=async()=>{
+  const body=new URLSearchParams();
+  let n=0;
+  document.querySelectorAll('#cfg input').forEach(i=>{
+    if(i.dataset.dirty){body.append(i.dataset.f,i.value);n++}
+  });
+  if(!n){st('Ничего не изменено','');return}
+  if(!confirm('Сохранить изменённых полей: '+n+'? Бот перезагрузится.'))return;
+  body.append('reboot','1');
+  try{
+    const r=await fetch('/config',{method:'POST',body});
+    const t=await r.text();
+    if(!r.ok)throw new Error(t);
+    st(t+' — ждём возврата бота…','ok');
+    waitBot();
+  }catch(e){st(e.message,'err')}
+};
+const SCFG=['name','sns_name','sns_key','lora_freq','lora_bw','lora_sf','lora_cr',
+            'lora_tx','lora_pre','lora_sync','tz','disp_bri','vext_on'];
+function buildSensorCfg(){
+  const box=$('scfg');
+  if(box.childElementCount)return;
+  for(const f of SCFG){
+    const row=document.createElement('div');
+    row.className='cfgrow';
+    const lab=document.createElement('span');
+    lab.textContent=f;
+    const inp=document.createElement('input');
+    inp.placeholder='не менять';
+    inp.dataset.f=f;
+    inp.oninput=()=>inp.classList.toggle('dirty',!!inp.value);
+    row.appendChild(lab);row.appendChild(inp);
+    box.appendChild(row);
+  }
+}
+buildSensorCfg();
+$('scfgget').onclick=async()=>{
+  if(isSelf()){st('Сначала выберите сенсор','err');return}
+  const body=new URLSearchParams();
+  body.append('target',target);
+  body.append('get','1');
+  try{
+    const r=await fetch('/sensors/config',{method:'POST',body});
+    st(await r.text(),'ok');
+  }catch(e){st(e.message,'err')}
+};
+$('scfgsend').onclick=async()=>{
+  if(isSelf()){st('Сначала выберите сенсор','err');return}
+  const body=new URLSearchParams();
+  body.append('target',target);
+  let n=0;
+  document.querySelectorAll('#scfg input').forEach(i=>{
+    if(i.value){body.append(i.dataset.f,i.value);n++}
+  });
+  const save=$('scfgsave').checked,reboot=$('scfgreboot').checked;
+  if(!n&&!save&&!reboot){st('Нечего отправлять','');return}
+  if(!confirm('Отправить '+n+' полей сенсору '+target+'?'
+      +(save?' Настройки будут сохранены.':' Без сохранения — до перезагрузки.')
+      +(reboot?' Сенсор перезагрузится.':'')))return;
+  if(save)body.append('save','1');
+  if(reboot)body.append('reboot','1');
+  $('scfgsend').disabled=true;
+  try{
+    const r=await fetch('/sensors/config',{method:'POST',body});
+    const t=await r.text();
+    if(!r.ok)throw new Error(t);
+    st(t,'ok');
+    document.querySelectorAll('#scfg input').forEach(i=>{i.value='';i.classList.remove('dirty')});
+  }catch(e){st(e.message,'err')}
+  $('scfgsend').disabled=false;
+};
 loadInfo();
 loadSensors();
+loadCfg();
 initLog();
 setInterval(loadInfo,5000);
 setInterval(loadSensors,20000);
@@ -796,6 +1050,17 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang='ru'><h
 <label>Куда прошиваем</label>
 <div id='targets'></div>
 <div class='row'><button id='ask' class='sec sm grow'>Опросить сенсоры</button></div>
+<details class='cfg' id='scfgbox' hidden><summary>Настройки сенсора по радио</summary>
+<div id='scfg'></div>
+<div class='cfghint'>Заполняйте только те поля, которые меняете. Сенсор применяет их в памяти,
+в NVS они попадут лишь при отметке «сохранить» — до этого всё чинится снятием питания.
+Смена имени, ключа канала или параметров радио уводит сенсор из сети: он вернётся, только
+если настройки совпадут с ботом. Ответы сенсора видны в журнале справа.</div>
+<label class='chk'><input type='checkbox' id='scfgsave' checked> сохранить в NVS</label>
+<label class='chk'><input type='checkbox' id='scfgreboot'> перезагрузить после сохранения</label>
+<div class='row'><button id='scfgget' class='sec sm grow'>Запросить текущие</button>
+<button id='scfgsend' class='sec sm grow'>Отправить</button></div>
+</details>
 <div id='drop'>&#128190; <span id='hint'></span><div id='fname'></div><div id='fver'></div></div>
 <input id='file' type='file' hidden>
 <div id='fw' class='fw' hidden></div>
@@ -807,6 +1072,12 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang='ru'><h
 <button id='ab' class='sec' hidden>Прервать</button>
 </div>
 <div id='st'></div>
+<details class='cfg'><summary>Настройки бота</summary>
+<div id='cfg'></div>
+<div class='cfghint'>Поле с подсказкой «задано» — пароль или ключ: оставьте пустым, чтобы не менять.
+Параметры радио должны совпадать у всех узлов сети. После сохранения бот перезагрузится.</div>
+<button id='cfgsave' class='sec sm' style='margin-top:8px;width:100%'>Сохранить и перезагрузить</button>
+</details>
 <div class='ft'>MeshBot v__VER__ · <a href='/selftest' target='_blank'>проверить LittleFS</a></div>
 </section>
 <section class='card'>
@@ -830,16 +1101,13 @@ void otaHandleJs()  { sendStatic("application/javascript; charset=utf-8", PAGE_J
 
 void otaHandleRoot() {
     String page = FPSTR(PAGE_HTML);
-    page.replace("__NAME__", DEVICE_NAME);
+    page.replace("__NAME__", cfg.name);
     page.replace("__VER__", FW_VERSION);
+    // сам HTML не кэшируем: он ссылается на css/js с версией в адресе,
+    // и после обновления бота страница должна прийти заново
+    otaServer.sendHeader("Cache-Control", "no-cache");
     otaServer.sendHeader("Connection", "close");
     otaServer.send(200, "text/html", page);
-    #if HAS_OLED
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("OTA page open");
-    display.display();
-    #endif
 }
 
 // После неудачной самопрошивки возвращаем радио и усилитель, иначе бот оглохнет до перезагрузки
@@ -851,11 +1119,17 @@ static void otaSelfUpdateResume() {
     isListening = true;
 }
 
+// Маркер платы в принимаемом образе и причина отказа для ответа странице
+static FwScan otaSelfScan;
+static char otaSelfErr[64] = "";
+
 void otaHandleUpdate() {
     HTTPUpload& up = otaServer.upload();
     switch (up.status) {
     case UPLOAD_FILE_START:
         Serial.printf("\n[OTA] загрузка: %s\n", up.filename.c_str());
+        fwScanReset(&otaSelfScan);
+        otaSelfErr[0] = 0;
         #if HAS_OLED
         display.clearDisplay();
         display.setCursor(0, 0);
@@ -873,11 +1147,29 @@ void otaHandleUpdate() {
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
         break;
     case UPLOAD_FILE_WRITE:
-        if (Update.isRunning() && Update.write(up.buf, up.currentSize) != up.currentSize) {
-            Update.printError(Serial);
+        if (Update.isRunning()) {
+            fwScanFeed(&otaSelfScan, up.buf, up.currentSize);
+            if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
         }
         break;
     case UPLOAD_FILE_END:
+    {
+        // Образ чужой платы не запустится, а снимать его придётся USB-кабелем,
+        // поэтому до применения прошивки проверяем маркер.
+        int verdict = fwScanVerdict(&otaSelfScan);
+        if (verdict < 0) {
+            snprintf(otaSelfErr, sizeof(otaSelfErr), "образ платы %s, а это " BOARD_CODE,
+                     otaSelfScan.other);
+            slog("[OTA] отклонено: %s\n", otaSelfErr);
+            Update.abort();
+            #if HAS_OLED
+            display.println("WRONG BOARD!");
+            display.display();
+            #endif
+            otaSelfUpdateResume();
+            break;
+        }
+        if (verdict == 0) slog("[OTA] в образе нет маркера платы — прошиваем как есть\n");
         if (Update.end(true)) {
             Serial.printf("[OTA] OK, %u bytes, reboot...\n", (unsigned)up.totalSize);
             #if HAS_OLED
@@ -895,6 +1187,7 @@ void otaHandleUpdate() {
         #endif
         otaSelfUpdateResume();
         break;
+    }
     case UPLOAD_FILE_ABORTED:
         Update.abort();
         otaSelfUpdateResume();
@@ -1075,7 +1368,8 @@ void setupOtaServer() {
     otaServer.on("/", HTTP_GET, otaHandleRoot);
     otaServer.on("/update", HTTP_POST, []() {
         otaServer.sendHeader("Connection", "close");
-        otaServer.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+        if (otaSelfErr[0]) otaServer.send(200, "text/plain", String("FAIL: ") + otaSelfErr);
+        else otaServer.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
     }, otaHandleUpdate);
     otaServer.on("/savefw", HTTP_POST, []() {
         otaServer.sendHeader("Connection", "close");
@@ -1095,6 +1389,7 @@ void setupOtaServer() {
     otaServer.on("/ota/status", HTTP_GET, otaHandleStatus);
     otaServer.on("/sensors", HTTP_GET, otaHandleSensors);
     otaServer.on("/sensors/hello", HTTP_POST, otaHandleSensorsHello);
+    otaServer.on("/sensors/config", HTTP_POST, otaHandleSensorsConfig);
     otaServer.on("/logs", HTTP_GET, []() {
         otaServer.sendHeader("X-Log-Pos", String(logTotal));
         otaServer.send(200, "text/plain; charset=utf-8", buildDiagReport());
@@ -1102,6 +1397,8 @@ void setupOtaServer() {
     otaServer.on("/logs/tail", HTTP_GET, otaHandleLogTail);
     otaServer.on("/info", HTTP_GET, otaHandleInfo);
     otaServer.on("/selftest", HTTP_GET, otaHandleSelfTest);
+    otaServer.on("/config", HTTP_GET, otaHandleConfigGet);
+    otaServer.on("/config", HTTP_POST, otaHandleConfigPost);
     otaServer.on("/style.css", HTTP_GET, otaHandleCss);
     otaServer.on("/app.js", HTTP_GET, otaHandleJs);
     otaServer.begin();
@@ -1122,6 +1419,7 @@ static size_t otaDictOfs = 0;
 static uint8_t otaWin[OTA_WINDOW][OTA_RAW_CHUNK_BYTES];   // слот = seq % OTA_WINDOW
 static uint8_t otaWinLen[OTA_WINDOW];
 static uint16_t otaWinMask = 0;          // бит i: чанк otaSeqExp+i уже в окне
+static FwScan otaImgScan;                // маркер платы в распакованном образе
 
 static void otaZFree() {
     free(otaInfl);
@@ -1135,6 +1433,7 @@ static bool otaWriteImage(const uint8_t* data, size_t n) {
         Update.printError(Serial);
         return false;
     }
+    fwScanFeed(&otaImgScan, data, n);
     otaCrcAcc = crc32_upd(otaCrcAcc, data, n);
     otaGot += n;
     return true;
@@ -1245,6 +1544,12 @@ void otaHandleRawSensor(const uint8_t* buf, int len) {
             otaRawFail("crc mismatch");
             return;
         }
+        // прошивка другой платы не стартует, и сенсор придётся снимать и шить по USB
+        if (fwScanVerdict(&otaImgScan) < 0) {
+            Serial.printf("[OTA] образ платы %s, а это " BOARD_CODE " — отказ\n", otaImgScan.other);
+            otaRawFail("board mismatch");
+            return;
+        }
         if (!Update.end(true)) {
             Update.printError(Serial);
             otaRawFail("end fail");
@@ -1286,6 +1591,7 @@ void otaSensorDraw() {
 }
 
 void otaSensorAbort(const char* why) {
+    bool wasFast = otaFastMode;
     if (otaFastMode) {
         Serial.printf("[OTA] быстрый канал: принято кадров %u, ошибок приёма %u\n",
                       (unsigned)fastRxFrames, (unsigned)fastRxErrors);
@@ -1293,6 +1599,13 @@ void otaSensorAbort(const char* why) {
     radioSetNormalConfig();
     otaFastMode = false;
     Serial.printf("[OTA] abort (%s), остаёмся на текущей прошивке\n", why);
+    // Пока мы не уходили на быстрый канал, бот слушает штатный и ждёт ответа. Без
+    // этого сообщения он увидит лишь таймаут и не покажет настоящую причину.
+    if (!wasFast && otaGotStart && sensorChannelIdx >= 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "ota:fail:%s", why);
+        sensorSendMsg(msg);
+    }
     Update.abort();
     otaZFree();
     otaWinMask = 0;
@@ -1333,7 +1646,7 @@ void otaSensorHandle() {
         int p = rest.indexOf(':');
         if (p <= 0) return;
         String target = rest.substring(0, p);
-        if (target != DEVICE_NAME) return;
+        if (target != cfg.name) return;
         rest = rest.substring(p + 1);
         int p2 = rest.indexOf(':');
         if (p2 <= 0) return;
@@ -1352,6 +1665,7 @@ void otaSensorHandle() {
         otaZFree();
         otaStreamLen = zsize;
         otaWinMask = 0;
+        fwScanReset(&otaImgScan);
         otaDictOfs = 0;
         otaInfl = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
         otaDict = (uint8_t*)malloc(TINFL_LZ_DICT_SIZE);
@@ -1362,7 +1676,7 @@ void otaSensorHandle() {
             otaSensorAbort("begin fail");
             return;
         }
-        Serial.printf("[OTA] start %s: %u байт crc=%08X\n", DEVICE_NAME, total, crc);
+        Serial.printf("[OTA] start %s: %u байт crc=%08X\n", cfg.name.c_str(), total, crc);
         otaSensorDraw();
         // ackstart уходит на штатном конфиге; бот после него ждёт OTA_FAST_SETTLE_MS.
         sensorSendMsg(OTA_ACKSTART, 20);

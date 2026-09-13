@@ -240,6 +240,24 @@
         return utf8cp866::processByte(*this, _u8, c, 1, 1, 1);
       }
       void setPower(bool on) { ssd1306_command(on ? 0xAF : 0xAE); }
+      // Яркость: контраст (0x81) и уровень отключения VCOMH (0xDB). Штатный dim(false)
+      // ставит контраст всего 0xCF, а 0xDB по умолчанию 0x20 — панель светит заметно
+      // слабее, чем может.
+      void setBrightness(uint8_t v) {
+        // Порядок и формула как в библиотеке, которую используют Meshtastic и MeshCore:
+        // яркость раскладывается на контраст, предзаряд и уровень VCOMH, а в конце
+        // обязательно идут resume/normal/display-on — без них панель после записи
+        // регистров может остаться погашенной.
+        uint8_t contrast  = (v < 128) ? (uint8_t)(v * 1.171f) : (uint8_t)(v * 1.171f - 43);
+        uint8_t precharge = (v == 0) ? 0x00 : 0xF1;
+        uint8_t comdetect = v / 8;
+        ssd1306_command(0xD9); ssd1306_command(precharge);
+        ssd1306_command(0x81); ssd1306_command(contrast);
+        ssd1306_command(0xDB); ssd1306_command(comdetect);
+        ssd1306_command(0xA4);   // выводить содержимое ОЗУ
+        ssd1306_command(0xA6);   // без инверсии
+        ssd1306_command(0xAF);   // экран включён
+      }
     private:
       utf8cp866::Decoder _u8;
     };
@@ -258,6 +276,7 @@
     void clearDisplay(void) {}
     void display(void) {}
     void dim(bool) {}
+    void setBrightness(uint8_t) {}
     void setPower(bool) {}
   };
 
@@ -267,6 +286,9 @@
 // SH1106/stub paths where the Adafruit_SSD1306 header is not included.
 #ifndef SSD1306_WHITE
   #define SSD1306_WHITE 1
+#endif
+#ifndef SSD1306_BLACK
+  #define SSD1306_BLACK 0
 #endif
 #ifndef SSD1306_SWITCHCAPVCC
   #define SSD1306_SWITCHCAPVCC 1
