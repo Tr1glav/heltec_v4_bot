@@ -190,14 +190,22 @@ bool fwFetchSensorImage(const String& url) {
 
 void fwUpdateTick() {
     if (!wifiConnected || !cfgReady()) return;
+    // Пока идёт прошивка, не проверяем и не начинаем ничего нового: сессия в эфире одна,
+    // и вклиниваться в неё нельзя.
+    if (otaSessionActive()) return;
+
     static unsigned long lastCheck = 0;
-    if (lastCheck != 0 && millis() - lastCheck < FW_CHECK_INTERVAL_MS) return;
+    static unsigned long interval = FW_CHECK_INTERVAL_MS;
+    if (lastCheck != 0 && millis() - lastCheck < interval) return;
     lastCheck = millis();
+    interval = FW_CHECK_INTERVAL_MS;
     if (!fwCheckLatest()) return;
     if (!cfg.autoUpd) return;
 
-    // Сначала сенсоры: обновлять себя значит перезагрузиться и потерять сессию
-    if (fwLatest.otazUrl.length() > 0 && !otaSessionActive()) {
+    // Сначала сенсоры: обновление себя означает перезагрузку и потерю сессии.
+    // Берём ровно один сенсор за проход — прошивка по радио занимает эфир целиком,
+    // и параллельно обновлять несколько физически нельзя.
+    if (fwLatest.otazUrl.length() > 0) {
         for (int i = 0; i < sensorDeviceDiscCount; i++) {
             if (!sensorOnlineNow[i] || sensorFwVersion[i].length() == 0) continue;
             if (fwVersionCmp(fwLatest.version, sensorFwVersion[i]) <= 0) continue;
@@ -206,12 +214,12 @@ void fwUpdateTick() {
             slog("[FW] сенсор %s: %s -> %s\n", sensorDeviceDisc[i].c_str(),
                  sensorFwVersion[i].c_str(), fwLatest.version.c_str());
             if (fwFetchSensorImage(fwLatest.otazUrl) && otaStartSession(sensorDeviceDisc[i])) {
-                return;   // одна сессия за раз
+                interval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
+                return;
             }
         }
     }
-    if (fwLatest.binUrl.length() > 0 && fwVersionCmp(fwLatest.version, FW_VERSION) > 0
-        && !otaSessionActive()) {
+    if (fwLatest.binUrl.length() > 0 && fwVersionCmp(fwLatest.version, FW_VERSION) > 0) {
         fwSelfUpdate(fwLatest.binUrl);
     }
 }

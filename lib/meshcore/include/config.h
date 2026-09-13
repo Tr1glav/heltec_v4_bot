@@ -190,6 +190,9 @@ enum {
 #define FW_RELEASE_API "https://api.github.com/repos/Tr1glav/meshcore-fork/releases/latest"
 #endif
 #define FW_CHECK_INTERVAL_MS (6UL * 60 * 60 * 1000)   // раз в 6 часов
+// После обновления одного сенсора следующий ждёт не полный цикл, а этот срок: очередь
+// разбирается быстро, но по одному — эфир и сессия прошивки всё равно одни на всех.
+#define FW_RECHECK_AFTER_MS  (10UL * 60 * 1000)
 #ifndef FW_ENV
 #define FW_ENV "unknown"
 #endif

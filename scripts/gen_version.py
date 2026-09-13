@@ -1,5 +1,6 @@
 import hashlib
 import os
+import subprocess
 import time
 from SCons.Script import COMMAND_LINE_TARGETS
 
@@ -67,7 +68,26 @@ if not NO_BUMP_TARGETS & set(COMMAND_LINE_TARGETS):
         build_time = int(time.time())
     write_if_changed(VERSION_FILE, f"{major}.{minor}.{build}\n{current_hash}\n{build_time}\n")
 
+def current_branch():
+    """Имя ветки: в Actions оно есть в окружении, локально спрашиваем git."""
+    name = os.environ.get("GITHUB_REF_NAME")
+    if name:
+        return name
+    try:
+        r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                           cwd=PROJECT_DIR, capture_output=True, text=True)
+        return r.stdout.strip()
+    except OSError:
+        return ""
+
+
+# Чистый номер версии получают только сборки с релизной ветки — именно они попадают в
+# релиз. Всё остальное помечается как dev, чтобы на экране устройства сразу было видно,
+# что прошивка не из релиза. В version.txt номер остаётся без суффикса.
 version = f"{major}.{minor}.{build}"
+if not current_branch().startswith("release/"):
+    version += "dev"
+
 write_if_changed(HEADER,
                  "// Сгенерировано scripts/gen_version.py перед сборкой — не править\n"
                  "#pragma once\n"
