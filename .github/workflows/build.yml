@@ -40,7 +40,7 @@ jobs:
         run: python3 scripts/selftest.py
 
       - name: Сборка прошивок
-        run: pio run -e heltec_v3_mqtt -e heltec_v4_3_sensors
+        run: pio run -e heltec_v3_coordinator -e heltec_v4_3_sensors
 
       - name: Версия из version.txt
         id: ver

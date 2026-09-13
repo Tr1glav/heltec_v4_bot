@@ -381,7 +381,7 @@ def cmd_import_ini(args):
     data = {
         "common": common,
         "devices": {
-            "bot": {"role": "bot", "env": "heltec_v3_mqtt", "name": bot_name},
+            "bot": {"role": "bot", "env": "heltec_v3_coordinator", "name": bot_name},
             "sensor": {"role": "sensor", "env": "heltec_v4_3_sensors", "name": sensor_name},
         },
     }

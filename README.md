@@ -13,11 +13,11 @@
 
 | Плата | Окружение | Код платы | Чем прошивать |
 |---|---|---|---|
-| Heltec V3 (бот) | `heltec_v3_mqtt` | `h3` | `.bin` через страницу OTA |
+| Heltec V3 (бот) | `heltec_v3_coordinator` | `h3` | `.bin` через страницу OTA |
 | Heltec V4.3 (сенсор) | `heltec_v4_3_sensors` | `h43` | `.otaz` по воздуху |
 
 ```bash
-pio run -e heltec_v3_mqtt -e heltec_v4_3_sensors   # сборка
+pio run -e heltec_v3_coordinator -e heltec_v4_3_sensors   # сборка
 pio run -e heltec_v4_3_sensors -t upload           # прошивка по USB
 python3 scripts/selftest.py                        # проверки на ПК, без железа
 ```
