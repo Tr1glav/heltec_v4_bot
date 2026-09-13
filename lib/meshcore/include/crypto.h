@@ -19,3 +19,10 @@ int decryptRaw(const uint8_t* secret32, const uint8_t* mac, const uint8_t* ciphe
 int privateKeyTo16(const String& keyb64, uint8_t key16[16]);
 
 void jsonEscape(const char* in, char* out, size_t outlen);
+
+// Печать вещественных БЕЗ %f. Формат с плавающей точкой тянет в образ ~35 КБ newlib:
+// float-вариант vfprintf, dtoa и общий вспомогательный код, который заодно затаскивает
+// scanf, хотя мы его нигде не вызываем. Здесь печатаем целую и дробную части целыми.
+char* fmtFix(float v, uint8_t dec, char* buf, size_t n);
+// Разбор числа без strtod по той же причине
+float parseFixed(const char* s);

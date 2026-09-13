@@ -118,6 +118,33 @@ int privateKeyTo16(const String& keyb64, uint8_t key16[16]) {
     return 1;                              // PSK-ключ
 }
 
+char* fmtFix(float v, uint8_t dec, char* buf, size_t n) {
+    if (n == 0) return buf;
+    long scale = 1;
+    for (uint8_t i = 0; i < dec; i++) scale *= 10;
+    long x = (long)(v * scale + (v >= 0 ? 0.5f : -0.5f));
+    const char* sign = "";
+    if (x < 0) { x = -x; sign = "-"; }
+    if (dec == 0) snprintf(buf, n, "%s%ld", sign, x);
+    else          snprintf(buf, n, "%s%ld.%0*ld", sign, x / scale, (int)dec, x % scale);
+    return buf;
+}
+
+float parseFixed(const char* s) {
+    while (*s == ' ') s++;
+    bool neg = (*s == '-');
+    if (neg || *s == '+') s++;
+    long ip = 0;
+    while (*s >= '0' && *s <= '9') ip = ip * 10 + (*s++ - '0');
+    float frac = 0.0f, scale = 0.1f;
+    if (*s == '.' || *s == ',') {
+        s++;
+        while (*s >= '0' && *s <= '9') { frac += (*s++ - '0') * scale; scale *= 0.1f; }
+    }
+    float v = (float)ip + frac;
+    return neg ? -v : v;
+}
+
 void jsonEscape(const char* in, char* out, size_t outlen) {
     size_t n = 0;
     for (size_t i = 0; in[i] != 0 && n + 3 < outlen; i++) {

@@ -1,5 +1,6 @@
 #include "config.h"
 #include "globals.h"
+#include "crypto.h"   // fmtFix: печать чисел без float-printf
 #include "radio.h"
 
 void rearmRadioAGC() {
@@ -58,9 +59,10 @@ bool initLoRa() {
     // Вызов begin() БЕЗ параметра TCXO.
     // RadioLib возьмёт значение из макроса SX126X_DIO3_TCXO_VOLTAGE,
     // который мы определим в platformio.ini.
-    Serial.printf("[RADIO] %.4f МГц BW %.1f SF%u CR%u sync 0x%02X %d дБм\n",
-                  (double)cfg.loraFreq, (double)cfg.loraBw, cfg.loraSf, cfg.loraCr,
-                  cfg.loraSync, cfg.loraTx);
+    char fr[16], bw[12];
+    Serial.printf("[RADIO] %s МГц BW %s SF%u CR%u sync 0x%02X %d дБм\n",
+                  fmtFix(cfg.loraFreq, 4, fr, sizeof(fr)), fmtFix(cfg.loraBw, 1, bw, sizeof(bw)),
+                  cfg.loraSf, cfg.loraCr, cfg.loraSync, cfg.loraTx);
     int state = radio.begin(
         cfg.loraFreq, cfg.loraBw, (uint8_t)cfg.loraSf, (uint8_t)cfg.loraCr,
         (uint8_t)cfg.loraSync, (int8_t)cfg.loraTx, (uint16_t)cfg.loraPre, 1.8

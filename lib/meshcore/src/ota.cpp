@@ -191,7 +191,9 @@ void otaDrawProgress() {
     display.printf("Pkts: %d", packetCount);
     // Качество связи по последнему принятому пакету (ack/nack сенсора)
     display.setCursor(0, 54);
-    display.printf("RSSI:%.0f SNR:%.0f", lastRSSI, lastSNR);
+    char pr[12], ps[12];
+    display.printf("RSSI:%s SNR:%s", fmtFix(lastRSSI, 0, pr, sizeof(pr)),
+                   fmtFix(lastSNR, 0, ps, sizeof(ps)));
     display.display();
     #endif
 }
@@ -1607,7 +1609,9 @@ void otaSensorDraw() {
     display.printf("Pkts: %d", packetCount);
     // Качество связи: RSSI/SNR последнего принятого чанка
     display.setCursor(0, 54);
-    display.printf("RSSI:%.0f SNR:%.0f", lastRSSI, lastSNR);
+    char pr[12], ps[12];
+    display.printf("RSSI:%s SNR:%s", fmtFix(lastRSSI, 0, pr, sizeof(pr)),
+                   fmtFix(lastSNR, 0, ps, sizeof(ps)));
     display.display();
     #endif
 }
@@ -1704,7 +1708,7 @@ void otaSensorHandle() {
         sensorSendMsg(OTA_ACKSTART, 20);
         radioSetFastConfig();
         otaFastMode = true;
-        Serial.printf("[OTA] fast config: FSK %.0f кбит/с\n", (double)OTA_FSK_BR);
+        Serial.printf("[OTA] fast config: FSK %d кбит/с\n", (int)OTA_FSK_BR);
         return;
     }
 }

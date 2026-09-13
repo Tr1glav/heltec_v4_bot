@@ -369,7 +369,9 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     Serial.printf("From: %s\n", lastSender.c_str());
     Serial.printf("Msg: %s\n", lastMessage.c_str());
     Serial.printf("Route: %s (hops=%u)\n", lastPath[0] ? lastPath : "direct", hop_count);
-    Serial.printf("RSSI: %.1f dBm, SNR: %.1f dB\n", lastRSSI, lastSNR);
+    char r1[12], s1[12];
+    Serial.printf("RSSI: %s dBm, SNR: %s dB\n", fmtFix(lastRSSI, 1, r1, sizeof(r1)),
+                  fmtFix(lastSNR, 1, s1, sizeof(s1)));
 
     lastRxDisplay = millis();
 
@@ -383,7 +385,9 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         display.setCursor(0, 0);
         display.println(lastChannelName.c_str());
         display.printf("From: %s\n", lastSender.c_str());
-        display.printf("RSSI:%.0f SNR:%.0f\n", lastRSSI, lastSNR);
+        char r2[12], s2[12];
+        display.printf("RSSI:%s SNR:%s\n", fmtFix(lastRSSI, 0, r2, sizeof(r2)),
+                       fmtFix(lastSNR, 0, s2, sizeof(s2)));
         if (hop_count > 0) {
             display.drawLine(0, 24, 128, 24, SSD1306_WHITE);
             display.setCursor(0, 26);
@@ -465,7 +469,8 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         // Диагностика на экран: канал приёма -> статус публикации в MQTT.
         display.drawLine(0, 48, 128, 48, SSD1306_WHITE);
         display.setCursor(0, 50);
-        if (snsPub) display.printf("SNS -> MQTT RSSI:%.0f", lastRSSI);
+        char r3[12];
+        if (snsPub) display.printf("SNS -> MQTT RSSI:%s", fmtFix(lastRSSI, 0, r3, sizeof(r3)));
         else        display.printf("SNS RX, MQTT %s", wifiConnected ? "off" : "no-wifi");
         display.display();
         #else
@@ -625,15 +630,15 @@ int sendFrame(int chIdx, const uint8_t* frame, int f) {
     return txFrame((uint8_t*)frame, f);
 }
 
-void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs) {
-    for (int i = 0; i < 3; i++) {
+void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs, int repeats) {
+    for (int i = 0; i < repeats; i++) {
         if (chIdx >= 0) sendFrame(chIdx, frame, f);
         else            txFrame((uint8_t*)frame, f);
-        if (i < 2) delay(gapMs);
+        if (i < repeats - 1) delay(gapMs);
     }
 }
 
-void sensorSendMsg(const char* msg, unsigned int gapMs) {
+void sensorSendMsg(const char* msg, unsigned int gapMs, int repeats) {
     if (sensorChannelIdx < 0) {
         Serial.printf("[SNS] sensor channel not configured, cannot send \"%s\"\n", msg);
         return;
@@ -641,7 +646,7 @@ void sensorSendMsg(const char* msg, unsigned int gapMs) {
     uint8_t frame[256];
     int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame));
     if (f <= 0) return;
-    floodSend3(-1, frame, f, gapMs);
+    floodSend3(-1, frame, f, gapMs, repeats);
     Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
     #ifdef SENSOR_NODE
     sensorLastSent = msg;
@@ -657,8 +662,9 @@ void sensorSendHello() {
     char msg[64];
     #if HAS_BATTERY
     if (batteryPresent()) {
-        snprintf(msg, sizeof(msg), "%s:%s:%d:%.2f:%s", SENSOR_MSG_HELLO, FW_VERSION,
-                 batteryPercent(), batteryVoltage(), BOARD_CODE);
+        char bv[12];
+        snprintf(msg, sizeof(msg), "%s:%s:%d:%s:%s", SENSOR_MSG_HELLO, FW_VERSION,
+                 batteryPercent(), fmtFix(batteryVoltage(), 2, bv, sizeof(bv)), BOARD_CODE);
     } else {
         snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
     }

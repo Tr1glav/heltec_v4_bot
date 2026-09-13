@@ -20,8 +20,9 @@ int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxle
 int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
                           const String& msg, uint8_t* frame, int maxlen);
 int sendFrame(int chIdx, const uint8_t* frame, int f);
-void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs = FLOOD_RETRY_MS);
-void sensorSendMsg(const char* msg, unsigned int gapMs = FLOOD_RETRY_MS);
+void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs = FLOOD_RETRY_MS,
+                int repeats = 3);
+void sensorSendMsg(const char* msg, unsigned int gapMs = FLOOD_RETRY_MS, int repeats = 3);
 #ifdef SENSOR_NODE
 void sensorSendHello();
 #endif

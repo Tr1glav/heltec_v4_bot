@@ -113,7 +113,9 @@ void drawIdleStatus() {
     // без аккумулятора индикатор не рисуем вовсе, чтобы не показывать "0% 0.00V"
     if (batteryPresent()) {
         char bat[16];
-        snprintf(bat, sizeof(bat), "%d%% %.2fV", batteryPercent(), batteryVoltage());
+        char v[12];
+        snprintf(bat, sizeof(bat), "%d%% %sV", batteryPercent(),
+                 fmtFix(batteryVoltage(), 2, v, sizeof(v)));
         display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
         display.print(bat);
     }

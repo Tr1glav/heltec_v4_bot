@@ -273,7 +273,9 @@ void loop() {
                 float snr = radio.getSNR();
                 // в fast-режиме лог каждого кадра стоит миллисекунды UART на кадр
                 if (pktLen > 0 && !otaFastMode) {
-                    Serial.printf("\n[RX] len=%d RSSI=%.1f SNR=%.1f ", pktLen, rssi, snr);
+                    char sr[12], ss[12];
+                    Serial.printf("\n[RX] len=%d RSSI=%s SNR=%s ", pktLen,
+                                  fmtFix(rssi, 1, sr, sizeof(sr)), fmtFix(snr, 1, ss, sizeof(ss)));
                     for (int i = 0; i < min(pktLen, 24); i++) Serial.printf("%02X", buffer[i]);
                     Serial.println();
                 }
@@ -298,8 +300,9 @@ void loop() {
                         display.setTextSize(1);
                         display.clearDisplay();
                         display.setCursor(0, 0);
-                        display.printf("RX %dB RSSI:%.0f\n", pktLen, rssi);
-                        display.printf("SNR:%.0f pkts:%d\n", snr, packetCount);
+                        char dr[12], ds[12];
+                        display.printf("RX %dB RSSI:%s\n", pktLen, fmtFix(rssi, 0, dr, sizeof(dr)));
+                        display.printf("SNR:%s pkts:%d\n", fmtFix(snr, 0, ds, sizeof(ds)), packetCount);
                         display.printf("hex:");
                         for (int i = 0; i < min(pktLen, 21); i++) display.printf("%02X", buffer[i]);
                         display.display();

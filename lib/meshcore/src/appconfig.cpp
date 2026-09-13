@@ -1,6 +1,7 @@
 #include "config.h"
 #include "appconfig.h"
 #include "globals.h"   // otaActive: во время прошивки по радио перезагружаться нельзя
+#include "crypto.h"    // fmtFix/parseFixed: печать и разбор чисел без float-printf
 #include "mesh.h"
 #include <Preferences.h>
 
@@ -142,7 +143,11 @@ static String cfgValueStr(const CfgField& fl, bool secrets) {
             char b[24];
             // 9 значащих цифр: 6 округляли бы 868.731018 до 868.731, и сверка
             // настроек внешним скриптом видела бы ложное расхождение
-            snprintf(b, sizeof(b), "%.9g", (double)(cfg.*(fl.f)));
+            // 6 знаков после точки хватает для частоты 868.731018 и не тянет float-printf
+            fmtFix(cfg.*(fl.f), 6, b, sizeof(b));
+            // хвостовые нули убираем, чтобы "62.5" не превращалось в "62.500000"
+            for (int i = (int)strlen(b) - 1; i > 0 && b[i] == '0'; i--) b[i] = 0;
+            { int i = (int)strlen(b) - 1; if (i > 0 && b[i] == '.') b[i] = 0; }
             return b;
         }
     }
@@ -187,7 +192,7 @@ static bool cfgSetField(const CfgField& fl, const String& value) {
         // strtol с основанием 0 понимает и 18, и 0x12 — слово синхронизации привычнее в hex
         case CFG_U16: cfg.*(fl.u) = (uint16_t)strtoul(value.c_str(), NULL, 0); break;
         case CFG_I16: cfg.*(fl.i) = (int16_t)strtol(value.c_str(), NULL, 0); break;
-        case CFG_FLT: cfg.*(fl.f) = value.toFloat(); break;
+        case CFG_FLT: cfg.*(fl.f) = parseFixed(value.c_str()); break;
     }
     return true;
 }
@@ -260,11 +265,11 @@ void cfgHandleMeshCfg(const String& rest) {
     if (rest == "save") {
         cfgSave();
         cfgPendingSince = 0;   // подтверждено, сторож больше не нужен
-        sensorSendMsg("cfg:ok:save");
+        sensorSendMsg("cfg:ok:save", FLOOD_RETRY_MS, 1);
         return;
     }
     if (rest == "reboot") {
-        sensorSendMsg("cfg:ok:reboot");
+        sensorSendMsg("cfg:ok:reboot", FLOOD_RETRY_MS, 1);
         delay(500);
         ESP.restart();
         return;
@@ -283,31 +288,31 @@ void cfgHandleMeshCfg(const String& rest) {
             if (v.length() == 0 || v == "(пусто)") continue;
             String piece = String(FIELDS[i].cmd) + "=" + v + ";";
             if (out.length() + piece.length() > 180) {
-                sensorSendMsg(out.c_str());
+                sensorSendMsg(out.c_str(), FLOOD_RETRY_MS, 1);
                 delay(1500);
                 out = "cfg:val:";
             }
             out += piece;
         }
-        if (out.length() > 8) sensorSendMsg(out.c_str());
+        if (out.length() > 8) sensorSendMsg(out.c_str(), FLOOD_RETRY_MS, 1);
         return;
     }
     int eq = rest.indexOf('=');
     if (eq <= 0) {
-        sensorSendMsg("cfg:err:format");
+        sensorSendMsg("cfg:err:format", FLOOD_RETRY_MS, 1);
         return;
     }
     String field = rest.substring(0, eq);
     String value = rest.substring(eq + 1);
     const CfgField* fl = cfgFind(field);
     if (!fl) {
-        sensorSendMsg(("cfg:err:" + field).c_str());
+        sensorSendMsg(("cfg:err:" + field).c_str(), FLOOD_RETRY_MS, 1);
         return;
     }
     cfgSetField(*fl, value);
     cfgPendingSince = millis();
     Serial.printf("[CFG] по радио: %s задано (жду save)\n", field.c_str());
-    sensorSendMsg(("cfg:ok:" + field).c_str());
+    sensorSendMsg(("cfg:ok:" + field).c_str(), FLOOD_RETRY_MS, 1);
 }
 
 void cfgPendingTick() {
