@@ -101,6 +101,9 @@ static unsigned long otaDoneMs = 0;    // когда сенсор подтвер
 static char otaLastErr[48] = "";       // причина последнего abort — показывается на странице
 static String otaFwName;               // имя последнего загруженного файла — для страницы
 static uint16_t otaPolls = 0;          // сколько раз пришлось переспрашивать маску за сессию
+// Замер «куда уходит время»: чтение с ФС и шифрование против собственно передачи.
+// Расчёт даёт 20 мс эфира на кадр 251 Б при 100 кбит/с, а по факту выходит втрое больше.
+static uint32_t otaUsBuild = 0, otaUsTx = 0, otaChunksSent = 0;
 static uint16_t otaRetrTotal = 0;      // сколько всего было повторов за сессию
 
 // Для сенсора годится только .otaz (формат OTA_Z_MAGIC); otaFwSize — длина сжатого потока
@@ -238,11 +241,16 @@ static void otaSendBurst() {
     bool first = true;
     for (int i = 0; i <= last; i++) {
         if (otaWinAcked & (1u << i)) continue;
+        uint32_t t0 = micros();
         int f = otaBuildRawData(frame, i == last ? RAW_TYPE_DATA_LAST : RAW_TYPE_DATA, otaSeq + i);
+        otaUsBuild += micros() - t0;
         if (f <= 0) return;
         if (!first) delay(OTA_BURST_GAP_MS);
         first = false;
+        uint32_t t1 = micros();
         rawTxFrame(frame, f);
+        otaUsTx += micros() - t1;
+        otaChunksSent++;
     }
     otaBurstMs = otaSince = millis();
 }
@@ -328,6 +336,15 @@ void otaHandleRawBot(const uint8_t* buf, int len) {
         otaDoneMs = millis();
         slog("[OTA] DONE: сенсор %s применил прошивку, CRC32 OK (кадров %u, ошибок приёма %u)\n",
              otaTarget.c_str(), (unsigned)fastRxFrames, (unsigned)fastRxErrors);
+        if (otaChunksSent > 0) {
+            unsigned long gapMs = (unsigned long)otaChunksSent * OTA_BURST_GAP_MS;
+            slog("[OTA] тайминг: кадров %lu | чтение+шифр %lu мс (%lu мкс/кадр) | "
+                 "передача %lu мс (%lu мкс/кадр) | паузы %lu мс\n",
+                 (unsigned long)otaChunksSent,
+                 (unsigned long)(otaUsBuild / 1000), (unsigned long)(otaUsBuild / otaChunksSent),
+                 (unsigned long)(otaUsTx / 1000), (unsigned long)(otaUsTx / otaChunksSent),
+                 gapMs);
+        }
         #if (HAS_OLED != 0)
         display.clearDisplay();
         display.setCursor(0, 0);
@@ -1312,6 +1329,7 @@ bool otaStartSession(const String& target) {
     otaSessionMs = millis();
     otaPolls = 0;
     otaRetrTotal = 0;
+    otaUsBuild = otaUsTx = otaChunksSent = 0;
     otaPhase = OTA_PHASE_WAIT_START;
     otaSeq = 0;
     otaSentBytes = 0;
@@ -1347,6 +1365,7 @@ void otaHandleStartOta() {
     otaSessionMs = millis();
     otaPolls = 0;
     otaRetrTotal = 0;
+    otaUsBuild = otaUsTx = otaChunksSent = 0;
     otaPhase = OTA_PHASE_WAIT_START;
     otaSeq = 0;
     otaSentBytes = 0;
