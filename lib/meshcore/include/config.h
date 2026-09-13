@@ -119,7 +119,7 @@ struct PeerEntry {
 // при теоретических 12.5 КБ/с для GFSK 100 кбит/с — ждём ответ вдвое реже.
 #define OTA_WINDOW          16
 // пауза между кадрами пачки: сенсор должен вычитать кадр и вернуться в RX до следующего
-#define OTA_BURST_GAP_MS    15
+#define OTA_BURST_GAP_MS    8
 
 // Сенсорная сторона OTA
 #define OTA_SENSOR_STALL_MS 60000

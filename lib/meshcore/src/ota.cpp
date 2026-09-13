@@ -24,7 +24,9 @@ int rawBuildFrame(uint8_t* frm, uint8_t type, uint32_t seq, const uint8_t* data,
     return f;
 }
 
-int rawTxFrame(const uint8_t* frm, int f) {
+// listenAfter=false: не возвращаться в приём сразу после кадра. Внутри пачки ответа
+// не ждём, а каждый возврат в RX стоит лишнего обмена по SPI.
+int rawTxFrame(const uint8_t* frm, int f, bool listenAfter = true) {
     otaRawDidTx = true;
     #if HAS_FEM
     digitalWrite(FEM_TX_PIN, HIGH);
@@ -34,7 +36,9 @@ int rawTxFrame(const uint8_t* frm, int f) {
     digitalWrite(FEM_TX_PIN, LOW);
     #endif
     if (st != RADIOLIB_ERR_NONE) Serial.printf("[RAW-TX] failed %d\n", st);
-    if (radio.startReceive() != RADIOLIB_ERR_NONE) rearmRadioAGC();
+    // Замер: 34.5 мс на кадр при 20 мс эфира. Лишнее — обмены по SPI, и один из них
+    // это возврат в приём; внутри пачки он не нужен, следующий кадр уйдёт из standby.
+    if (listenAfter && radio.startReceive() != RADIOLIB_ERR_NONE) rearmRadioAGC();
     return st;
 }
 
@@ -248,7 +252,7 @@ static void otaSendBurst() {
         if (!first) delay(OTA_BURST_GAP_MS);
         first = false;
         uint32_t t1 = micros();
-        rawTxFrame(frame, f);
+        rawTxFrame(frame, f, i == last);   // в приём возвращаемся только после последнего
         otaUsTx += micros() - t1;
         otaChunksSent++;
     }
