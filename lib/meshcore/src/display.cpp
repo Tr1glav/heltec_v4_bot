@@ -70,20 +70,21 @@ static void drawPingResult() {
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.println("Проверка связи");
+    // Экран сенсора везде на английском — держим единый язык
+    display.println("LINK TEST");
     if (pingFailed) {
         display.println("");
-        display.println("ответа нет");
-        display.printf("ждали %lu с\n", PING_TIMEOUT_MS / 1000);
+        display.println("no reply");
+        display.printf("waited %lu s\n", PING_TIMEOUT_MS / 1000);
         display.display();
         return;
     }
     char a[12], b[12];
-    display.printf("ответ: %lu мс\n", pingRttMs);
-    display.printf("я слышу: %s дБм\n", fmtFix(pingRssi, 0, a, sizeof(a)));
-    display.printf("SNR: %s дБ\n", fmtFix(pingSnr, 1, b, sizeof(b)));
-    display.printf("меня: %d дБм\n", pingPeerRssi);
-    display.printf("хопов: %u%s\n", pingHops, pingHops == 0 ? " (напрямую)" : "");
+    display.printf("rtt:  %lu ms\n", pingRttMs);
+    display.printf("rx:   %s dBm\n", fmtFix(pingRssi, 0, a, sizeof(a)));
+    display.printf("snr:  %s dB\n", fmtFix(pingSnr, 1, b, sizeof(b)));
+    display.printf("peer: %d dBm\n", pingPeerRssi);
+    display.printf("hops: %u%s\n", pingHops, pingHops == 0 ? " (direct)" : "");
     display.display();
 }
 #endif
