@@ -2,6 +2,7 @@
 #include "globals.h"
 #include "crypto.h"
 #include "display.h"
+#include "companion.h"   // код сопряжения BLE на экране компаньона
 
 #ifdef SENSOR_NODE
 // "12m05s" / "3h07m" — сколько прошло с момента sinceMs
@@ -89,9 +90,34 @@ static void drawPingResult() {
 }
 #endif
 
+#ifdef COMPANION_NODE
+// Код сопряжения во весь экран: его набирают в приложении при первом подключении.
+// Цифры крупные (шрифт 18x24), потому что читать их приходится с расстояния вытянутой руки.
+static void drawBlePin() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("PAIR CODE");          // экран устройства везде на английском
+    char pin[12];
+    snprintf(pin, sizeof(pin), "%06u", (unsigned)companionBlePin());
+    display.setTextSize(3);
+    display.setCursor((128 - 6 * 18) / 2, 22);
+    display.print(pin);
+    display.setTextSize(1);
+    display.setCursor(0, 56);
+    display.print(cfgReady() ? cfg.name.c_str() : "MeshCore");
+    display.display();
+}
+#endif
+
 void drawIdleStatus() {
     #ifdef SENSOR_NODE
     if (pingShowUntil != 0 && (long)(millis() - pingShowUntil) < 0) { drawPingResult(); return; }
+    #endif
+    #ifdef COMPANION_NODE
+    // Пока телефон не подключился, экран занят кодом сопряжения: его вводят в приложении,
+    // и код меняется при каждом запуске, так что подсмотреть его можно только здесь.
+    if (!companionBleLinked()) { drawBlePin(); return; }
     #endif
     display.clearDisplay();
     display.setTextSize(1);

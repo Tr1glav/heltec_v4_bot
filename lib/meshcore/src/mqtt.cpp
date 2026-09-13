@@ -26,7 +26,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         int fl = buildGroupFrameFlood(mqttTxChannel, msg, frame, sizeof(frame));
         if (fl > 0) {
             Serial.printf("[MQTT TX] %s: %s: %s (%dB)\n", channels[mqttTxChannel].name, cfg.name.c_str(), msg, fl);
-            floodSend3(mqttTxChannel, frame, fl);
+            floodSend(mqttTxChannel, frame, fl);
         }
         return;
     }
@@ -353,11 +353,11 @@ bool publishSensorMessage() {
     bool hello = lastMessage == SENSOR_MSG_HELLO || lastMessage.startsWith(SENSOR_MSG_HELLO ":");
     // hello:<версия>:<заряд %>:<напряжение>:<код платы>; "-" = поля нет, у старых сенсоров
     // полей меньше
-    String ver, batPct, batVolt, board;
+    String ver, batPct, batVolt, board, envName;
     if (hello) {
         String rest = lastMessage.substring(strlen(SENSOR_MSG_HELLO) + 1);
-        String* fields[] = { &ver, &batPct, &batVolt, &board };
-        for (int i = 0; i < 4 && rest.length() > 0; i++) {
+        String* fields[] = { &ver, &batPct, &batVolt, &board, &envName };
+        for (int i = 0; i < 5 && rest.length() > 0; i++) {
             int p = rest.indexOf(':');
             *fields[i] = (p < 0) ? rest : rest.substring(0, p);
             rest = (p < 0) ? String() : rest.substring(p + 1);
@@ -366,6 +366,7 @@ bool publishSensorMessage() {
     }
     if (idx >= 0 && ver.length() > 0) sensorFwVersion[idx] = ver;
     if (idx >= 0 && board.length() > 0) sensorBoard[idx] = board;
+    if (idx >= 0 && envName.length() > 0) sensorEnv[idx] = envName;
     if (idx >= 0 && batPct.length() > 0) sensorBattery[idx] = batPct.toInt();
 
     if (!mqttConnected) {

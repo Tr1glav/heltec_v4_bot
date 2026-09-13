@@ -5,6 +5,7 @@
 #include "mesh.h"
 #include "display.h"
 #include "ota.h"   // slog: журнал бота, он же виден на странице
+#include "companion.h"   // очередь сообщений для телефонного приложения
 
 uint8_t* findPeerPub(uint8_t hash) {
     for (int i = 0; i < PEER_CACHE_MAX; i++) {
@@ -102,6 +103,22 @@ static void autoKey16(const char* name, uint8_t key16[16]) {
     memcpy(key16, sha, 16);
 }
 
+// Имена каналов, заведённых не из прошивки: channels[].name — указатель, поэтому
+// строка обязана пережить вызов, а не остаться во временном буфере.
+static char chanNamePool[MAX_CHANNELS][33];
+
+int channelSetSlot(int idx, const char* name, const uint8_t* key16) {
+    if (idx < 0 || idx >= MAX_CHANNELS || name == nullptr || name[0] == 0) return -1;
+    if (idx > numChannels) return -1;          // дыр в списке быть не должно
+    if (idx == numChannels) numChannels = idx + 1;
+    strncpy(chanNamePool[idx], name, 32);
+    chanNamePool[idx][32] = 0;
+    channels[idx].name = chanNamePool[idx];
+    setChannelKey(channels[idx], key16);
+    Serial.printf("[CH] канал %d: %s hash 0x%02X\n", idx, chanNamePool[idx], channels[idx].hash);
+    return idx;
+}
+
 void addChannelKey16(const char* name, const uint8_t* key16) {
     MeshChannel& ch = channels[numChannels];
     setChannelKey(ch, key16);
@@ -126,8 +143,9 @@ void deriveChannels() {
     autoKey16("#connections", key16);
     addChannelKey16("#connections", key16);
 
-    // Приватный канал MQTT-бота — из build-флагов.
-    #ifdef MQTT_ENABLED
+    // Приватный канал: нужен координатору и компаньону — в приложении это обычный
+    // чат наравне с остальными, и без него в списке каналов видно только сенсорный.
+    #if defined(MQTT_ENABLED) || defined(COMPANION_NODE)
     loadPrivateChannel();
     #endif
     // Сенсорный канал: нужен и MQTT-боту, и сенсорным платам (без WiFi),
@@ -229,6 +247,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             if (route_type == 0x00 || route_type == 0x03) o += 4;
             if (o < len) {
                 uint8_t pl = data[o++];
+                const uint8_t* advPath = &data[o];          // хэши ретрансляторов, через которые пришёл адверт
                 o += (pl & 0x3F) * (((pl >> 6) & 3) + 1);   // path bytes
                 if (o + 32 + 4 + 64 <= len) {
                     uint8_t* pub = &data[o];
@@ -245,6 +264,11 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
                     memcpy(&msg[mlen], app, applen); mlen += applen;
                     if (Ed25519::verify(sig, pub, msg, mlen)) {
                         rememberPeerPub(pub[0], pub);
+                        #ifdef COMPANION_NODE
+                        // Приложение строит список собеседников из адвертов: без этого
+                        // добавить кого-либо в контакты попросту неоткуда.
+                        companionOnAdvert(pub, app, applen, pl, advPath);
+                        #endif
                         Serial.printf("[ADV] cached pubkey for <%02X>\n", pub[0]);
                     } else {
                         Serial.printf("[ADV] bad signature for <%02X>\n", pub[0]);
@@ -364,6 +388,22 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 
     // не обрабатываем собственные сообщения (эхо собственного флуда)
     if (lastSender == cfg.name) return false;
+
+    #ifdef COMPANION_NODE
+    // Приложение должно видеть переписку, но не служебный обмен узлов между собой
+    if (chIdx >= 0 && !lastMessage.startsWith("ota:") && !lastMessage.startsWith("cfg:")
+        && !lastMessage.startsWith("time:") && !lastMessage.startsWith("ping:")
+        && !lastMessage.startsWith("pong:") && !lastMessage.startsWith(SENSOR_MSG_HELLO)) {
+        // Отправителя приложение достаёт из начала текста ("Имя: сообщение") — так
+        // устроен формат группового сообщения в сети. Мы же разбирали строку на имя и
+        // текст и отдавали только текст, поэтому в приложении сообщения были безымянными.
+        String forApp = (lastSender.length() > 0 && lastSender != "?")
+                      ? lastSender + ": " + lastMessage : lastMessage;
+        // Приложению нужен сам байт длины пути, а не число хопов: в нём закодированы и
+        // размер хэша ретранслятора, и счётчик, по нему приложение и показывает маршрут.
+        companionOnChannelText(chIdx, forApp, lastSNR, path_len);
+    }
+    #endif
 
     Serial.printf("\n=== PACKET #%d (%s) ===\n", packetCount, lastChannelName.c_str());
     Serial.printf("From: %s\n", lastSender.c_str());
@@ -541,7 +581,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
             int dl = buildPrivateTextFrame(dmSrc, peerPub, reply, frame, sizeof(frame));
             if (dl > 0) {
                 Serial.printf("\n[TX DM] to <%02X>: %s (%dB, flood x3)\n", dmSrc, reply, dl);
-                floodSend3(-1, frame, dl);
+                floodSend(-1, frame, dl);
             }
             return true;
         }
@@ -549,7 +589,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         int f = buildGroupFrameFlood(chIdx, reply, frame, sizeof(frame));
         if (f > 0) {
             Serial.printf("\n[TX] %s: %s: %s (%dB, flood x3)\n", channels[chIdx].name, cfg.name.c_str(), reply, f);
-            floodSend3(chIdx, frame, f);
+            floodSend(chIdx, frame, f);
         }
     }
     #endif  // !SENSOR_NODE (ответ на пинг/DM — только MQTT-бот)
@@ -570,7 +610,7 @@ void sendAdvert(uint8_t route_type) {
     uint8_t frame[190];
     int f = 0;
     frame[f++] = (uint8_t)((0x04 << 2) | (route_type & 0x03));  // ADVERT | route
-    frame[f++] = 0x00;  // path_len: hash_size=1, 0 хопов
+    frame[f++] = PATH_LEN_INIT;  // path_len: размер хэша и 0 хопов
 
     memcpy(frame + f, bot_pub, 32); f += 32;
     uint32_t ts = (uint32_t)time(NULL);
@@ -621,7 +661,7 @@ int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxle
     int enclen = buildGroupEnc(chIdx, msg, enc);
     if (enclen <= 0 || 3 + enclen > maxlen) return 0;
     frame[0] = 0x15;                    // GRP_TXT | ROUTE_TYPE_FLOOD
-    frame[1] = 0x00;                    // path_len: hash_size=1, 0 хопов (построится ретрансляторами)
+    frame[1] = PATH_LEN_INIT;           // размер хэша, 0 хопов (путь достроят ретрансляторы)
     frame[2] = channels[chIdx].hash;
     memcpy(frame + 3, enc, enclen);
     return 3 + enclen;
@@ -647,7 +687,7 @@ int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
 
     int f = 0;
     frame[f++] = 0x09;                       // TXT_MSG | ROUTE_TYPE_FLOOD
-    frame[f++] = 0x40;                       // path_len: hash_size=2, 0 хопов
+    frame[f++] = PATH_LEN_INIT;              // размер хэша, 0 хопов
     frame[f++] = dest_hash;
     frame[f++] = ownShortHash;
     memcpy(frame + f, enc, enclen); f += enclen;
@@ -664,7 +704,7 @@ int sendFrame(int chIdx, const uint8_t* frame, int f) {
     return txFrame((uint8_t*)frame, f);
 }
 
-void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs, int repeats) {
+void floodSend(int chIdx, const uint8_t* frame, int f, unsigned int gapMs, int repeats) {
     for (int i = 0; i < repeats; i++) {
         if (chIdx >= 0) sendFrame(chIdx, frame, f);
         else            txFrame((uint8_t*)frame, f);
@@ -680,7 +720,7 @@ void sensorSendMsg(const char* msg, unsigned int gapMs, int repeats) {
     uint8_t frame[256];
     int f = buildGroupFrameFlood(sensorChannelIdx, msg, frame, sizeof(frame));
     if (f <= 0) return;
-    floodSend3(-1, frame, f, gapMs, repeats);
+    floodSend(-1, frame, f, gapMs, repeats);
     Serial.printf("[SNS] sent \"%s\" to sensor channel\n", msg);
     #ifdef SENSOR_NODE
     sensorLastSent = msg;
@@ -693,17 +733,22 @@ void sensorSendMsg(const char* msg, unsigned int gapMs, int repeats) {
 // hello:<версия>:<заряд %>:<напряжение>:<код платы> — бот публикует эти поля в MQTT.
 // Без измерения батареи вместо значений идёт "-", чтобы позиция кода платы не съезжала.
 void sensorSendHello() {
-    char msg[64];
+    // Пятым полем идёт окружение сборки: код платы больше не определяет прошивку —
+    // сенсор и компаньон живут на одной h43, а образы у них разные.
+    char msg[96];
     #if HAS_BATTERY
     if (batteryPresent()) {
         char bv[12];
-        snprintf(msg, sizeof(msg), "%s:%s:%d:%s:%s", SENSOR_MSG_HELLO, FW_VERSION,
-                 batteryPercent(), fmtFix(batteryVoltage(), 2, bv, sizeof(bv)), BOARD_CODE);
+        snprintf(msg, sizeof(msg), "%s:%s:%d:%s:%s:%s", SENSOR_MSG_HELLO, FW_VERSION,
+                 batteryPercent(), fmtFix(batteryVoltage(), 2, bv, sizeof(bv)),
+                 BOARD_CODE, FW_ENV);
     } else {
-        snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
+        snprintf(msg, sizeof(msg), "%s:%s:-:-:%s:%s", SENSOR_MSG_HELLO, FW_VERSION,
+                 BOARD_CODE, FW_ENV);
     }
     #else
-    snprintf(msg, sizeof(msg), "%s:%s:-:-:%s", SENSOR_MSG_HELLO, FW_VERSION, BOARD_CODE);
+    snprintf(msg, sizeof(msg), "%s:%s:-:-:%s:%s", SENSOR_MSG_HELLO, FW_VERSION,
+             BOARD_CODE, FW_ENV);
     #endif
     sensorSendMsg(msg);
 }

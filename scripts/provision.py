@@ -47,6 +47,9 @@ ROLE_FIELDS = {
             "mqtt_user", "mqtt_pass", "prv_name", "prv_key", "sns_name", "sns_key",
             "tx_ch"] + RADIO_FIELDS,
     "sensor": ["name", "sns_name", "sns_key"] + RADIO_FIELDS,
+    # Компаньон — сенсорный узел плюс BLE для телефонного приложения. Приватный канал
+    # ему тоже нужен: в приложении это обычный чат, и без ключа его попросту не видно.
+    "companion": ["name", "prv_name", "prv_key", "sns_name", "sns_key"] + RADIO_FIELDS,
 }
 SECRET_FIELDS = {"wifi_pass", "mqtt_pass", "prv_key", "sns_key"}
 

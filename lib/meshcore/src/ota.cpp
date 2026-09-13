@@ -591,14 +591,18 @@ void otaHandleLogTail() {
 void otaHandleSensors() {
     String json = "[";
     for (int i = 0; i < sensorDeviceDiscCount; i++) {
-        char name[48], ver[32], board[16], item[240];
+        // Окружение сборки показываем рядом с платой: по нему автообновление выбирает
+        // файл релиза, и пустое значение означает старую прошивку узла (тогда файл
+        // подбирается по коду платы, что для компаньона дало бы образ сенсора).
+        char name[48], ver[32], board[16], env[40], item[300];
         jsonEscape(sensorDeviceDisc[i].c_str(), name, sizeof(name));
         jsonEscape(sensorFwVersion[i].c_str(), ver, sizeof(ver));
         jsonEscape(sensorBoard[i].c_str(), board, sizeof(board));
+        jsonEscape(sensorEnv[i].c_str(), env, sizeof(env));
         snprintf(item, sizeof(item),
-                 "%s{\"name\":\"%s\",\"ver\":\"%s\",\"board\":\"%s\",\"online\":%s,"
-                 "\"seen_s\":%lu,\"bat\":%d,\"rssi\":%.0f}",
-                 i ? "," : "", name, ver, board, sensorOnlineNow[i] ? "true" : "false",
+                 "%s{\"name\":\"%s\",\"ver\":\"%s\",\"board\":\"%s\",\"env\":\"%s\","
+                 "\"online\":%s,\"seen_s\":%lu,\"bat\":%d,\"rssi\":%.0f}",
+                 i ? "," : "", name, ver, board, env, sensorOnlineNow[i] ? "true" : "false",
                  (millis() - sensorLastActive[i]) / 1000, sensorBattery[i], sensorRssi[i]);
         json += item;
     }

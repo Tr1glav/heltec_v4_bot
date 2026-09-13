@@ -10,6 +10,7 @@
 #include "ota.h"
 #include "mqtt.h"
 #include "fwupdate.h"
+#include "companion.h"
 
 void initSystemClock() {
     struct timeval tv;
@@ -199,6 +200,10 @@ void setup() {
     radio.startReceive();
     isListening = true;
     lastDirectAdvertMs = lastFloodAdvertMs = millis();
+
+    #ifdef COMPANION_NODE
+    companionBegin();   // BLE поднимаем после радио: приложение может подключиться сразу
+    #endif
     
     #if HAS_OLED
     display.clearDisplay();
@@ -406,6 +411,9 @@ void loop() {
     otaSensorTick();   // mesh OTA: сторожевое время — при зависании прерываем сессию
     sensorPingTick();  // не дождались ответа на проверку связи — показать это
     cfgPendingTick();  // правки настроек по радио без "save" откатываются перезагрузкой
+    #ifdef COMPANION_NODE
+    companionTick();   // кадры от приложения разбираем здесь, а не в колбэке BLE
+    #endif
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
     // Во время OTA mesh-отправки подавляем: радио слушает raw-чанки на быстром канале.
     static unsigned long lastBtnPress = 0;

@@ -9,6 +9,9 @@ bool checkAndMarkSeen(uint8_t* data, int len);
 void addChannelKey16(const char* name, const uint8_t* key16);
 void deriveChannels();
 int findChannelByName(const char* name);
+// Завести или заменить канал в ячейке idx (idx == numChannels — добавить в конец).
+// Возвращает номер канала или -1. Сохранением занимается вызывающий.
+int channelSetSlot(int idx, const char* name, const uint8_t* key16);
 void loadPrivateChannel();
 void loadSensorChannel();
 #ifdef MQTT_ENABLED
@@ -20,9 +23,12 @@ int buildGroupFrameFlood(int chIdx, const String& msg, uint8_t* frame, int maxle
 int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
                           const String& msg, uint8_t* frame, int maxlen);
 int sendFrame(int chIdx, const uint8_t* frame, int f);
-void floodSend3(int chIdx, const uint8_t* frame, int f, unsigned int gapMs = FLOOD_RETRY_MS,
-                int repeats = 3);
-void sensorSendMsg(const char* msg, unsigned int gapMs = FLOOD_RETRY_MS, int repeats = 3);
+// Одно и то же сообщение уходит в эфир несколько раз: приёмник отбрасывает дубликаты по
+// хэшу, а лишняя копия спасает от коллизии. Двух копий достаточно — третья только занимала
+// эфир и задерживала следующую передачу.
+void floodSend(int chIdx, const uint8_t* frame, int f, unsigned int gapMs = FLOOD_RETRY_MS,
+               int repeats = 2);
+void sensorSendMsg(const char* msg, unsigned int gapMs = FLOOD_RETRY_MS, int repeats = 2);
 #ifdef SENSOR_NODE
 void sensorSendHello();
 #ifdef SENSOR_NODE

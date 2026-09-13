@@ -18,6 +18,7 @@ extern bool sensorOnlineNow[SENSOR_DEV_CACHE_MAX];
 extern bool sensorDiscPublished[SENSOR_DEV_CACHE_MAX];
 extern String sensorFwVersion[SENSOR_DEV_CACHE_MAX];
 extern String sensorBoard[SENSOR_DEV_CACHE_MAX];
+extern String sensorEnv[SENSOR_DEV_CACHE_MAX];   // окружение сборки из hello
 extern int sensorBattery[SENSOR_DEV_CACHE_MAX];
 extern float sensorRssi[SENSOR_DEV_CACHE_MAX];
 extern unsigned long timeSyncMs;

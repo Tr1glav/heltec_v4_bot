@@ -205,15 +205,19 @@ void fwUpdateTick() {
     // Сначала сенсоры: обновление себя означает перезагрузку и потерю сессии.
     // Берём ровно один сенсор за проход — прошивка по радио занимает эфир целиком,
     // и параллельно обновлять несколько физически нельзя.
-    if (fwLatest.otazUrl.length() > 0) {
+    {
         for (int i = 0; i < sensorDeviceDiscCount; i++) {
             if (!sensorOnlineNow[i] || sensorFwVersion[i].length() == 0) continue;
             if (fwVersionCmp(fwLatest.version, sensorFwVersion[i]) <= 0) continue;
-            const char* envName = fwSensorEnvForBoard(sensorBoard[i]);
-            if (envName[0] == 0) continue;
+            // Окружение берём из hello; у прошивок постарше его нет — тогда по плате
+            String envName = sensorEnv[i];
+            if (envName.length() == 0) envName = fwSensorEnvForBoard(sensorBoard[i]);
+            if (envName.length() == 0) continue;
+            String url = String(FW_RELEASE_DL) + "v" + fwLatest.version + "/"
+                       + envName + "_v" + fwLatest.version + ".otaz";
             slog("[FW] сенсор %s: %s -> %s\n", sensorDeviceDisc[i].c_str(),
                  sensorFwVersion[i].c_str(), fwLatest.version.c_str());
-            if (fwFetchSensorImage(fwLatest.otazUrl) && otaStartSession(sensorDeviceDisc[i])) {
+            if (fwFetchSensorImage(url) && otaStartSession(sensorDeviceDisc[i])) {
                 interval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
                 return;
             }

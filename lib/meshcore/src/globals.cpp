@@ -19,6 +19,7 @@ bool sensorOnlineNow[SENSOR_DEV_CACHE_MAX];
 bool sensorDiscPublished[SENSOR_DEV_CACHE_MAX]; // HA discovery сенсора отправлен в текущее подключение к брокеру
 String sensorFwVersion[SENSOR_DEV_CACHE_MAX];   // версия прошивки из hello
 String sensorBoard[SENSOR_DEV_CACHE_MAX];       // короткий код платы из hello ("h43", "h3")
+String sensorEnv[SENSOR_DEV_CACHE_MAX];         // окружение сборки: по нему берётся файл релиза
 int sensorBattery[SENSOR_DEV_CACHE_MAX];        // заряд % из hello; -1 — сенсор его не шлёт
 float sensorRssi[SENSOR_DEV_CACHE_MAX];         // RSSI последнего пакета от сенсора
 unsigned long timeSyncMs = 0;                   // millis() последнего "time:" из канала сенсоров

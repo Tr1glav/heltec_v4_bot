@@ -33,7 +33,7 @@
 #define LOCAL_TZ "Europe/Moscow UTC+3"
 
 // ===== КАНАЛЫ =====
-#define MAX_CHANNELS 4
+#define MAX_CHANNELS 8        // 4 своих + место для каналов, добавленных из приложения
 // Открытый текст группового сообщения [ts 4][type 1][«имя: »][текст]:
 // шифр ≤ 240 + MAC 2 + заголовок 3 ≤ 255 Б (лимит кадра SX1262)
 #define GROUP_TEXT_MAX_PLAIN 240
@@ -76,6 +76,15 @@ struct PeerEntry {
     uint8_t pub[32];
     uint32_t last_seen;
 };
+
+// ===== ДЛИНА ПУТИ В КАДРЕ =====
+// Старшие два бита байта path_len задают размер хэша одного ретранслятора, младшие шесть —
+// число хопов. Вся сеть обязана считать одинаково, поэтому значение одно на все платы:
+// два байта на хоп (меньше совпадений хэшей), при пути в 64 байта это максимум 32 хопа.
+#define PATH_HASH_SIZE 2
+#define PATH_LEN_INIT  ((uint8_t)((PATH_HASH_SIZE - 1) << 6))   // 0 хопов, хэш нужного размера
+
+#define COMPANION_MAX_CONTACTS 16   // список узлов, который видит приложение
 
 // ===== ИДЕНТИЧНОСТЬ НОДЫ ДЛЯ ADVERT =====
 #define ADVERT_PERIOD_MS        (5UL * 60 * 1000)
@@ -181,7 +190,7 @@ enum {
 
 // ===== ФЛУД-ОТПРАВКА =====
 #ifndef FLOOD_RETRY_MS
-#define FLOOD_RETRY_MS 100
+#define FLOOD_RETRY_MS 60     // пауза между повторами флуда
 #endif
 
 // FW_VERSION и BUILD_UNIX_TIME генерирует scripts/gen_version.py перед сборкой
@@ -205,6 +214,10 @@ enum {
 #define FW_RELEASE_API "https://api.github.com/repos/Tr1glav/meshcore-fork/releases/latest"
 #endif
 #define FW_CHECK_INTERVAL_MS (6UL * 60 * 60 * 1000)   // раз в 6 часов
+// Адрес файла собирается из имени окружения узла: <окружение>_v<версия>.otaz
+#ifndef FW_RELEASE_DL
+#define FW_RELEASE_DL "https://github.com/Tr1glav/meshcore-fork/releases/download/"
+#endif
 // После обновления одного сенсора следующий ждёт не полный цикл, а этот срок: очередь
 // разбирается быстро, но по одному — эфир и сессия прошивки всё равно одни на всех.
 #define FW_RECHECK_AFTER_MS  (10UL * 60 * 1000)
