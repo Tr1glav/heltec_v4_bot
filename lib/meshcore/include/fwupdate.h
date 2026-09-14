@@ -20,7 +20,7 @@ int fwVersionCmp(const String& a, const String& b);
 
 bool fwCheckLatest();                      // опросить GitHub, заполнить fwLatest
 bool fwSelfUpdate(const String& url);      // скачать и прошить себя
-bool fwFetchSensorImage(const String& url);// скачать .otaz в /ota.bin
+bool fwFetchNodeImage(const String& url);  // скачать .otaz узла в /ota.bin
 const char* fwSensorEnvForBoard(const String& board);
 void fwUpdateTick();                       // периодическая проверка и автообновление
 // Заявка на ручную проверку (кнопка на странице). Сама проверка идёт в главном цикле:

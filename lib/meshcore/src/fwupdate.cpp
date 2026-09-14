@@ -176,8 +176,14 @@ bool fwSelfUpdate(const String& url) {
 // проходит. Без него единичный срыв отменял всё обновление до следующей проверки.
 #define FW_DOWNLOAD_TRIES 3
 
-bool fwFetchSensorImage(const String& url) {
-    slog("[FW] образ сенсора: %s\n", url.c_str());
+// Заполняются в цикле ДО запуска задачи и после этого не меняются: так задача не читает
+// то, что цикл может переписать при очередном hello.
+static String fwFetchUrl, fwFetchTarget;
+
+bool fwFetchNodeImage(const String& url) {
+    // Узел может быть и сенсором, и компаньоном — пишем, кому именно качаем:
+    // подпись «образ сенсора» рядом со ссылкой на образ компаньона сбивает с толку.
+    slog("[FW] образ для %s: %s\n", fwFetchTarget.c_str(), url.c_str());
     if (otaFile) { otaFile.close(); otaFile = File(); }
     bool ok = false;
     File f;
@@ -221,9 +227,6 @@ static bool fwManual = false;
 enum FwNetStage : uint8_t { FW_NET_IDLE, FW_NET_BUSY, FW_NET_CHECKED, FW_NET_FETCHED };
 static volatile FwNetStage fwNetStage = FW_NET_IDLE;
 static volatile bool fwNetOk = false;
-// Заполняются в цикле ДО запуска задачи и после этого не меняются: так задача не читает
-// то, что цикл может переписать при очередном hello.
-static String fwFetchUrl, fwFetchTarget;
 
 static void fwCheckTask(void*) {
     fwNetOk = fwCheckLatest();
@@ -232,7 +235,7 @@ static void fwCheckTask(void*) {
 }
 
 static void fwFetchTask(void*) {
-    fwNetOk = fwFetchSensorImage(fwFetchUrl);
+    fwNetOk = fwFetchNodeImage(fwFetchUrl);
     fwNetStage = FW_NET_FETCHED;
     vTaskDelete(NULL);
 }
