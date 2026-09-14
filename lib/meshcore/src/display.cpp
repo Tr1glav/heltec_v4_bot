@@ -153,6 +153,19 @@ void screenTick() {
 }
 #endif
 
+#if defined(COMPANION_NODE) && HAS_OLED
+// Руна Bluetooth 7x11 в правом верхнем углу: рисуем линиями, а не шрифтом — в нашем
+// наборе такого знака нет, а картинка в памяти стоила бы больше, чем пять отрезков.
+// Показывается, только когда телефон действительно подключён и сопряжён.
+static void drawBtIcon(int x, int y) {
+    display.drawLine(x + 3, y,      x + 3, y + 10, SSD1306_WHITE);  // ствол
+    display.drawLine(x + 3, y,      x + 6, y + 3,  SSD1306_WHITE);  // верхний луч
+    display.drawLine(x + 6, y + 3,  x,     y + 7,  SSD1306_WHITE);
+    display.drawLine(x + 3, y + 10, x + 6, y + 7,  SSD1306_WHITE);  // нижний луч
+    display.drawLine(x + 6, y + 7,  x,     y + 3,  SSD1306_WHITE);
+}
+#endif
+
 void drawIdleStatus() {
     #ifdef SENSOR_NODE
     if (!screenOn) return;          // панель выключена — не тратим шину I2C впустую
@@ -217,6 +230,10 @@ void drawIdleStatus() {
         display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
         display.print(bat);
     }
+    #endif
+    #if defined(COMPANION_NODE) && HAS_OLED
+    // Значок связи с телефоном — в правом верхнем углу, чтобы не спорить с часами
+    if (companionBleLinked()) drawBtIcon(SCREEN_WIDTH - 8, 0);
     #endif
     display.display();
 }
