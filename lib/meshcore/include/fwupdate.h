@@ -23,6 +23,14 @@ bool fwSelfUpdate(const String& url);      // скачать и прошить �
 bool fwFetchNodeImage(const String& url);  // скачать .otaz узла в /ota.bin
 const char* fwSensorEnvForBoard(const String& board);
 void fwUpdateTick();                       // периодическая проверка и автообновление
+
+// Прогресс скачивания образа — читается страницей (/fw/status). Заполняется в сетевой
+// задаче скачивания, поэтому величины — volatile: их читает цикл из другого контекста.
+extern volatile uint8_t  fwDlPhase;    // 0 — загрузки нет, 1 — идёт
+extern volatile uint32_t fwDlGot;      // сколько байт дошло до флеша
+extern volatile uint32_t fwDlTotal;    // ожидаемый размер (0, если сервер его не отдал)
+extern volatile uint8_t  fwDlAttempt;  // номер попытки из общего числа
+extern volatile char     fwDlTarget[16];
 // Заявка на ручную проверку (кнопка на странице). Сама проверка идёт в главном цикле:
 // она ходит в сеть и качает образ, а это десятки секунд — выполнять такое внутри
 // обработчика запроса нельзя, иначе на это время страница перестаёт отвечать целиком.

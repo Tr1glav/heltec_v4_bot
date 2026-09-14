@@ -10,6 +10,13 @@
 
 FwLatest fwLatest;
 
+// Прогресс скачивания образа для страницы (см. fwupdate.h)
+volatile uint8_t  fwDlPhase = 0;
+volatile uint32_t fwDlGot = 0;
+volatile uint32_t fwDlTotal = 0;
+volatile uint8_t  fwDlAttempt = 0;
+volatile char     fwDlTarget[16] = "";
+
 int fwVersionCmp(const String& a, const String& b) {
     int ai = 0, bi = 0;
     for (int part = 0; part < 3; part++) {
@@ -152,6 +159,7 @@ static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr)
         return false;
     }
     int total = http.getSize();
+    if (gotOut) { fwDlTotal = total > 0 ? (uint32_t)total : 0; fwDlGot = 0; }   // для страницы
     WiFiClient* st = http.getStreamPtr();
     uint8_t buf[1024];
     int got = 0;
@@ -174,6 +182,7 @@ static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr)
         if (n <= 0) continue;
         lastData = millis();
         got += n;
+        if (gotOut) fwDlGot = (uint32_t)got;   // живьём для полосы прогресса
         if (!sink(buf, (size_t)n)) { http.end(); return false; }
     }
     http.end();
@@ -236,55 +245,45 @@ bool fwFetchNodeImage(const String& url) {
     // Освобождаем место ДО загрузки: прежний образ уже не нужен, мы идём за свежим.
     LittleFS.remove("/ota.bin");
     LittleFS.remove("/ota.bin.part");
-    // Буфер на блок файловой системы: принятое копится здесь и уходит на флеш только
-    // полными блоками (см. FS_BLOCK_BYTES). На стеке сетевой задачи ему не место.
-    uint8_t* blk = (uint8_t*)malloc(FS_BLOCK_BYTES);
-    if (!blk) { slog("[FW] не хватило памяти под буфер блока\n"); return false; }
+    // Прогресс для полосы на странице
+    for (size_t i = 0; i < sizeof(fwDlTarget) - 1 && fwFetchTarget[i]; i++) fwDlTarget[i] = fwFetchTarget[i];
+    fwDlTarget[sizeof(fwDlTarget) - 1] = 0;
+    fwDlPhase = 1;
+    fwDlGot = 0;
+    fwDlTotal = 0;
     bool ok = false;
     for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
+        fwDlAttempt = attempt;
         File f;
         uint32_t got = 0;
-        size_t fill = 0;                       // сколько байт лежит в буфере блока
-        bool opened = false, openFail = false, writeFail = false;
+        bool opened = false, openFail = false;
         ok = httpStream(url, [&](const uint8_t* d, size_t n) {
             if (!opened) {
                 f = LittleFS.open("/ota.bin.part", "w");   // только с нуля, докачек нет
                 opened = true;
                 if (!f) { openFail = true; return false; }
             }
-            while (n > 0) {
-                size_t k = FS_BLOCK_BYTES - fill;
-                if (k > n) k = n;
-                memcpy(blk + fill, d, k);
-                fill += k;
-                d += k;
-                n -= k;
-                if (fill == FS_BLOCK_BYTES) {
-                    if (f.write(blk, FS_BLOCK_BYTES) != FS_BLOCK_BYTES) { writeFail = true; return false; }
-                    fill = 0;
-                }
-            }
-            return true;
+            // Пишем кусок сети как есть, как это делает ручная загрузка через /savefw.
+            // Запись, ровно равная блоку файловой системы, на этой плате до флеша не
+            // доезжает: финальный кусок с нулевым добиванием в прошлом замирал на
+            // границе блока и файл выходил короче принятого.
+            return f.write(d, n) == n;
         }, &got);
-        if (openFail) { free(blk); slog("[FW] не открылся файл на боте\n"); return false; }
-        if (ok && f && fill > 0) {
-            // Хвост короче блока добиваем нулями и пишем полным блоком: неполный блок до
-            // флеша не доезжает. Нули после сжатого потока распаковщик узла не трогает.
-            memset(blk + fill, 0, FS_BLOCK_BYTES - fill);
-            if (f.write(blk, FS_BLOCK_BYTES) != FS_BLOCK_BYTES) writeFail = true;
-            fill = 0;
-        }
+        if (openFail) { fwDlPhase = 0; slog("[FW] не открылся файл на боте\n"); return false; }
         if (f) { f.flush(); f.close(); }
-        if (writeFail) { slog("[FW] запись на флеш не прошла\n"); ok = false; }
         if (ok) {
-            // Верим файлу на флеше, а не счётчику принятого. Ждём размер, округлённый
-            // вверх до границы блока — ровно столько мы и записали.
-            uint32_t want = ((got + FS_BLOCK_BYTES - 1) / FS_BLOCK_BYTES) * FS_BLOCK_BYTES;
+            // Верим файлу на флеше, а не счётчику принятого: короткий хвост мог уйти
+            // в отчёт, но не доехать до страницы флеша. Догонять его нулями нельзя —
+            // в потерянном хвосте лежат последние байты сжатого потока, и контрольная
+            // сумма образа перестанет сходиться. Такую попытку не засчитываем: ниже
+            // файл стирается и начнётся следующая, с чистого листа.
+            uint32_t want = got;
             File chk2 = LittleFS.open("/ota.bin.part", "r");
             uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
             if (chk2) chk2.close();
             if (sz != want) {
-                slog("[FW] в файле %u из %u байт\n", (unsigned)sz, (unsigned)want);
+                slog("[FW] в файле %u из %u байт — хвост не дошёл, качаю заново\n",
+                     (unsigned)sz, (unsigned)want);
                 ok = false;
             }
         }
@@ -296,7 +295,7 @@ bool fwFetchNodeImage(const String& url) {
             }
         }
     }
-    free(blk);
+    fwDlPhase = 0;
     if (!ok) { LittleFS.remove("/ota.bin.part"); return false; }
     LittleFS.remove("/ota.bin");
     // переименование в конце: оборванная загрузка не должна выглядеть готовой прошивкой

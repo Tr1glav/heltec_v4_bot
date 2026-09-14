@@ -6,7 +6,8 @@ const ago=s=>s<60?s+' с':s<3600?Math.floor(s/60)+' мин':Math.floor(s/3600)+'
 const upfmt=s=>s>=86400?Math.floor(s/86400)+' д '+Math.floor(s%86400/3600)+' ч':s>=3600?Math.floor(s/3600)+' ч '+Math.floor(s%3600/60)+' мин':Math.floor(s/60)+' мин';
 const ERRS={'timeout p1':'сенсор не ответил на старт','timeout p2':'сенсор перестал отвечать на чанки','timeout p3':'сенсор не подтвердил прошивку','no progress':'сенсор не принимает чанки','sensor fail':'сенсор сообщил об ошибке записи','read err':'не читается файл на боте','encrypt err':'ошибка шифрования чанка','no file':'файл на боте не открыт','новый файл':'сессия прервана загрузкой нового файла','manual':'прервано вручную','no RAM':'на сенсоре не хватило памяти','begin fail':'сенсор не смог открыть раздел прошивки','no first chunk':'сенсор не дождался первого чанка','stall timeout':'сенсор перестал получать данные','write fail':'сенсор не смог записать образ','size mismatch':'на сенсор пришло не столько байт','crc mismatch':'контрольная сумма образа не совпала','end fail':'сенсор забраковал образ при записи','board mismatch':'образ собран для другой платы','from bot':'сессию прервал бот'};
 const errText=e=>ERRS[e]||e;
-let file=null,poll=null,busy=false,vErr=false,sensors=[],info={},target='__self__';
+let file=null,poll=null,busy=false,vErr=false,sensors=[],info={},target='__self__',
+    downloading=false;
 const isSelf=()=>target=='__self__';
 function st(t,c){$('st').textContent=t;$('st').className=c||'';vErr=false}
 function bar(p,l,r){$('prog').hidden=false;$('pctv').textContent=Math.round(p);$('fill').style.width=p+'%';$('pl').textContent=l;$('pr').textContent=r||''}
@@ -21,7 +22,7 @@ function refresh(){
     else if(vErr)st('','');
   }
   $('go').textContent=isSelf()?'Прошить бота':'Прошить '+target;
-  $('go').disabled=busy||!file||bad;
+  $('go').disabled=busy||!file||bad||downloading;
   $('fwgo')&&($('fwgo').disabled=busy||isSelf());
   $('scfgbox').hidden=isSelf();
 }
@@ -224,6 +225,25 @@ function track(){
     else{st(j.err?'Ошибка: '+errText(j.err)+' ('+stats+')':'Сессия завершена','err');finish()}
   },1000);
 }
+async function fwTrack(){
+  let wasDown=false;
+  setInterval(async()=>{
+    let j;
+    try{j=await (await fetch('/fw/status')).json()}catch(e){return}
+    if(busy)return;               // полоса занята переданной по радио сессией
+    if(j.phase==1){
+      wasDown=downloading=true;
+      refresh();
+      $('ab').hidden=true;
+      const p=j.total?j.got*100/j.total:0;
+      const right=j.total?kb(j.got)+' из '+kb(j.total)+(j.attempt>1?' · попытка '+j.attempt:''):kb(j.got);
+      bar(p,'Скачиваю образ'+(j.target?' для '+j.target:''),right);
+    }else if(wasDown){
+      wasDown=downloading=false;
+      refresh();
+    }
+  },1000);
+}
 async function startSession(){
   const s=await fetch('/ota/start?target='+encodeURIComponent(target),{method:'POST'});
   if(!s.ok)throw new Error(await s.text());
@@ -348,6 +368,7 @@ loadInfo();
 loadSensors();
 loadCfg();
 initLog();
+fwTrack();
 setInterval(loadInfo,5000);
 setInterval(loadSensors,20000);
 fetch('/ota/status').then(r=>r.json()).then(j=>{if(j.phase>=1&&j.phase<=3){busy=true;$('ab').hidden=false;$('prog').hidden=false;refresh();track()}}).catch(()=>{});

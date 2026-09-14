@@ -276,6 +276,23 @@ void otaHandleFwCheck() {
                    "проверяю обновления, ход и результат — в журнале");
 }
 
+// Полоса прогресса скачивания образа: сколько байт из скольких уже легло на флеш.
+// Фаза берётся из сетевой задачи загрузки, поэтому то, что качает, и эта функция
+// живут в разных контекстах — они связаны только volatile-переменными.
+void otaHandleFwStatus() {
+    char copy[sizeof(fwDlTarget)];
+    for (size_t i = 0; i < sizeof(copy) - 1 && fwDlTarget[i]; i++) copy[i] = fwDlTarget[i];
+    copy[sizeof(copy) - 1] = 0;
+    char tgt[sizeof(copy)];
+    jsonEscape(copy, tgt, sizeof(tgt));
+    char json[192];
+    snprintf(json, sizeof(json),
+             "{\"phase\":%u,\"got\":%u,\"total\":%u,\"attempt\":%u,\"target\":\"%s\"}",
+             (unsigned)fwDlPhase, (unsigned)fwDlGot, (unsigned)fwDlTotal,
+             (unsigned)fwDlAttempt, tgt);
+    otaServer.send(200, "application/json", json);
+}
+
 void otaHandleSensorsHello() {
     if (otaSessionActive()) { otaServer.send(409, "text/plain", "идёт прошивка сенсора"); return; }
     if (sensorChannelIdx < 0) { otaServer.send(503, "text/plain", "канал сенсоров не настроен"); return; }
@@ -647,6 +664,7 @@ void setupOtaServer() {
     otaServer.on("/sensors", HTTP_GET, otaHandleSensors);
     otaServer.on("/sensors/hello", HTTP_POST, otaHandleSensorsHello);
     otaServer.on("/fw/check", HTTP_POST, otaHandleFwCheck);
+    otaServer.on("/fw/status", HTTP_GET, otaHandleFwStatus);
     otaServer.on("/sensors/config", HTTP_POST, otaHandleSensorsConfig);
     otaServer.on("/logs", HTTP_GET, []() {
         otaServer.sendHeader("X-Log-Pos", String(logTotal));
