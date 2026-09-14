@@ -209,6 +209,7 @@ bool fwFetchNodeImage(const String& url) {
     LittleFS.remove("/ota.bin");
     LittleFS.remove("/ota.bin.part");
     bool ok = false;
+    bool reformatted = false;   // раздел пересоздаём не больше одного раза за загрузку
     for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
         // Сколько уже лежит от прошлой попытки — с этого места и просим продолжить
         uint32_t have = 0;
@@ -242,7 +243,17 @@ bool fwFetchNodeImage(const String& url) {
             uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
             if (chk2) chk2.close();
             if (sz != want) {
-                slog("[FW] в файле %u из %u байт, дописываю остаток\n", (unsigned)sz, (unsigned)want);
+                slog("[FW] в файле %u из %u байт\n", (unsigned)sz, (unsigned)want);
+                // Раздел перестаёт выделять блоки после череды оборванных загрузок:
+                // свободное место он показывает, а запись возвращает ноль, и файл
+                // замирает на границе блока. Лечится только пересозданием; образ не
+                // жаль — он качается заново с релиза.
+                if (!reformatted) {
+                    slog("[FW] раздел не принимает запись, пересоздаю\n");
+                    LittleFS.format();
+                    LittleFS.begin(true);
+                    reformatted = true;
+                }
                 ok = false;
             }
         }
