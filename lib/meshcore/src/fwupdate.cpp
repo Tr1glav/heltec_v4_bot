@@ -96,8 +96,11 @@ bool fwCheckLatest() {
 }
 
 // Общая часть скачивания: тянем поток и отдаём кусками в приёмник
+// from — сколько байт уже лежит в файле: просим сервер отдать остаток. Признак partial
+// выставляется ДО первого куска, чтобы вызывающий знал, дописывать файл или начинать
+// заново: сервер вправе не понять запрос диапазона и прислать файл целиком.
 template <typename Sink>
-static bool httpStream(const String& url, Sink sink) {
+static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* partial = nullptr) {
     WiFiClientSecure cl;
     cl.setInsecure();
     HTTPClient http;
@@ -105,12 +108,16 @@ static bool httpStream(const String& url, Sink sink) {
     http.setTimeout(20000);
     if (!http.begin(cl, url)) return false;
     http.addHeader("User-Agent", "meshcore-bot");
+    if (from > 0) http.addHeader("Range", "bytes=" + String(from) + "-");
     int code = http.GET();
-    if (code != HTTP_CODE_OK) {
+    bool isPartial = (code == HTTP_CODE_PARTIAL_CONTENT);
+    if (partial) *partial = isPartial;
+    if (code != HTTP_CODE_OK && !isPartial) {
         slog("[FW] загрузка -> HTTP %d\n", code);
         http.end();
         return false;
     }
+    if (from > 0 && !isPartial) slog("[FW] сервер отдал файл целиком, качаю заново\n");
     int total = http.getSize();
     WiFiClient* st = http.getStreamPtr();
     uint8_t buf[1024];
@@ -119,7 +126,13 @@ static bool httpStream(const String& url, Sink sink) {
     while (http.connected() && (total < 0 || got < total)) {
         int avail = st->available();
         if (avail <= 0) {
-            if (millis() - lastData > 20000) { slog("[FW] обрыв загрузки\n"); http.end(); return false; }
+            if (millis() - lastData > 20000) {
+                // Сколько успело прийти — по этому видно, оборвался поток или связь
+                // вообще не установилась.
+                slog("[FW] обрыв загрузки, принято %d из %d байт\n", got, total);
+                http.end();
+                return false;
+            }
             delay(5);
             continue;
         }
@@ -130,7 +143,8 @@ static bool httpStream(const String& url, Sink sink) {
         if (!sink(buf, (size_t)n)) { http.end(); return false; }
     }
     http.end();
-    slog("[FW] принято %d байт\n", got);
+    if (isPartial) slog("[FW] докачано %d байт (было %u)\n", got, (unsigned)from);
+    else           slog("[FW] принято %d байт\n", got);
     return total < 0 || got == total;
 }
 
@@ -186,14 +200,27 @@ bool fwFetchNodeImage(const String& url) {
     slog("[FW] образ для %s: %s\n", fwFetchTarget.c_str(), url.c_str());
     if (otaFile) { otaFile.close(); otaFile = File(); }
     bool ok = false;
-    File f;
     for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
-        f = LittleFS.open("/ota.bin.part", "w");
-        if (!f) { slog("[FW] не открылся файл на боте\n"); return false; }
+        // Сколько уже лежит от прошлой попытки — с этого места и просим продолжить
+        uint32_t have = 0;
+        File chk = LittleFS.open("/ota.bin.part", "r");
+        if (chk) { have = (uint32_t)chk.size(); chk.close(); }
+        if (have > 0) slog("[FW] в файле уже %u байт, прошу остаток\n", (unsigned)have);
+
+        File f;
+        bool partial = false, opened = false, openFail = false;
         ok = httpStream(url, [&](const uint8_t* d, size_t n) {
+            if (!opened) {
+                // Режим выбираем по ответу сервера: дописываем только если он понял
+                // запрос диапазона, иначе начинаем файл заново.
+                f = LittleFS.open("/ota.bin.part", partial ? "a" : "w");
+                opened = true;
+                if (!f) { openFail = true; return false; }
+            }
             return f.write(d, n) == n;
-        });
-        f.close();
+        }, have, &partial);
+        if (openFail) { slog("[FW] не открылся файл на боте\n"); return false; }
+        if (f) f.close();
         if (!ok && attempt < FW_DOWNLOAD_TRIES) {
             slog("[FW] попытка %d не удалась, повторяю\n", attempt);
             delay(2000);
