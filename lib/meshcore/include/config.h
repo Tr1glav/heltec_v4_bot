@@ -29,6 +29,10 @@
 #endif
 
 #include "board_config.h"
+// Роли разложены на независимые признаки: features.h выводит их из ролевых флагов,
+// если окружение не задало иначе. Подключается после board_config.h — часть признаков
+// опирается на свойства платы (например HAS_OLED).
+#include "features.h"
 // Имя узла, каналы, WiFi и MQTT берутся из NVS (cfg), а не из build-флагов
 #include "appconfig.h"
 

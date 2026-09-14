@@ -203,28 +203,58 @@ bool fwFetchSensorImage(const String& url) {
 
 // Когда до следующей проверки: после начатой сессии очередь разбирается быстрее.
 static unsigned long fwNextInterval = FW_CHECK_INTERVAL_MS;
-// Самообновление, отложенное до следующего прохода цикла. Нужно только для ручного
-// запуска: прошивка себя заканчивается перезагрузкой, и если начать её прямо в
-// обработчике запроса, страница не успеет получить ответ.
+// Самообновление, отложенное до следующего прохода цикла. Прошивка себя заканчивается
+// перезагрузкой, и начинать её прямо в обработчике запроса нельзя: страница не успеет
+// получить ответ.
 static bool fwSelfPending = false;
-// Нажата кнопка «Проверить обновления». Работа делается в главном цикле, а не в
-// обработчике запроса: проверка идёт в сеть и тянет образ целиком.
+// Нажата кнопка «Проверить обновления».
 static bool fwCheckRequested = false;
+// Проверку запустила кнопка, а не расписание: тогда настройка auto_upd не учитывается.
+static bool fwManual = false;
 
-// Один и тот же ход проверки для расписания и для кнопки. manual = нажали кнопку:
-// тогда настройка auto_upd не учитывается, ведь нажатие и есть явное согласие.
-// Возвращает строку, пригодную и для журнала, и для страницы.
-static String fwUpdateRun(bool manual) {
-    if (!wifiConnected) return "нет WiFi";
-    // Пока идёт прошивка, не начинаем ничего нового: сессия в эфире одна.
-    if (otaSessionActive()) return "идёт прошивка узла";
-    if (!fwCheckLatest()) return "не удалось получить сведения о релизе";
-    if (!manual && !cfg.autoUpd) return "автообновление выключено";
+// ===== Сеть — в отдельной задаче =====
+// Опрос GitHub и особенно скачивание образа занимают десятки секунд. Пока это шло в
+// главном цикле, координатор всё это время молчал: не отвечал странице, не объявлял себя
+// в сети и не обслуживал радио — проверено, до полутора минут тишины в эфире. Поэтому
+// сетевая часть вынесена в задачу, а в цикле осталось только то, что трогает радио и
+// общие данные об узлах.
+enum FwNetStage : uint8_t { FW_NET_IDLE, FW_NET_BUSY, FW_NET_CHECKED, FW_NET_FETCHED };
+static volatile FwNetStage fwNetStage = FW_NET_IDLE;
+static volatile bool fwNetOk = false;
+// Заполняются в цикле ДО запуска задачи и после этого не меняются: так задача не читает
+// то, что цикл может переписать при очередном hello.
+static String fwFetchUrl, fwFetchTarget;
+
+static void fwCheckTask(void*) {
+    fwNetOk = fwCheckLatest();
+    fwNetStage = FW_NET_CHECKED;
+    vTaskDelete(NULL);
+}
+
+static void fwFetchTask(void*) {
+    fwNetOk = fwFetchSensorImage(fwFetchUrl);
+    fwNetStage = FW_NET_FETCHED;
+    vTaskDelete(NULL);
+}
+
+static bool fwStartNetTask(TaskFunction_t fn, const char* name) {
+    fwNetStage = FW_NET_BUSY;
+    // 16 КБ стека: рукопожатию TLS обычного размера не хватает
+    if (xTaskCreate(fn, name, 16384, nullptr, 1, nullptr) == pdPASS) return true;
+    fwNetStage = FW_NET_IDLE;
+    slog("[FW] не удалось создать задачу %s\n", name);
+    return false;
+}
+
+// Что делать с результатом проверки: выбрать узел и заказать скачивание образа либо
+// решить, что обновлять нечего. Выполняется в главном цикле — здесь читаются общие
+// данные об узлах.
+static void fwAfterCheck() {
+    if (!fwManual && !cfg.autoUpd) { slog("[FW] автообновление выключено\n"); return; }
 
     fwNextInterval = FW_CHECK_INTERVAL_MS;
     // Сначала узлы: обновление себя означает перезагрузку и потерю сессии. Берём ровно
-    // один узел за проход — прошивка по радио занимает эфир целиком, и параллельно
-    // обновлять несколько физически нельзя.
+    // один узел за проход — прошивка по радио занимает эфир целиком.
     for (int i = 0; i < sensorDeviceDiscCount; i++) {
         if (!sensorOnlineNow[i] || sensorFwVersion[i].length() == 0) continue;
         if (fwVersionCmp(fwLatest.version, sensorFwVersion[i]) <= 0) continue;
@@ -232,36 +262,45 @@ static String fwUpdateRun(bool manual) {
         String envName = sensorEnv[i];
         if (envName.length() == 0) envName = fwSensorEnvForBoard(sensorBoard[i]);
         if (envName.length() == 0) continue;
-        String url = String(FW_RELEASE_DL) + "v" + fwLatest.version + "/"
+        fwFetchTarget = sensorDeviceDisc[i];
+        fwFetchUrl = String(FW_RELEASE_DL) + "v" + fwLatest.version + "/"
                    + envName + "_v" + fwLatest.version + ".otaz";
-        slog("[FW] узел %s: %s -> %s\n", sensorDeviceDisc[i].c_str(),
+        slog("[FW] узел %s: %s -> %s, качаю образ\n", fwFetchTarget.c_str(),
              sensorFwVersion[i].c_str(), fwLatest.version.c_str());
-        if (fwFetchSensorImage(url) && otaStartSession(sensorDeviceDisc[i])) {
-            fwNextInterval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
-            return String("обновляю ") + sensorDeviceDisc[i] + ": "
-                 + sensorFwVersion[i] + " -> " + fwLatest.version;
-        }
-        return String("не удалось взять образ для ") + sensorDeviceDisc[i];
+        fwStartNetTask(fwFetchTask, "fwfetch");
+        return;
     }
     if (fwLatest.binUrl.length() > 0 && fwVersionCmp(fwLatest.version, FW_VERSION) > 0) {
-        if (manual) {
-            fwSelfPending = true;   // прошьём себя следующим проходом, после ответа странице
-            return String("ставлю на себя ") + fwLatest.version + ", устройство перезагрузится";
-        }
-        fwSelfUpdate(fwLatest.binUrl);
-        return "";
+        slog("[FW] своя прошивка устарела: %s -> %s\n", FW_VERSION, fwLatest.version.c_str());
+        fwSelfPending = true;   // прошьём себя следующим проходом
+        return;
     }
-    return String("обновлять нечего, последняя версия ") + fwLatest.version;
+    slog("[FW] обновлять нечего, последняя версия %s\n", fwLatest.version.c_str());
 }
 
 void fwUpdateTick() {
     if (!wifiConnected || !cfgReady()) return;
-    if (fwCheckRequested) {
-        fwCheckRequested = false;
-        String r = fwUpdateRun(true);
-        slog("[FW] проверка по кнопке: %s\n", r.c_str());
+
+    // Пока сетевая задача работает, в цикле делать нечего: он свободен и обслуживает
+    // страницу и радио.
+    if (fwNetStage == FW_NET_BUSY) return;
+
+    if (fwNetStage == FW_NET_CHECKED) {
+        fwNetStage = FW_NET_IDLE;
+        if (!fwNetOk) { slog("[FW] не удалось получить сведения о релизе\n"); return; }
+        fwAfterCheck();
         return;
     }
+    if (fwNetStage == FW_NET_FETCHED) {
+        fwNetStage = FW_NET_IDLE;
+        if (!fwNetOk) { slog("[FW] образ для %s взять не удалось\n", fwFetchTarget.c_str()); return; }
+        if (otaStartSession(fwFetchTarget)) {
+            fwNextInterval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
+            slog("[FW] прошиваю %s до %s\n", fwFetchTarget.c_str(), fwLatest.version.c_str());
+        }
+        return;
+    }
+
     if (fwSelfPending && !otaSessionActive()) {
         fwSelfPending = false;
         fwSelfUpdate(fwLatest.binUrl);   // отсюда возврата обычно нет: плата перезагружается
@@ -269,11 +308,18 @@ void fwUpdateTick() {
     }
     if (otaSessionActive()) return;
 
+    if (fwCheckRequested) {
+        fwCheckRequested = false;
+        fwManual = true;
+        fwStartNetTask(fwCheckTask, "fwcheck");
+        return;
+    }
+
     static unsigned long lastCheck = 0;
     if (lastCheck != 0 && millis() - lastCheck < fwNextInterval) return;
     lastCheck = millis();
-    String r = fwUpdateRun(false);
-    if (r.length() > 0) slog("[FW] %s\n", r.c_str());
+    fwManual = false;
+    fwStartNetTask(fwCheckTask, "fwcheck");
 }
 
 void fwRequestCheck() { fwCheckRequested = true; }
