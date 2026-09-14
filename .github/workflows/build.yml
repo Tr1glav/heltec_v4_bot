@@ -83,8 +83,11 @@ jobs:
           # какие файлы менялись.
           PREV=$(git tag -l 'v*' --sort=-v:refname | grep -v "^$TAG$" | head -1)
           if [ -n "$PREV" ]; then
+            # Голые номера версий выбрасываем, а у остальных срезаем приставку «vX.Y.Z: »:
+            # номер релиза уже стоит в заголовке, в списке изменений он только мешает.
             CHANGES=$(git log --no-merges --pretty=format:'- %s' "$PREV"..HEAD \
-                      | grep -vE '^- v[0-9]+\.[0-9]+\.[0-9]+$' | awk '!seen[$0]++')
+                      | grep -vE '^- v[0-9]+\.[0-9]+\.[0-9]+$' \
+                      | sed -E 's/^- v[0-9]+\.[0-9]+\.[0-9]+: /- /' | awk '!seen[$0]++')
             STAT=$(git diff --shortstat "$PREV"..HEAD)
             {
               echo "### Изменения с $PREV"
