@@ -220,3 +220,23 @@ void drawIdleStatus() {
     #endif
     display.display();
 }
+
+
+// ===== Обновление экрана статуса =====
+// Выделено из главного цикла: раз в полсекунды перерисовываем статус, но не затираем
+// только что показанное сообщение и не трогаем экран во время прошивки по радио —
+// там своя картинка с ходом сессии.
+void statusScreenTick() {
+    // Показать статус на экране (обновляем раз в 500мс)
+    if (isListening && (millis() - lastDisplayUpdate > 500)) {
+        lastDisplayUpdate = millis();
+        #ifdef SENSOR_NODE
+        bool rxScreenHeld = false;   // сенсор входящие пакеты не рисует, статус не ждёт паузы после приёма
+        #else
+        bool rxScreenHeld = millis() - lastRxDisplay <= 5000;
+        #endif
+        if (!otaFastMode && !rxScreenHeld) {
+            drawIdleStatus();
+        }
+    }
+}

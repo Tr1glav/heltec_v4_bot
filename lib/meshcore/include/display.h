@@ -1,6 +1,8 @@
 #pragma once
 #include "config.h"
 void drawIdleStatus();
+// Перерисовка статуса по расписанию — зовётся из главного цикла
+void statusScreenTick();
 #ifdef SENSOR_NODE
 // Экран узла гаснет в простое. Длинное нажатие кнопки переключает его вручную.
 void screenWake();

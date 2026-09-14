@@ -278,18 +278,7 @@ void loop() {
 
     radioRxTick();   // приём из эфира: опрос радио, разбор кадров, поддержание приёмника
 
-    // Показать статус на экране (обновляем раз в 500мс)
-    if (isListening && (millis() - lastDisplayUpdate > 500)) {
-        lastDisplayUpdate = millis();
-        #ifdef SENSOR_NODE
-        bool rxScreenHeld = false;   // сенсор входящие пакеты не рисует, статус не ждёт паузы после приёма
-        #else
-        bool rxScreenHeld = millis() - lastRxDisplay <= 5000;
-        #endif
-        if (!otaFastMode && !rxScreenHeld) {
-            drawIdleStatus();
-        }
-    }
+    statusScreenTick();   // статус на экране раз в полсекунды
 
     #ifdef MQTT_ENABLED
     coordinatorTasksTick();   // MQTT, время, доступность узлов, проверка обновлений
