@@ -231,14 +231,25 @@ bool fwFetchNodeImage(const String& url) {
             return f.write(d, n) == n;
         }, have, &partial, &got);
         if (openFail) { slog("[FW] не открылся файл на боте\n"); return false; }
-        // Сброс буфера до закрытия: последняя неполная страница кэша LittleFS не доезжала
-        // до флеша, и файл выходил кратным 4096 — короче принятого. Образ уходил в эфир
-        // обрезанным, а узел не мог распаковать хвост и отвечал «size mismatch».
+        uint32_t want = (partial ? have : 0) + got;
+        if (ok && f) {
+            // Дополняем нулями до границы блока, не закрывая файл: последний неполный
+            // блок при записи из сетевой задачи не доезжает до флеша, и размер замирает
+            // на кратном FS_BLOCK_BYTES. Полный блок фиксируется всегда, а лишние нули
+            // после сжатого потока распаковщику узла безразличны — он останавливается на
+            // конце сжатых данных (на том же свойстве держится OTA_Z_TAIL_PAD).
+            uint32_t pad = (FS_BLOCK_BYTES - (want % FS_BLOCK_BYTES)) % FS_BLOCK_BYTES;
+            want += pad;
+            static const uint8_t zeros[128] = {0};
+            while (pad > 0) {
+                size_t k = pad > sizeof(zeros) ? sizeof(zeros) : (size_t)pad;
+                if (f.write(zeros, k) != k) break;
+                pad -= k;
+            }
+        }
         if (f) { f.flush(); f.close(); }
         if (ok) {
-            // Верим файлу на флеше, а не счётчику принятого: не сошлось — не беда,
-            // следующая попытка попросит у сервера ровно недостающий остаток.
-            uint32_t want = (partial ? have : 0) + got;
+            // Верим файлу на флеше, а не счётчику принятого.
             File chk2 = LittleFS.open("/ota.bin.part", "r");
             uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
             if (chk2) chk2.close();
