@@ -8,3 +8,6 @@ void radioSetNormalConfig();
 void radioSetFastConfig();
 void rearmRadioAGC();
 int txFrame(uint8_t* frame, int f);
+
+// Опрос радио и разбор принятого — зовётся из главного цикла
+void radioRxTick();
