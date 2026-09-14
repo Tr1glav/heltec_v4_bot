@@ -364,7 +364,16 @@ void otaHandleRawBot(const uint8_t* buf, int len) {
         return;
     }
     if (type == RAW_TYPE_FAIL) {
-        otaBotAbort("sensor fail");
+        // Кадр: [BE EF][тип][seq 4][причина][crc16] — причина необязательна, у прошивок
+        // постарше её нет, поэтому оставляем прежний общий текст.
+        char why[24] = "sensor fail";
+        int n = len - 9;
+        if (n > 0) {
+            if (n > (int)sizeof(why) - 1) n = (int)sizeof(why) - 1;
+            memcpy(why, &buf[7], n);
+            why[n] = 0;
+        }
+        otaBotAbort(why);
         return;
     }
 }
@@ -1134,8 +1143,12 @@ static void otaSendWack() {
 }
 
 static void otaRawFail(const char* why) {
-    uint8_t f[16];
-    rawTxFrame(f, rawBuildFrame(f, RAW_TYPE_FAIL, 0, NULL, 0));
+    // Причину кладём прямо в кадр. Раньше он уходил пустым, координатор писал в журнал
+    // обобщённое «sensor fail», а настоящая причина (crc mismatch, end fail, write fail)
+    // оставалась в консоли узла — к которому в рабочей сети обычно не подключиться.
+    uint8_t f[48];
+    size_t n = strnlen(why, 20);
+    rawTxFrame(f, rawBuildFrame(f, RAW_TYPE_FAIL, 0, (const uint8_t*)why, n));
     otaSensorAbort(why);
 }
 

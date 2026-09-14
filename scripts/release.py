@@ -51,6 +51,38 @@ def git_try(*args):
     return r.returncode == 0, ((r.stderr or r.stdout).strip().splitlines() or [""])[-1]
 
 
+# Описание коммита по умолчанию. Голый номер версии в истории бесполезен: из таких
+# сообщений не собрать список отличий для описания релиза. Поэтому перечисляем области,
+# которых коснулась правка, — это видно из путей изменённых файлов.
+AREAS = (
+    ("lib/meshcore/src/companion", "компаньон"),
+    ("lib/meshcore/src/ota",       "OTA"),
+    ("lib/meshcore/src/mqtt",      "MQTT"),
+    ("lib/meshcore/src/mesh",      "радио"),
+    ("lib/meshcore/src/fwupdate",  "автообновление"),
+    ("lib/meshcore/src/display",   "экран"),
+    ("lib/meshcore/src/appconfig", "настройки"),
+    ("lib/meshcore/",              "прошивка"),
+    ("src/main.cpp",               "главный цикл"),
+    ("web/",                       "страница"),
+    ("scripts/",                   "скрипты"),
+    (".github/",                   "сборка"),
+    ("platformio.ini",             "сборка"),
+    ("README",                     "документация"),
+)
+
+
+def describe(files):
+    """Короткое описание правки по списку изменённых путей."""
+    names = []
+    for path in files:
+        for prefix, name in AREAS:
+            if path.startswith(prefix) and name not in names:
+                names.append(name)
+                break
+    return ", ".join(names)
+
+
 def version():
     with open(ROOT / "version.txt") as fh:
         return fh.read().split()[0]
@@ -89,7 +121,9 @@ def main():
         return
 
     if files:
-        git("commit", "-m", args.message or f"v{ver}")
+        summary = describe(files)
+        msg = args.message or (f"v{ver}: {summary}" if summary else f"v{ver}")
+        git("commit", "-m", msg)
         print(f"[release] коммит {git('rev-parse', '--short', 'HEAD')} в {branch}: файлов {len(files)}")
     else:
         git("reset", check=False)

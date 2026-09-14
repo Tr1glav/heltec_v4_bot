@@ -16,6 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Нужны вся история и теги: из них собирается список отличий от прошлого релиза.
+          # По умолчанию checkout берёт одну ревизию, и сравнивать было бы не с чем.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -70,10 +74,37 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "релиз $TAG уже существует, обновляю файлы"
             gh release upload "$TAG" firmware_output/*.bin firmware_output/*.otaz --clobber
-          else
-            gh release create "$TAG" \
-              --target "${{ github.sha }}" \
-              --title "$TAG" \
-              --notes "Прошивки версии ${{ steps.ver.outputs.version }}. Координатор — .bin (через страницу OTA), сенсор и компаньон — .otaz (уходят по радио). Автообновление ищет файл по имени окружения: <окружение>_v<версия>." \
-              firmware_output/*.bin firmware_output/*.otaz
+            exit 0
           fi
+
+          # Описание релиза — отличия от предыдущего тега. Коммиты сборки называются
+          # просто номером версии, поэтому такие строки отбрасываем: в списке остаются
+          # только осмысленные сообщения. Если их не осталось, показываем хотя бы то,
+          # какие файлы менялись.
+          PREV=$(git tag -l 'v*' --sort=-v:refname | grep -v "^$TAG$" | head -1)
+          if [ -n "$PREV" ]; then
+            CHANGES=$(git log --no-merges --pretty=format:'- %s' "$PREV"..HEAD \
+                      | grep -vE '^- v[0-9]+\.[0-9]+\.[0-9]+$' | awk '!seen[$0]++')
+            STAT=$(git diff --shortstat "$PREV"..HEAD)
+            {
+              echo "### Изменения с $PREV"
+              echo
+              if [ -n "$CHANGES" ]; then echo "$CHANGES"; else echo "- правки без отдельного описания"; fi
+              echo
+              [ -n "$STAT" ] && echo "_${STAT}_"
+            } > notes.md
+          else
+            echo "### Первый релиз" > notes.md
+          fi
+          {
+            echo
+            echo "---"
+            echo "Координатор — файл \`.bin\` (через страницу OTA), сенсор и компаньон — \`.otaz\` (уходят по радио)."
+            echo "Автообновление ищет файл по имени окружения: \`<окружение>_v<версия>\`."
+          } >> notes.md
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            firmware_output/*.bin firmware_output/*.otaz
