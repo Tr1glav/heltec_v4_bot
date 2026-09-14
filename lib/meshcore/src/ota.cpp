@@ -661,10 +661,17 @@ void otaHandleSensorsConfig() {
                    String("отправлено полей: ") + sent + ", ответы смотрите в журнале");
 }
 
-// Кнопка «Проверить обновления»: тот же ход, что у автообновления по расписанию.
+// Кнопка «Проверить обновления»: тот же ход, что у автообновления по расписанию, но
+// запускается он в главном цикле. Отвечать надо сразу: проверка ходит в сеть и качает
+// образ, и если делать это здесь, страница замолчит на всё время загрузки.
 void otaHandleFwCheck() {
-    String msg = fwUpdateNow();
-    otaServer.send(200, "text/plain; charset=utf-8", msg);
+    if (otaSessionActive()) {
+        otaServer.send(409, "text/plain; charset=utf-8", "идёт прошивка узла");
+        return;
+    }
+    fwRequestCheck();
+    otaServer.send(200, "text/plain; charset=utf-8",
+                   "проверяю обновления, ход и результат — в журнале");
 }
 
 void otaHandleSensorsHello() {

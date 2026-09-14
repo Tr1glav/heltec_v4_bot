@@ -194,6 +194,9 @@ static unsigned long fwNextInterval = FW_CHECK_INTERVAL_MS;
 // запуска: прошивка себя заканчивается перезагрузкой, и если начать её прямо в
 // обработчике запроса, страница не успеет получить ответ.
 static bool fwSelfPending = false;
+// Нажата кнопка «Проверить обновления». Работа делается в главном цикле, а не в
+// обработчике запроса: проверка идёт в сеть и тянет образ целиком.
+static bool fwCheckRequested = false;
 
 // Один и тот же ход проверки для расписания и для кнопки. manual = нажали кнопку:
 // тогда настройка auto_upd не учитывается, ведь нажатие и есть явное согласие.
@@ -240,6 +243,12 @@ static String fwUpdateRun(bool manual) {
 
 void fwUpdateTick() {
     if (!wifiConnected || !cfgReady()) return;
+    if (fwCheckRequested) {
+        fwCheckRequested = false;
+        String r = fwUpdateRun(true);
+        slog("[FW] проверка по кнопке: %s\n", r.c_str());
+        return;
+    }
     if (fwSelfPending && !otaSessionActive()) {
         fwSelfPending = false;
         fwSelfUpdate(fwLatest.binUrl);   // отсюда возврата обычно нет: плата перезагружается
@@ -254,9 +263,5 @@ void fwUpdateTick() {
     if (r.length() > 0) slog("[FW] %s\n", r.c_str());
 }
 
-String fwUpdateNow() {
-    String r = fwUpdateRun(true);
-    slog("[FW] проверка по кнопке: %s\n", r.c_str());
-    return r;
-}
+void fwRequestCheck() { fwCheckRequested = true; }
 #endif

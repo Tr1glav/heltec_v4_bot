@@ -110,7 +110,9 @@ $('fwchk').onclick=async()=>{
     const r=await fetch('/fw/check',{method:'POST'});
     const t=(await r.text()).trim();
     if(!busy)st(t||'готово',r.ok?'ok':'err');
-    await loadSensors();
+    // Проверка идёт в главном цикле и занимает десятки секунд: подтянем список узлов
+    // через некоторое время, а подробности пользователь увидит в журнале.
+    setTimeout(loadSensors,15000);
   }catch(e){if(!busy)st(e.message,'err')}
   $('fwchk').disabled=false;
 };
