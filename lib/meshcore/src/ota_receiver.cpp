@@ -284,6 +284,9 @@ void otaSensorHandle() {
         otaGot = 0; otaCrcAcc = 0xFFFFFFFF; otaSeqExp = 0;
         otaActive = true; otaGotStart = true;
         otaLastActivity = millis();
+        #if HAS_OLED
+        screenWake();   // прошивка пришла — зажигаем экран, иначе ход не видно
+        #endif
         otaZFree();
         otaStreamLen = zsize;
         otaWinMask = 0;
