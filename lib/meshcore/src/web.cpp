@@ -517,9 +517,12 @@ void otaHandleSaveFw() {
                     n.close();
                 }
                 slog("[OTA-SAVE] записано %lu байт, .otaz=%d\n", otaWriteBytes, (int)otaFwReady);
-                if (otaFwReady && otaFwSize + OTA_Z_HDR != (uint32_t)otaWriteBytes) {
+                // Сверяем с длиной потока в файле: otaFwSize учитывает ещё и хвост нулей,
+                // который дописывается в эфир, но в файле его нет (см. OTA_Z_TAIL_PAD).
+                uint32_t inFile = otaFwSize - OTA_Z_TAIL_PAD + OTA_Z_HDR;
+                if (otaFwReady && inFile != (uint32_t)otaWriteBytes) {
                     slog("[OTA-SAVE] ВНИМАНИЕ: size()=%u != writeBytes=%lu\n",
-                         (unsigned)(otaFwSize + OTA_Z_HDR), otaWriteBytes);
+                         (unsigned)inFile, otaWriteBytes);
                 }
             }
         } else {
