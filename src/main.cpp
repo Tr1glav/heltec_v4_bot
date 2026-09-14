@@ -424,11 +424,14 @@ void loop() {
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
     screenTick();      // экран гаснет в простое, будит длинное нажатие кнопки
-    // Прошивка по воздуху идёт кадрами каждые 8 мс — на это время возвращаем полную
-    // частоту, иначе узел перестаёт успевать вычитывать пачку.
+    // Полную частоту держим на всю прошивку, а не только пока открыт быстрый канал.
+    // Кадры идут каждые 8 мс, но куда важнее конец сессии: запись во флеш и проверка
+    // образа на пониженной частоте — самое подозрительное место, а узел дважды отвергал
+    // уже полностью принятый и заведомо исправный образ.
+    bool wantFastCpu = otaFastMode || otaActive;
     static bool cpuFast = false;
-    if (otaFastMode != cpuFast) {
-        cpuFast = otaFastMode;
+    if (wantFastCpu != cpuFast) {
+        cpuFast = wantFastCpu;
         setCpuFrequencyMhz(cpuFast ? CPU_MHZ_FAST : CPU_MHZ_IDLE);
         Serial.printf("[PWR] частота процессора %d МГц\n", cpuFast ? CPU_MHZ_FAST : CPU_MHZ_IDLE);
     }
