@@ -308,7 +308,7 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
         //     чтобы ответы нескольких сенсоров не столкнулись в эфире ===
         if (lastMessage == SENSOR_MSG_HELLO_REQ) {
             #ifdef SENSOR_NODE
-            sensorHelloDueMs = millis() + random(300, 4000);
+            sensorHelloDueMs = millis() + random(HELLO_REPLY_DELAY_MIN_MS, HELLO_REPLY_DELAY_MAX_MS);
             #endif
             return true;
         }
@@ -360,8 +360,9 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     bool isDirect = (route_type == 0x02 || route_type == 0x03);
     if (personalDm || (chIdx == 1 && lastMessage == "/ping") || isDirect) {
         // Ждём, пока отправитель закончит свои повторы: пока он передаёт, он нас не
-        // слышит, и ответ, посланный раньше, до него просто не дойдёт.
-        delay(PING_REPLY_DELAY_MS);
+        // слышит, и ответ, посланный раньше, до него просто не дойдёт. Задержка
+        // случайная — иначе несколько узлов отвечают разом и глушат друг друга.
+        delay(random(PING_REPLY_DELAY_MIN_MS, PING_REPLY_DELAY_MAX_MS));
 
         char reply[100];
         buildPingReply(reply, sizeof(reply), replyPath, replyHops, path_hash_size);

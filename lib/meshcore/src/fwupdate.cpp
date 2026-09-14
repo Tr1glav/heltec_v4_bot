@@ -132,9 +132,11 @@ static String fwResolveUrl(const String& url) {
     return cur;
 }
 
+// Образ тянем только целиком. Докачка с середины запрещена: склейка кусков от разных
+// ответов сервера даёт не тот поток, и контрольная сумма образа перестаёт сходиться —
+// сорвавшаяся попытка начинается с чистого листа.
 template <typename Sink>
-static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* partial = nullptr,
-                       uint32_t* gotOut = nullptr) {
+static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr) {
     String real = fwResolveUrl(url);
     WiFiClientSecure cl;
     cl.setInsecure();
@@ -143,16 +145,12 @@ static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* pa
     http.setTimeout(20000);
     if (!http.begin(cl, real)) return false;
     http.addHeader("User-Agent", "meshcore-bot");
-    if (from > 0) http.addHeader("Range", "bytes=" + String(from) + "-");
     int code = http.GET();
-    bool isPartial = (code == HTTP_CODE_PARTIAL_CONTENT);
-    if (partial) *partial = isPartial;
-    if (code != HTTP_CODE_OK && !isPartial) {
+    if (code != HTTP_CODE_OK) {
         slog("[FW] загрузка -> HTTP %d\n", code);
         http.end();
         return false;
     }
-    if (from > 0 && !isPartial) slog("[FW] сервер отдал файл целиком, качаю заново\n");
     int total = http.getSize();
     WiFiClient* st = http.getStreamPtr();
     uint8_t buf[1024];
@@ -180,8 +178,7 @@ static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* pa
     }
     http.end();
     if (gotOut) *gotOut = (uint32_t)got;
-    if (isPartial) slog("[FW] докачано %d байт (было %u)\n", got, (unsigned)from);
-    else           slog("[FW] принято %d байт\n", got);
+    slog("[FW] принято %d байт\n", got);
     return total < 0 || got == total;
 }
 
@@ -236,51 +233,70 @@ bool fwFetchNodeImage(const String& url) {
     // подпись «образ сенсора» рядом со ссылкой на образ компаньона сбивает с толку.
     slog("[FW] образ для %s: %s\n", fwFetchTarget.c_str(), url.c_str());
     if (otaFile) { otaFile.close(); otaFile = File(); }
-    // Освобождаем место ДО загрузки, а не после. Иначе рядом с новым образом всё время
-    // лежит старый, и на тесной файловой системе хвост нового просто не фиксируется:
-    // записи проходят, а размер файла остаётся кратным блоку — узел потом не досчитается
-    // конца потока. Прежний образ всё равно уже не нужен: мы идём за свежим.
+    // Освобождаем место ДО загрузки: прежний образ уже не нужен, мы идём за свежим.
     LittleFS.remove("/ota.bin");
     LittleFS.remove("/ota.bin.part");
+    // Буфер на блок файловой системы: принятое копится здесь и уходит на флеш только
+    // полными блоками (см. FS_BLOCK_BYTES). На стеке сетевой задачи ему не место.
+    uint8_t* blk = (uint8_t*)malloc(FS_BLOCK_BYTES);
+    if (!blk) { slog("[FW] не хватило памяти под буфер блока\n"); return false; }
     bool ok = false;
     for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
-        // Сколько уже лежит от прошлой попытки — с этого места и просим продолжить
-        uint32_t have = 0;
-        File chk = LittleFS.open("/ota.bin.part", "r");
-        if (chk) { have = (uint32_t)chk.size(); chk.close(); }
-        if (have > 0) slog("[FW] в файле уже %u байт, прошу остаток\n", (unsigned)have);
-
         File f;
         uint32_t got = 0;
-        bool partial = false, opened = false, openFail = false;
+        size_t fill = 0;                       // сколько байт лежит в буфере блока
+        bool opened = false, openFail = false, writeFail = false;
         ok = httpStream(url, [&](const uint8_t* d, size_t n) {
             if (!opened) {
-                // Режим выбираем по ответу сервера: дописываем только если он понял
-                // запрос диапазона, иначе начинаем файл заново.
-                f = LittleFS.open("/ota.bin.part", partial ? "a" : "w");
+                f = LittleFS.open("/ota.bin.part", "w");   // только с нуля, докачек нет
                 opened = true;
                 if (!f) { openFail = true; return false; }
             }
-            return f.write(d, n) == n;
-        }, have, &partial, &got);
-        if (openFail) { slog("[FW] не открылся файл на боте\n"); return false; }
-        uint32_t want = (partial ? have : 0) + got;
+            while (n > 0) {
+                size_t k = FS_BLOCK_BYTES - fill;
+                if (k > n) k = n;
+                memcpy(blk + fill, d, k);
+                fill += k;
+                d += k;
+                n -= k;
+                if (fill == FS_BLOCK_BYTES) {
+                    if (f.write(blk, FS_BLOCK_BYTES) != FS_BLOCK_BYTES) { writeFail = true; return false; }
+                    fill = 0;
+                }
+            }
+            return true;
+        }, &got);
+        if (openFail) { free(blk); slog("[FW] не открылся файл на боте\n"); return false; }
+        if (ok && f && fill > 0) {
+            // Хвост короче блока добиваем нулями и пишем полным блоком: неполный блок до
+            // флеша не доезжает. Нули после сжатого потока распаковщик узла не трогает.
+            memset(blk + fill, 0, FS_BLOCK_BYTES - fill);
+            if (f.write(blk, FS_BLOCK_BYTES) != FS_BLOCK_BYTES) writeFail = true;
+            fill = 0;
+        }
         if (f) { f.flush(); f.close(); }
+        if (writeFail) { slog("[FW] запись на флеш не прошла\n"); ok = false; }
         if (ok) {
-            // Верим файлу на флеше, а не счётчику принятого.
+            // Верим файлу на флеше, а не счётчику принятого. Ждём размер, округлённый
+            // вверх до границы блока — ровно столько мы и записали.
+            uint32_t want = ((got + FS_BLOCK_BYTES - 1) / FS_BLOCK_BYTES) * FS_BLOCK_BYTES;
             File chk2 = LittleFS.open("/ota.bin.part", "r");
             uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
             if (chk2) chk2.close();
             if (sz != want) {
-                slog("[FW] в файле %u из %u байт, дописываю остаток\n", (unsigned)sz, (unsigned)want);
+                slog("[FW] в файле %u из %u байт\n", (unsigned)sz, (unsigned)want);
                 ok = false;
             }
         }
-        if (!ok && attempt < FW_DOWNLOAD_TRIES) {
-            slog("[FW] попытка %d не удалась, повторяю\n", attempt);
-            delay(2000);
+        if (!ok) {
+            LittleFS.remove("/ota.bin.part");   // следующая попытка начинается с чистого листа
+            if (attempt < FW_DOWNLOAD_TRIES) {
+                slog("[FW] попытка %d не удалась, качаю заново\n", attempt);
+                delay(2000);
+            }
         }
     }
+    free(blk);
     if (!ok) { LittleFS.remove("/ota.bin.part"); return false; }
     LittleFS.remove("/ota.bin");
     // переименование в конце: оборванная загрузка не должна выглядеть готовой прошивкой
