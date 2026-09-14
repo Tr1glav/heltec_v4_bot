@@ -281,8 +281,9 @@ void otaHandleFwCheck() {
 // живут в разных контекстах — они связаны только volatile-переменными.
 void otaHandleFwStatus() {
     char copy[sizeof(fwDlTarget)];
-    for (size_t i = 0; i < sizeof(copy) - 1 && fwDlTarget[i]; i++) copy[i] = fwDlTarget[i];
-    copy[sizeof(copy) - 1] = 0;
+    size_t i = 0;
+    while (i < sizeof(copy) - 1 && fwDlTarget[i]) { copy[i] = fwDlTarget[i]; i++; }
+    copy[i] = 0;   // ноль сразу за именем: дальше в буфере мусор со стека
     char tgt[sizeof(copy)];
     jsonEscape(copy, tgt, sizeof(tgt));
     char json[192];

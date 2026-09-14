@@ -2,6 +2,7 @@
 #include "globals.h"
 #include "fwupdate.h"
 #include "ota.h"
+#include "ota_internal.h"   // otaFwName: имя скачанного образа показывает страница
 #include "mesh.h"
 
 #ifdef MQTT_ENABLED
@@ -71,7 +72,9 @@ static String jsonField(const String& src, const String& key, int from = 0) {
 bool fwCheckLatest() {
     if (!wifiConnected) return false;
     String body;
-    if (!httpGetString(FW_RELEASE_API, body, 16384)) return false;
+    // Ответ с тремя ассетами вплотную подходит к прежнему пределу в 16 КБ, а при обрезке
+    // теряется ссылка на собственный образ — самообновление молча перестаёт работать.
+    if (!httpGetString(FW_RELEASE_API, body, 32768)) return false;
 
     String tag = jsonField(body, "tag_name");
     if (tag.startsWith("v")) tag.remove(0, 1);
@@ -79,7 +82,6 @@ bool fwCheckLatest() {
 
     fwLatest.version = tag;
     fwLatest.binUrl = "";
-    fwLatest.otazUrl = "";
     // Файлы названы <окружение>_v<версия>.<тип>, поэтому своё берём по имени окружения
     String selfPrefix = String(FW_ENV) + "_v";
     int pos = 0;
@@ -94,7 +96,6 @@ bool fwCheckLatest() {
         int slash = url.lastIndexOf('/');
         String name = (slash < 0) ? url : url.substring(slash + 1);
         if (name.startsWith(selfPrefix) && name.endsWith(".bin")) fwLatest.binUrl = url;
-        if (name.endsWith(".otaz")) fwLatest.otazUrl = url;
     }
     fwLatest.checkedMs = millis();
     fwLatest.valid = true;
@@ -122,7 +123,10 @@ static String fwResolveUrl(const String& url) {
         http.addHeader("User-Agent", "meshcore-bot");
         const char* want[] = { "Location" };
         http.collectHeaders(want, 1);
-        int code = http.GET();
+        // HEAD, а не GET: тела он не тянет, а перенаправление отдаёт так же. Прежде на
+        // каждую попытку приходилось три запроса, из них один — полная загрузка, которую
+        // тут же бросали. Лишнее рукопожатие TLS било и по куче, и по стеку задачи.
+        int code = http.sendRequest("HEAD");
         if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
             code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
             code == HTTP_CODE_PERMANENT_REDIRECT) {
@@ -159,12 +163,23 @@ static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr)
         return false;
     }
     int total = http.getSize();
-    if (gotOut) { fwDlTotal = total > 0 ? (uint32_t)total : 0; fwDlGot = 0; }   // для страницы
+    if (total < 0) {
+        // Без объявленной длины полноту образа проверить нечем: обрезанный файл прошёл бы
+        // как удачный и уехал в эфир. Для прошивки это недопустимо.
+        slog("[FW] сервер не сообщил длину файла, отказ\n");
+        http.end();
+        return false;
+    }
+    if (gotOut) { fwDlTotal = (uint32_t)total; fwDlGot = 0; }   // для страницы
     WiFiClient* st = http.getStreamPtr();
-    uint8_t buf[1024];
+    // Буфер статический, не на стеке: в сетевой задаче рядом живут клиент TLS и его
+    // рукопожатие, и лишний килобайт там на вес золота. Загрузки не идут параллельно.
+    static uint8_t buf[1024];
     int got = 0;
     unsigned long lastData = millis();
-    while (http.connected() && (total < 0 || got < total)) {
+    // Сервер вправе закрыть соединение сразу за последним байтом, когда часть данных ещё
+    // лежит в буфере клиента. Выходить только по connected() — значит терять хвост.
+    while (got < total && (http.connected() || st->available() > 0)) {
         int avail = st->available();
         if (avail <= 0) {
             if (millis() - lastData > 20000) {
@@ -187,8 +202,8 @@ static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr)
     }
     http.end();
     if (gotOut) *gotOut = (uint32_t)got;
-    slog("[FW] принято %d байт\n", got);
-    return total < 0 || got == total;
+    slog("[FW] принято %d из %d байт\n", got, total);
+    return got == total;
 }
 
 bool fwSelfUpdate(const String& url) {
@@ -242,12 +257,13 @@ bool fwFetchNodeImage(const String& url) {
     // подпись «образ сенсора» рядом со ссылкой на образ компаньона сбивает с толку.
     slog("[FW] образ для %s: %s\n", fwFetchTarget.c_str(), url.c_str());
     if (otaFile) { otaFile.close(); otaFile = File(); }
-    // Освобождаем место ДО загрузки: прежний образ уже не нужен, мы идём за свежим.
-    LittleFS.remove("/ota.bin");
+    // Прежний образ не трогаем: сорвётся загрузка — он останется рабочим, и его
+    // по-прежнему можно отправить в эфир. Удаляем его только перед переименованием.
     LittleFS.remove("/ota.bin.part");
     // Прогресс для полосы на странице
-    for (size_t i = 0; i < sizeof(fwDlTarget) - 1 && fwFetchTarget[i]; i++) fwDlTarget[i] = fwFetchTarget[i];
-    fwDlTarget[sizeof(fwDlTarget) - 1] = 0;
+    size_t tn = 0;
+    while (tn < sizeof(fwDlTarget) - 1 && fwFetchTarget[tn]) { fwDlTarget[tn] = fwFetchTarget[tn]; tn++; }
+    fwDlTarget[tn] = 0;   // ноль сразу за именем, иначе в хвосте остаётся прежнее
     fwDlPhase = 1;
     fwDlGot = 0;
     fwDlTotal = 0;
@@ -300,6 +316,12 @@ bool fwFetchNodeImage(const String& url) {
     LittleFS.remove("/ota.bin");
     // переименование в конце: оборванная загрузка не должна выглядеть готовой прошивкой
     if (!LittleFS.rename("/ota.bin.part", "/ota.bin")) { slog("[FW] rename не удался\n"); return false; }
+    // Имя образа кладём рядом с файлом: без этого страница показывает имя от прошлой
+    // ручной заливки — например сенсорное рядом с образом компаньона.
+    int slash = url.lastIndexOf('/');
+    otaFwName = (slash < 0) ? url : url.substring(slash + 1);
+    File nm = LittleFS.open("/ota.name", "w");
+    if (nm) { nm.print(otaFwName); nm.close(); }
     otaInspectStoredFw();
     return otaFwReady;
 }
@@ -333,14 +355,20 @@ static void fwCheckTask(void*) {
 
 static void fwFetchTask(void*) {
     fwNetOk = fwFetchNodeImage(fwFetchUrl);
+    // Запас стека на выходе: здесь же живут рукопожатие TLS и буфер чтения, а
+    // переполнение портит кучу — в ней лежат дескриптор и кэш файловой системы, и
+    // записи тогда принимаются, но до флеша не доезжают.
+    slog("[FW] запас стека задачи: %u Б\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
     fwNetStage = FW_NET_FETCHED;
     vTaskDelete(NULL);
 }
 
 static bool fwStartNetTask(TaskFunction_t fn, const char* name) {
     fwNetStage = FW_NET_BUSY;
-    // 16 КБ стека: рукопожатию TLS обычного размера не хватает
-    if (xTaskCreate(fn, name, 16384, nullptr, 1, nullptr) == pdPASS) return true;
+    // 24 КБ стека: рукопожатию TLS обычного размера не хватает, а в задаче загрузки к
+    // нему добавляются кадры разбора ссылки и потоковой записи. Запас печатается в
+    // журнал на выходе из задачи — по нему видно, не подошли ли мы к краю.
+    if (xTaskCreate(fn, name, 24576, nullptr, 1, nullptr) == pdPASS) return true;
     fwNetStage = FW_NET_IDLE;
     slog("[FW] не удалось создать задачу %s\n", name);
     return false;

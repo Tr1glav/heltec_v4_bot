@@ -118,6 +118,7 @@ void otaInspectStoredFw() {
     otaFwCrc = 0;
     otaFwSize = 0;
     otaZReal = 0;
+    otaImgSize = 0;   // иначе страница показывает размер от прошлого образа
     File f = LittleFS.open("/ota.bin", "r");
     uint32_t sz = f ? (uint32_t)f.size() : 0;
     uint8_t hdr[OTA_Z_HDR];
