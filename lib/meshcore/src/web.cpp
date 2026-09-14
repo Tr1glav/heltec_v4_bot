@@ -655,6 +655,18 @@ void setupOtaServer() {
     otaServer.on("/logs/tail", HTTP_GET, otaHandleLogTail);
     otaServer.on("/info", HTTP_GET, otaHandleInfo);
     otaServer.on("/selftest", HTTP_GET, otaHandleSelfTest);
+    // Обслуживание: раздел, переставший принимать запись, лечится только пересозданием.
+    // Образ прошивки не жаль — он всегда скачивается заново с релиза.
+    otaServer.on("/fs/format", HTTP_POST, []() {
+        if (otaFile) { otaFile.close(); otaFile = File(); }
+        otaFwReady = false;
+        otaFwSize = 0;
+        otaSaveOk = false;
+        bool ok = LittleFS.format();
+        LittleFS.begin(true);
+        slog("[FS] пересоздание раздела: %s\n", ok ? "готово" : "ошибка");
+        otaServer.send(ok ? 200 : 500, "text/plain; charset=utf-8", ok ? "OK" : "FAIL");
+    });
     otaServer.on("/config", HTTP_GET, otaHandleConfigGet);
     otaServer.on("/config", HTTP_POST, otaHandleConfigPost);
     otaServer.on("/style.css", HTTP_GET, otaHandleCss);
