@@ -82,7 +82,17 @@ String buildDiagReport() {
 // Проверка LittleFS по запросу. Раньше шла внутри /logs и писала во flash при каждом
 // открытии страницы — теперь только когда её явно попросили.
 void otaHandleSelfTest() {
-    String r = "LittleFS: ";
+    // Место на файловой системе: без этих чисел не отличить «файл не дописался» от
+    // «в разделе кончились блоки», а скачанный образ молча обрывался именно так.
+    String r = "Место: занято " + String((unsigned)LittleFS.usedBytes()) +
+               " из " + String((unsigned)LittleFS.totalBytes()) + " Б\r\n";
+    {
+        File d = LittleFS.open("/");
+        for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+            r += "  " + String(e.name()) + " — " + String((unsigned)e.size()) + " Б\r\n";
+        }
+    }
+    r += "LittleFS: ";
     File t = LittleFS.open("/.probe", "w");
     if (!t) {
         r += "open(w) FAILED — файловая система не работает";
