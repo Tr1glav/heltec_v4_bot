@@ -111,18 +111,22 @@ uint16_t otaPolls = 0;          // сколько раз пришлось пер
 uint32_t otaUsBuild = 0, otaUsTx = 0, otaChunksSent = 0;
 uint16_t otaRetrTotal = 0;      // сколько всего было повторов за сессию
 
+static uint32_t otaZReal = 0;   // сколько байт потока лежит в файле (без хвостовых нулей)
+
 // Для сенсора годится только .otaz (формат OTA_Z_MAGIC); otaFwSize — длина сжатого потока
 void otaInspectStoredFw() {
     otaFwCrc = 0;
     otaFwSize = 0;
+    otaZReal = 0;
     File f = LittleFS.open("/ota.bin", "r");
     uint32_t sz = f ? (uint32_t)f.size() : 0;
     uint8_t hdr[OTA_Z_HDR];
     if (sz > OTA_Z_HDR && f.read(hdr, OTA_Z_HDR) == (size_t)OTA_Z_HDR && memcmp(hdr, OTA_Z_MAGIC, 4) == 0) {
         memcpy(&otaImgSize, hdr + 4, 4);
         memcpy(&otaFwCrc, hdr + 8, 4);
-        otaFwSize = sz - OTA_Z_HDR;
-        slog("[OTA] сжатая прошивка: %u -> %u байт\n", (unsigned)otaImgSize, (unsigned)otaFwSize);
+        otaZReal = sz - OTA_Z_HDR;
+        otaFwSize = otaZReal + OTA_Z_TAIL_PAD;   // хвост нулей уходит в эфир, см. OTA_Z_TAIL_PAD
+        slog("[OTA] сжатая прошивка: %u -> %u байт\n", (unsigned)otaImgSize, (unsigned)otaZReal);
     }
     if (f) f.close();
     otaFwReady = otaFwSize > 0;
@@ -219,8 +223,13 @@ static int otaBuildRawData(uint8_t* frame, uint8_t type, uint32_t seq) {
     uint32_t off = seq * OTA_RAW_CHUNK_BYTES;
     int n = min((int)OTA_RAW_CHUNK_BYTES, (int)(otaFwSize - off));
     uint8_t chunk[OTA_RAW_CHUNK_BYTES];
-    otaFile.seek(OTA_Z_HDR + off);
-    if (otaFile.read(chunk, n) != n) { otaBotAbort("read err"); return 0; }
+    // За концом файла идут хвостовые нули дополнения — в файле их нет, дописываем сами
+    int real = (off < otaZReal) ? (int)min((uint32_t)n, otaZReal - off) : 0;
+    if (real < n) memset(chunk + real, 0, n - real);
+    if (real > 0) {
+        otaFile.seek(OTA_Z_HDR + off);
+        if (otaFile.read(chunk, real) != real) { otaBotAbort("read err"); return 0; }
+    }
     uint8_t enc[OTA_RAW_CHUNK_BYTES + 18];
     int enc_len = (sensorChannelIdx >= 0)
         ? encryptGroupText(channels[sensorChannelIdx].secret, enc, chunk, n)
