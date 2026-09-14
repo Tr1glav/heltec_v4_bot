@@ -231,6 +231,16 @@ def otaz_test():
     check("формат .otaz: заголовок", packed[:4] == b"OTAZ" and size == len(raw))
     check("формат .otaz: CRC32 образа", crc == zlib.crc32(raw) & 0xFFFFFFFF)
     check("формат .otaz: распаковка кусками по 240 Б", out == raw)
+    # Бот дописывает в эфир OTA_Z_TAIL_PAD нулей после потока: без них распаковщик узла
+    # придерживает хвост образа, и приём падает с «size mismatch». Длину берём из config.h,
+    # чтобы проверка и прошивка не разъехались, и убеждаемся, что лишний вход безвреден.
+    cfg = (ROOT / "lib/meshcore/include/config.h").read_text(encoding="utf-8")
+    m = re.search(r"#define\s+OTA_Z_TAIL_PAD\s+(\d+)", cfg)
+    check("формат .otaz: объявлен хвост нулей", m is not None)
+    padded = body + bytes(int(m.group(1)) if m else 0)
+    dp = zlib.decompressobj()
+    outp = b"".join(dp.decompress(padded[i:i + 240]) for i in range(0, len(padded), 240)) + dp.flush()
+    check("формат .otaz: хвостовые нули не портят образ", outp == raw)
 
 
 def page_js_test():
