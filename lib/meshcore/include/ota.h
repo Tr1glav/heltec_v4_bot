@@ -12,6 +12,11 @@ struct FwScan {
     bool mine;         // встретился маркер нашей платы
     char other[12];    // код чужой платы, если встретился
 };
+// Кадр сырого протокола прошивки: [BE EF][тип][seq 4][данные][crc16]. Собирают и шлют
+// обе стороны, поэтому объявления живут здесь, а не внутри файла одной из сторон.
+int rawBuildFrame(uint8_t* frm, uint8_t type, uint32_t seq, const uint8_t* data, int n);
+int rawTxFrame(const uint8_t* frm, int f, bool listenAfter = true);
+
 void fwScanReset(FwScan* s);
 void fwScanFeed(FwScan* s, const uint8_t* data, size_t n);
 // 1 — образ нашей платы, 0 — маркера нет (сборка старше проверки), -1 — чужая плата
@@ -31,10 +36,12 @@ bool otaStartSession(const String& target);
 String buildDiagReport();
 void setupOtaServer();
 #endif
-#ifdef SENSOR_NODE
+#if FEATURE_MESH_OTA_RECEIVER
 void otaSensorDraw();
 void otaSensorAbort(const char* why);
 void otaSensorTick();
 void otaSensorHandle();
+// Разбор входящего кадра на стороне узла — зовёт диспетчер в ota.cpp
+void otaHandleRawSensor(const uint8_t* buf, int len);
 #endif
 void otaHandleRawFrame(const uint8_t* buf, int len);
