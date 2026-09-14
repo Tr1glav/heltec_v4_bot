@@ -100,7 +100,8 @@ bool fwCheckLatest() {
 // выставляется ДО первого куска, чтобы вызывающий знал, дописывать файл или начинать
 // заново: сервер вправе не понять запрос диапазона и прислать файл целиком.
 template <typename Sink>
-static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* partial = nullptr) {
+static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* partial = nullptr,
+                       uint32_t* gotOut = nullptr) {
     WiFiClientSecure cl;
     cl.setInsecure();
     HTTPClient http;
@@ -130,6 +131,7 @@ static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* pa
                 // Сколько успело прийти — по этому видно, оборвался поток или связь
                 // вообще не установилась.
                 slog("[FW] обрыв загрузки, принято %d из %d байт\n", got, total);
+                if (gotOut) *gotOut = (uint32_t)got;
                 http.end();
                 return false;
             }
@@ -143,6 +145,7 @@ static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* pa
         if (!sink(buf, (size_t)n)) { http.end(); return false; }
     }
     http.end();
+    if (gotOut) *gotOut = (uint32_t)got;
     if (isPartial) slog("[FW] докачано %d байт (было %u)\n", got, (unsigned)from);
     else           slog("[FW] принято %d байт\n", got);
     return total < 0 || got == total;
@@ -208,6 +211,7 @@ bool fwFetchNodeImage(const String& url) {
         if (have > 0) slog("[FW] в файле уже %u байт, прошу остаток\n", (unsigned)have);
 
         File f;
+        uint32_t got = 0;
         bool partial = false, opened = false, openFail = false;
         ok = httpStream(url, [&](const uint8_t* d, size_t n) {
             if (!opened) {
@@ -218,9 +222,24 @@ bool fwFetchNodeImage(const String& url) {
                 if (!f) { openFail = true; return false; }
             }
             return f.write(d, n) == n;
-        }, have, &partial);
+        }, have, &partial, &got);
         if (openFail) { slog("[FW] не открылся файл на боте\n"); return false; }
-        if (f) f.close();
+        // Сброс буфера до закрытия: последняя неполная страница кэша LittleFS не доезжала
+        // до флеша, и файл выходил кратным 4096 — короче принятого. Образ уходил в эфир
+        // обрезанным, а узел не мог распаковать хвост и отвечал «size mismatch».
+        if (f) { f.flush(); f.close(); }
+        if (ok) {
+            // Верим файлу на флеше, а не счётчику принятого: не сошлось — не беда,
+            // следующая попытка попросит у сервера ровно недостающий остаток.
+            uint32_t want = (partial ? have : 0) + got;
+            File chk2 = LittleFS.open("/ota.bin.part", "r");
+            uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
+            if (chk2) chk2.close();
+            if (sz != want) {
+                slog("[FW] в файле %u из %u байт, дописываю остаток\n", (unsigned)sz, (unsigned)want);
+                ok = false;
+            }
+        }
         if (!ok && attempt < FW_DOWNLOAD_TRIES) {
             slog("[FW] попытка %d не удалась, повторяю\n", attempt);
             delay(2000);
