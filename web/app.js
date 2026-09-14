@@ -45,10 +45,10 @@ function addTarget(id,name,meta,online,bat){
 function renderTargets(){
   $('targets').innerHTML='';
   addTarget('__self__',$('dev').textContent+' — этот бот',
-            '<b>'+(info.board||'?')+'</b> · v'+(info.ver||'?')+' · файл .bin',true,
+            '<b>'+(info.env||'?')+'</b> · v'+(info.ver||'?')+' · файл .bin',true,
             info.bat>=0?info.bat:-1);
   for(const s of sensors){
-    const meta='<b>'+(s.board||'?')+'</b> · '+(s.ver?'v'+s.ver:'версия ?')
+    const meta='<b>'+(s.env||'?')+'</b> · '+(s.ver?'v'+s.ver:'версия ?')
       +' · '+(s.online?'онлайн':'был '+ago(s.seen_s)+' назад')
       +(s.rssi?' · '+s.rssi+' dBm':'');
     addTarget(s.name,s.name,meta,s.online,s.bat);

@@ -86,14 +86,16 @@ struct QueuedMsg {
     uint8_t pathLen;
     int8_t snr4;          // SNR, умноженный на 4 — так требует протокол
     uint32_t ts;
-    char text[100];
+    // Столько текста несёт кадр сообщения: MAX_FRAME_SIZE минус 11 байт заголовка.
+    // При 100 байтах длинные сообщения канала обрезались, хотя место в кадре было.
+    char text[MAX_FRAME_SIZE - 11 + 1];
 };
 
 static BLEServer* bleServer = nullptr;
 static BLECharacteristic* txChar = nullptr;
 static volatile bool bleConnected = false;
 static uint32_t blePin = 0;
-static uint8_t appVer = 0;      // версия приложения из APP_START: от неё зависит формат кадров
+static uint8_t appVer = 0;      // версия протокола приложения из DEVICE_QUERY
 // Экран с кодом убираем не по факту соединения, а только когда сопряжение состоялось:
 // код нужен телефону именно в промежутке между подключением и вводом кода.
 static volatile bool blePaired = false;
@@ -455,8 +457,7 @@ static void handleFrame(const uint8_t* f, size_t len) {
     int i = 0;
     switch (f[0]) {
     case CMD_APP_START: {
-        // [01][версия приложения][6 байт резерва][имя приложения]
-        appVer = (len >= 2) ? f[1] : 0;
+        // [01][резерв 7][имя приложения] — версии протокола здесь нет
         out[i++] = RESP_CODE_SELF_INFO;
         out[i++] = ADV_TYPE_CHAT;
         out[i++] = (uint8_t)cfg.loraTx;
@@ -482,6 +483,10 @@ static void handleFrame(const uint8_t* f, size_t len) {
         break;
     }
     case CMD_DEVICE_QUERY: {
+        // Версию протокола приложение сообщает именно здесь, вторым байтом. Читать её из
+        // APP_START нельзя: там это поле зарезервировано, и мы получали ноль — то есть
+        // считали приложение древним и слали ему кадр сообщения без качества связи и пути.
+        if (len >= 2) appVer = f[1];
         out[i++] = RESP_CODE_DEVICE_INFO;
         out[i++] = COMPANION_VER_CODE;
         // В этом кадре — вместимость, а не текущее число: у оригинала здесь
@@ -727,12 +732,13 @@ static void handleFrame(const uint8_t* f, size_t len) {
 
         String text;
         for (size_t k = 13; k < len; k++) text += (char)f[k];
-        if (text.length() > 96)   // столько влезает в кадр личного сообщения
-            Serial.printf("[BLE] текст личного сообщения обрезан: %u -> 96 байт\n", text.length());
+        if (text.length() > DM_TEXT_MAX)
+            Serial.printf("[BLE] текст личного сообщения обрезан: %u -> %u байт\n",
+                          text.length(), (unsigned)DM_TEXT_MAX);
 
         bool sent = false;
         if (idx >= 0 && txtType == 0 && text.length() > 0) {   // 0 — обычный текст
-            uint8_t frame[192];
+            uint8_t frame[256];
             int fl = buildPrivateTextFrame(contacts[idx].pub[0], contacts[idx].pub,
                                            text, frame, sizeof(frame));
             if (fl > 0) { floodSend(-1, frame, fl); sent = true; }

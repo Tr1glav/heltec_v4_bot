@@ -561,7 +561,7 @@ void otaHandleInfo() {
     snprintf(json, sizeof(json),
              "{\"up\":%lu,\"wifi\":%s,\"mqtt\":%s,\"heap\":%u,\"temp\":%.1f,"
              "\"bat\":%d,\"volt\":%.2f,\"ip\":\"%s\",\"pkts\":%d,"
-             "\"board\":\"" BOARD_CODE "\",\"ver\":\"" FW_VERSION "\","
+             "\"env\":\"" FW_ENV "\",\"ver\":\"" FW_VERSION "\","
              "\"fwready\":%s,\"fwname\":\"%s\",\"fwsize\":%u,\"fwimg\":%u}",
              (unsigned long)(millis() / 1000),
              wifiConnected ? "true" : "false", mqttConnected ? "true" : "false",
@@ -591,18 +591,17 @@ void otaHandleLogTail() {
 void otaHandleSensors() {
     String json = "[";
     for (int i = 0; i < sensorDeviceDiscCount; i++) {
-        // Окружение сборки показываем рядом с платой: по нему автообновление выбирает
-        // файл релиза, и пустое значение означает старую прошивку узла (тогда файл
-        // подбирается по коду платы, что для компаньона дало бы образ сенсора).
-        char name[48], ver[32], board[16], env[40], item[300];
+        // Имя окружения показываем вместо кода платы: в нём уже есть и плата, и тип
+        // прошивки, а по нему же автообновление выбирает файл релиза. Пустое значение —
+        // прошивка узла старая, и файл подберётся по коду платы (он остаётся в hello).
+        char name[48], ver[32], env[40], item[300];
         jsonEscape(sensorDeviceDisc[i].c_str(), name, sizeof(name));
         jsonEscape(sensorFwVersion[i].c_str(), ver, sizeof(ver));
-        jsonEscape(sensorBoard[i].c_str(), board, sizeof(board));
         jsonEscape(sensorEnv[i].c_str(), env, sizeof(env));
         snprintf(item, sizeof(item),
-                 "%s{\"name\":\"%s\",\"ver\":\"%s\",\"board\":\"%s\",\"env\":\"%s\","
+                 "%s{\"name\":\"%s\",\"ver\":\"%s\",\"env\":\"%s\","
                  "\"online\":%s,\"seen_s\":%lu,\"bat\":%d,\"rssi\":%.0f}",
-                 i ? "," : "", name, ver, board, env, sensorOnlineNow[i] ? "true" : "false",
+                 i ? "," : "", name, ver, env, sensorOnlineNow[i] ? "true" : "false",
                  (millis() - sensorLastActive[i]) / 1000, sensorBattery[i], sensorRssi[i]);
         json += item;
     }

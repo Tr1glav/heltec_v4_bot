@@ -672,16 +672,16 @@ int buildPrivateTextFrame(uint8_t dest_hash, const uint8_t* dest_pub,
     uint8_t secret[32];
     ed25519_key_exchange(secret, dest_pub, bot_prv64);
 
-    uint8_t data[128];
+    uint8_t data[DM_TEXT_MAX + 8];
     int dlen = 0;
     uint32_t ts = (uint32_t)time(NULL);   // Unix-секунды (epoch-ms не лезет в uint32)
     memcpy(data, &ts, 4); dlen += 4;
     data[dlen++] = 0;                        // attempt = 0
-    size_t ml = min((size_t)96, (size_t)msg.length());
+    size_t ml = min((size_t)DM_TEXT_MAX, (size_t)msg.length());
     memcpy(data + dlen, msg.c_str(), ml); dlen += ml;
     data[dlen++] = 0;                        // null terminator
 
-    uint8_t enc[128];
+    uint8_t enc[DM_TEXT_MAX + 24];           // MAC 2 + шифр, дополненный до кратного 16
     int enclen = encryptGroupText(secret, enc, data, dlen);   // [MAC 2B][cipher]
     if (enclen <= 0 || 4 + enclen > maxlen) return 0;
 

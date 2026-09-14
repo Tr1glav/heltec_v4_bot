@@ -9,7 +9,8 @@ void publishMessage();
 void clearLastMsg();
 void clearSensorBtnText();
 void mqttSlug(const char* name, char* out, int maxLen);
-void publishSensorDisc(const String& sender, const char* slug);
+// env — имя окружения сборки узла: по нему карточка в HA получает роль в названии
+void publishSensorDisc(const String& sender, const char* slug, const String& env);
 void publishSensorAvailability(int idx);
 bool publishSensorMessage();
 void publishStatus();

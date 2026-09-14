@@ -227,12 +227,23 @@ void mqttSlug(const char* name, char* out, int maxLen) {
     out[n] = 0;
 }
 
-void publishSensorDisc(const String& sender, const char* slug) {
-    char devBlock[160];
+// Роль узла для карточки в Home Assistant. Берётся из имени окружения сборки, которое
+// узел сообщает в hello: сенсор и компаньон живут на одной плате, и различить их иначе
+// нельзя. Пусто — прошивка узла старая, окружение она не передаёт; такие узлы у нас
+// всегда были сенсорами, поэтому это и значение по умолчанию.
+static const char* roleFromEnv(const String& env) {
+    if (env.endsWith("companion"))   return "Companion";
+    if (env.endsWith("coordinator")) return "Coordinator";
+    return "Sensor";
+}
+
+void publishSensorDisc(const String& sender, const char* slug, const String& env) {
+    const char* role = roleFromEnv(env);
+    char devBlock[192];
     snprintf(devBlock, sizeof(devBlock),
-        "\"identifiers\":[\"meshcore_sensor_%s\"],\"name\":\"MeshBot Sensor %s\","
-        "\"manufacturer\":\"MeshCore\",\"model\":\"Sensor node\"",
-        slug, slug);
+        "\"identifiers\":[\"meshcore_sensor_%s\"],\"name\":\"MeshBot %s %s\","
+        "\"manufacturer\":\"MeshCore\",\"model\":\"%s node\"",
+        slug, role, slug, role);
     // Один буфер на все сущности: функция вызывается глубоко из разбора пакета, стек не бесконечен
     char topic[128], payload[512];
 
@@ -387,7 +398,8 @@ bool publishSensorMessage() {
                  SENSOR_DEV_CACHE_MAX, lastSender.c_str());
         }
     } else if (!sensorDiscPublished[idx]) {
-        publishSensorDisc(lastSender, slug);
+        // Окружение разобрано строкой выше, поэтому карточка сразу получает верную роль
+        publishSensorDisc(lastSender, slug, sensorEnv[idx]);
         sensorDiscPublished[idx] = true;
         cameOnline = true;
     }
@@ -410,9 +422,14 @@ bool publishSensorMessage() {
             snprintf(t, sizeof(t), "%s/sensor/%s/voltage", mqttPrefix, slug);
             mqtt.publish(t, batVolt.c_str(), true);
         }
-        if (board.length() > 0) {
+        if (envName.length() > 0 || board.length() > 0) {
+            // В поле «плата» публикуем имя окружения сборки: в нём есть и плата, и тип
+            // прошивки, тогда как короткий код («h43») одинаков у сенсора и компаньона.
+            // Сам код остаётся запасным вариантом для узлов, чья прошивка окружение ещё
+            // не передаёт.
+            const String& what = envName.length() > 0 ? envName : board;
             snprintf(t, sizeof(t), "%s/sensor/%s/board", mqttPrefix, slug);
-            mqtt.publish(t, board.c_str(), true);
+            mqtt.publish(t, what.c_str(), true);
         }
         Serial.printf("[SNS] heartbeat from %s: v%s, батарея %s%%\n", lastSender.c_str(),
                       ver.length() ? ver.c_str() : "?",
