@@ -247,7 +247,18 @@ bool fwFetchNodeImage(const String& url) {
                 pad -= k;
             }
         }
-        if (f) { f.flush(); f.close(); }
+        if (f) {
+            // Где именно теряется хвост: позиция — сколько байт приняла запись, размер
+            // после сброса — сколько из них доехало до флеша. Расхождение между ними
+            // указывает на фиксацию, совпадение с коротким числом — на то, что записи
+            // перестали приниматься раньше и молча возвращали успех.
+            uint32_t pos = (uint32_t)f.position();
+            f.flush();
+            uint32_t afterFlush = (uint32_t)f.size();
+            slog("[FW] запись: позиция %u, после сброса %u, ошибка записи %d\n",
+                 (unsigned)pos, (unsigned)afterFlush, (int)f.getWriteError());
+            f.close();
+        }
         if (ok) {
             // Верим файлу на флеше, а не счётчику принятого.
             File chk2 = LittleFS.open("/ota.bin.part", "r");
