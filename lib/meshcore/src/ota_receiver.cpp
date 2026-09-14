@@ -35,6 +35,10 @@ static void otaZFree() {
 }
 
 static bool otaWriteImage(const uint8_t* data, size_t n) {
+    // Распаковщик может выдать больше объявленного: в конце потока он дополняет
+    // последний блок. Лишнее в раздел не пишем, иначе Update.write упрётся в границу.
+    if (otaGot + n > otaTotal) n = otaTotal - otaGot;
+    if (n == 0) return true;
     if (Update.write((uint8_t*)data, n) != n) {
         Update.printError(Serial);
         return false;
@@ -45,12 +49,16 @@ static bool otaWriteImage(const uint8_t* data, size_t n) {
     return true;
 }
 
-static bool otaFeed(const uint8_t* in, size_t n) {
+// last = это последний чанк сжатого потока. Флаг «вход ещё будет» на нём снимается:
+// с ним распаковщик не берётся за символы, которым не хватает бит в буфере, и
+// придерживает хвост образа до следующей порции — которой уже не будет. Так терялись
+// последние байты (на образе 1106000 доходило 1103279), и приём падал с «size mismatch».
+static bool otaFeed(const uint8_t* in, size_t n, bool last) {
     for (;;) {
         size_t inBytes = n;
         size_t outBytes = TINFL_LZ_DICT_SIZE - otaDictOfs;
         tinfl_status st = tinfl_decompress(otaInfl, in, &inBytes, otaDict, otaDict + otaDictOfs, &outBytes,
-                                           TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_HAS_MORE_INPUT);
+                                           TINFL_FLAG_PARSE_ZLIB_HEADER | (last ? 0 : TINFL_FLAG_HAS_MORE_INPUT));
         in += inBytes;
         n -= inBytes;
         if (outBytes > 0 && !otaWriteImage(otaDict + otaDictOfs, outBytes)) return false;
@@ -66,7 +74,9 @@ static bool otaFeed(const uint8_t* in, size_t n) {
 static bool otaFlushWindow() {
     while (otaWinMask & 1) {
         uint8_t slot = otaSeqExp % OTA_WINDOW;
-        if (!otaFeed(otaWin[slot], otaWinLen[slot])) return false;
+        uint32_t off = otaSeqExp * OTA_RAW_CHUNK_BYTES;
+        bool last = (off + otaWinLen[slot] >= otaStreamLen);
+        if (!otaFeed(otaWin[slot], otaWinLen[slot], last)) return false;
         otaWinMask >>= 1;
         otaSeqExp++;
     }
