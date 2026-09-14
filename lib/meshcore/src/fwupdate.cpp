@@ -171,15 +171,28 @@ bool fwSelfUpdate(const String& url) {
     return true;
 }
 
+// Сколько раз пробуем скачать образ. Соединение с GitHub срывается не всегда, а через
+// раз (HTTPClient возвращает -1 ещё на установке связи), и повтор через паузу обычно
+// проходит. Без него единичный срыв отменял всё обновление до следующей проверки.
+#define FW_DOWNLOAD_TRIES 3
+
 bool fwFetchSensorImage(const String& url) {
     slog("[FW] образ сенсора: %s\n", url.c_str());
     if (otaFile) { otaFile.close(); otaFile = File(); }
-    File f = LittleFS.open("/ota.bin.part", "w");
-    if (!f) { slog("[FW] не открылся файл на боте\n"); return false; }
-    bool ok = httpStream(url, [&](const uint8_t* d, size_t n) {
-        return f.write(d, n) == n;
-    });
-    f.close();
+    bool ok = false;
+    File f;
+    for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
+        f = LittleFS.open("/ota.bin.part", "w");
+        if (!f) { slog("[FW] не открылся файл на боте\n"); return false; }
+        ok = httpStream(url, [&](const uint8_t* d, size_t n) {
+            return f.write(d, n) == n;
+        });
+        f.close();
+        if (!ok && attempt < FW_DOWNLOAD_TRIES) {
+            slog("[FW] попытка %d не удалась, повторяю\n", attempt);
+            delay(2000);
+        }
+    }
     if (!ok) { LittleFS.remove("/ota.bin.part"); return false; }
     LittleFS.remove("/ota.bin");
     // переименование в конце: оборванная загрузка не должна выглядеть готовой прошивкой
