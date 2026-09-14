@@ -99,15 +99,49 @@ bool fwCheckLatest() {
 // from — сколько байт уже лежит в файле: просим сервер отдать остаток. Признак partial
 // выставляется ДО первого куска, чтобы вызывающий знал, дописывать файл или начинать
 // заново: сервер вправе не понять запрос диапазона и прислать файл целиком.
+// Адрес ассета на GitHub — это перенаправление на хранилище. Встроенное следование за
+// перенаправлением тянет новый адрес, не разрывая уже открытое TLS-соединение, и загрузка
+// рвётся: то HTTP -1, то файл приходит короче заявленного. Поэтому конечную ссылку
+// выясняем отдельным запросом, а качаем по ней уже чистым соединением.
+static String fwResolveUrl(const String& url) {
+    String cur = url;
+    for (int hop = 0; hop < 4; hop++) {
+        WiFiClientSecure cl;
+        cl.setInsecure();
+        HTTPClient http;
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        http.setTimeout(15000);
+        if (!http.begin(cl, cur)) return cur;
+        http.addHeader("User-Agent", "meshcore-bot");
+        const char* want[] = { "Location" };
+        http.collectHeaders(want, 1);
+        int code = http.GET();
+        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+            code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+            code == HTTP_CODE_PERMANENT_REDIRECT) {
+            String loc = http.header("Location");
+            http.end();
+            if (loc.length() == 0) return cur;
+            slog("[FW] переход %d, шаг %d\n", code, hop + 1);
+            cur = loc;
+            continue;
+        }
+        http.end();
+        return cur;
+    }
+    return cur;
+}
+
 template <typename Sink>
 static bool httpStream(const String& url, Sink sink, uint32_t from = 0, bool* partial = nullptr,
                        uint32_t* gotOut = nullptr) {
+    String real = fwResolveUrl(url);
     WiFiClientSecure cl;
     cl.setInsecure();
     HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.setTimeout(20000);
-    if (!http.begin(cl, url)) return false;
+    if (!http.begin(cl, real)) return false;
     http.addHeader("User-Agent", "meshcore-bot");
     if (from > 0) http.addHeader("Range", "bytes=" + String(from) + "-");
     int code = http.GET();
@@ -209,7 +243,6 @@ bool fwFetchNodeImage(const String& url) {
     LittleFS.remove("/ota.bin");
     LittleFS.remove("/ota.bin.part");
     bool ok = false;
-    bool reformatted = false;   // раздел пересоздаём не больше одного раза за загрузку
     for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
         // Сколько уже лежит от прошлой попытки — с этого места и просим продолжить
         uint32_t have = 0;
@@ -232,50 +265,14 @@ bool fwFetchNodeImage(const String& url) {
         }, have, &partial, &got);
         if (openFail) { slog("[FW] не открылся файл на боте\n"); return false; }
         uint32_t want = (partial ? have : 0) + got;
-        if (ok && f) {
-            // Дополняем нулями до границы блока, не закрывая файл: последний неполный
-            // блок при записи из сетевой задачи не доезжает до флеша, и размер замирает
-            // на кратном FS_BLOCK_BYTES. Полный блок фиксируется всегда, а лишние нули
-            // после сжатого потока распаковщику узла безразличны — он останавливается на
-            // конце сжатых данных (на том же свойстве держится OTA_Z_TAIL_PAD).
-            uint32_t pad = (FS_BLOCK_BYTES - (want % FS_BLOCK_BYTES)) % FS_BLOCK_BYTES;
-            want += pad;
-            static const uint8_t zeros[128] = {0};
-            while (pad > 0) {
-                size_t k = pad > sizeof(zeros) ? sizeof(zeros) : (size_t)pad;
-                if (f.write(zeros, k) != k) break;
-                pad -= k;
-            }
-        }
-        if (f) {
-            // Где именно теряется хвост: позиция — сколько байт приняла запись, размер
-            // после сброса — сколько из них доехало до флеша. Расхождение между ними
-            // указывает на фиксацию, совпадение с коротким числом — на то, что записи
-            // перестали приниматься раньше и молча возвращали успех.
-            uint32_t pos = (uint32_t)f.position();
-            f.flush();
-            uint32_t afterFlush = (uint32_t)f.size();
-            slog("[FW] запись: позиция %u, после сброса %u, ошибка записи %d\n",
-                 (unsigned)pos, (unsigned)afterFlush, (int)f.getWriteError());
-            f.close();
-        }
+        if (f) { f.flush(); f.close(); }
         if (ok) {
             // Верим файлу на флеше, а не счётчику принятого.
             File chk2 = LittleFS.open("/ota.bin.part", "r");
             uint32_t sz = chk2 ? (uint32_t)chk2.size() : 0;
             if (chk2) chk2.close();
             if (sz != want) {
-                slog("[FW] в файле %u из %u байт\n", (unsigned)sz, (unsigned)want);
-                // Раздел перестаёт выделять блоки после череды оборванных загрузок:
-                // свободное место он показывает, а запись возвращает ноль, и файл
-                // замирает на границе блока. Лечится только пересозданием; образ не
-                // жаль — он качается заново с релиза.
-                if (!reformatted) {
-                    slog("[FW] раздел не принимает запись, пересоздаю\n");
-                    LittleFS.format();
-                    LittleFS.begin(true);
-                    reformatted = true;
-                }
+                slog("[FW] в файле %u из %u байт, дописываю остаток\n", (unsigned)sz, (unsigned)want);
                 ok = false;
             }
         }
