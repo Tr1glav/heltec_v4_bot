@@ -359,9 +359,9 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
     //   DIRECT-сообщение, адресованное устройству.
     bool isDirect = (route_type == 0x02 || route_type == 0x03);
     if (personalDm || (chIdx == 1 && lastMessage == "/ping") || isDirect) {
-        // Пауза перед ответом: даём отправителю выйти из TX и перейти в RX,
-        // иначе его приёмник «задирается» на старт нашей передачи (desense).
-        delay(250);
+        // Ждём, пока отправитель закончит свои повторы: пока он передаёт, он нас не
+        // слышит, и ответ, посланный раньше, до него просто не дойдёт.
+        delay(PING_REPLY_DELAY_MS);
 
         char reply[100];
         buildPingReply(reply, sizeof(reply), replyPath, replyHops, path_hash_size);
