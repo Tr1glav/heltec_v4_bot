@@ -35,7 +35,19 @@ def check(name, ok, detail=""):
 
 def grab(rel, signature):
     """Вырезает функцию из исходника по началу сигнатуры, считая фигурные скобки."""
-    src = (ROOT / rel).read_text(encoding="utf-8")
+    # Путь — подсказка, а не требование: файлы переезжают при разборке на модули, и
+    # жёсткая привязка ломает проверки на ровном месте. Не нашлось по подсказке — ищем
+    # сигнатуру по всем исходникам прошивки.
+    path = ROOT / rel
+    if signature not in path.read_text(encoding="utf-8"):
+        for cand in sorted((ROOT / "lib/meshcore/src").glob("*.cpp")) + \
+                    sorted((ROOT / "src").glob("*.cpp")):
+            if signature in cand.read_text(encoding="utf-8"):
+                path = cand
+                break
+        else:
+            raise RuntimeError("не найдена функция " + signature)
+    src = path.read_text(encoding="utf-8")
     start = src.index(signature)
     depth = 0
     for i in range(src.index("{", start), len(src)):
