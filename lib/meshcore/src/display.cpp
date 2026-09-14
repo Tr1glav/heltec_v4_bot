@@ -110,8 +110,39 @@ static void drawBlePin() {
 }
 #endif
 
+#ifdef SENSOR_NODE
+// Экран гаснет в простое: на аккумуляторе панель ест 15–25 мА, а смотрят на неё
+// редко. Будит длинное нажатие кнопки (см. main.cpp). Содержимое видеопамяти при
+// выключении сохраняется, поэтому включение мгновенное и без повторной настройки.
+static bool screenOn = true;
+static unsigned long screenWakeMs = 0;
+
+void screenWake() {
+    screenWakeMs = millis();
+    if (screenOn) return;
+    screenOn = true;
+    display.setPower(true);
+}
+
+bool screenIsOn() { return screenOn; }
+
+void screenTick() {
+    if (!screenOn) return;
+    #ifdef COMPANION_NODE
+    // Пока приложение не сопряжено, на экране код сопряжения — гасить нельзя,
+    // иначе подключиться будет нечем.
+    if (!companionBleLinked()) { screenWakeMs = millis(); return; }
+    #endif
+    if (millis() - screenWakeMs < SCREEN_IDLE_OFF_MS) return;
+    screenOn = false;
+    display.setPower(false);
+    Serial.println("[SCR] экран погашен (простой)");
+}
+#endif
+
 void drawIdleStatus() {
     #ifdef SENSOR_NODE
+    if (!screenOn) return;          // панель выключена — не тратим шину I2C впустую
     if (pingShowUntil != 0 && (long)(millis() - pingShowUntil) < 0) { drawPingResult(); return; }
     #endif
     #ifdef COMPANION_NODE

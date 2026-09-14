@@ -202,7 +202,22 @@ void setup() {
     lastDirectAdvertMs = lastFloodAdvertMs = millis();
 
     #ifdef COMPANION_NODE
+    // Список контактов лежит файлом, поэтому файловую систему монтируем до BLE.
+    // У координатора она уже смонтирована выше — там в ней живёт образ для mesh OTA.
+    #ifndef MQTT_ENABLED
+    if (!LittleFS.begin(true)) Serial.println("[FS] не смонтировалась — контакты не сохранятся");
+    #endif
     companionBegin();   // BLE поднимаем после радио: приложение может подключиться сразу
+    #endif
+
+    #ifdef SENSOR_NODE
+    // Узлы работают от аккумулятора: 80 МГц вместо 240 экономят 20–30 мА, а BLE и LoRa
+    // на этой частоте штатны. На время прошивки по воздуху частота поднимается обратно.
+    // Пересчитывать скорость порта не нужно: на этих платах консоль идёт по нативному
+    // USB, где скорость номинальная, а для UART ядро само правит делитель при смене
+    // частоты.
+    setCpuFrequencyMhz(CPU_MHZ_IDLE);
+    Serial.printf("[PWR] частота процессора %d МГц\n", CPU_MHZ_IDLE);
     #endif
     
     #if HAS_OLED
@@ -408,6 +423,15 @@ void loop() {
 
     // Sensor node: button = trigger ("button"), hello = heartbeat раз в N минут
 #ifdef SENSOR_NODE
+    screenTick();      // экран гаснет в простое, будит длинное нажатие кнопки
+    // Прошивка по воздуху идёт кадрами каждые 8 мс — на это время возвращаем полную
+    // частоту, иначе узел перестаёт успевать вычитывать пачку.
+    static bool cpuFast = false;
+    if (otaFastMode != cpuFast) {
+        cpuFast = otaFastMode;
+        setCpuFrequencyMhz(cpuFast ? CPU_MHZ_FAST : CPU_MHZ_IDLE);
+        Serial.printf("[PWR] частота процессора %d МГц\n", cpuFast ? CPU_MHZ_FAST : CPU_MHZ_IDLE);
+    }
     otaSensorTick();   // mesh OTA: сторожевое время — при зависании прерываем сессию
     sensorPingTick();  // не дождались ответа на проверку связи — показать это
     cfgPendingTick();  // правки настроек по радио без "save" откатываются перезагрузкой
@@ -440,19 +464,32 @@ void loop() {
     // Одно нажатие — "button", два — "button2", три — проверка связи с координатором.
     if (!otaActive) {
         static bool btnDown = false;
-        static unsigned long btnEdgeMs = 0;
+        static unsigned long btnEdgeMs = 0;   // когда состояние кнопки менялось в последний раз
+        static unsigned long btnDownMs = 0;   // когда её нажали
         static int btnPresses = 0;
         bool down = (digitalRead(BUTTON_PIN) == LOW);
         unsigned long now = millis();
         if (down != btnDown && now - btnEdgeMs > 40) {      // 40 мс — подавление дребезга
             btnDown = down;
             btnEdgeMs = now;
-            if (down) btnPresses++;
+            if (down) {
+                btnDownMs = now;
+            } else {
+                unsigned long held = now - btnDownMs;
+                if (held >= BTN_WAKE_MS) {
+                    screenWake();               // от двух секунд — только будим экран
+                } else if (held < BTN_TRIGGER_MAX_MS) {
+                    btnPresses++;               // короткое нажатие идёт в счёт серии
+                }
+                // Между секундой и двумя — намеренно ничего: так отсекается случайное
+                // удержание кнопки, которое иначе ушло бы сообщением в сеть.
+            }
         }
         // Серия закончена: кнопка отпущена и окно ожидания следующего нажатия истекло
         if (btnPresses > 0 && !btnDown && now - btnEdgeMs > SNS_BTN_DBL_WINDOW_MS) {
             int presses = btnPresses;
             btnPresses = 0;
+            screenWake();                       // результат должно быть видно
             if (presses >= 3) sensorPingSend();
             else sensorSendMsg(presses == 2 ? SENSOR_MSG_BUTTON2 : SENSOR_MSG_BUTTON);
         }

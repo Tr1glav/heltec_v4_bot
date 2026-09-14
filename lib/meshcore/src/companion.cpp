@@ -154,34 +154,38 @@ static int contactFind(const uint8_t* pub) {
 // это износ и задержка. Сохраняем, когда поток утих.
 #define CONTACTS_SAVE_DELAY_MS 5000
 
+#define CONTACTS_FILE "/contacts.bin"
+
+// Контакты живут файлом, а не записью в NVS: раздел nvs — это 20 КБ на всё вместе с
+// настройками, а список на 200 узлов занимает уже сорок с лишним килобайт.
 static void contactsSave() {
-    Preferences p;
-    if (!p.begin(COMPANION_NS, false)) return;
-    p.putUChar("ccount", contactCount);
-    // Ключ с номером: состав записи менялся, и чтение старой длины дало бы мусор в списке
-    if (contactCount > 0) p.putBytes("contacts2", contacts, sizeof(Contact) * contactCount);
-    p.end();
+    File f = LittleFS.open(CONTACTS_FILE, "w");
+    if (!f) { Serial.println("[BLE] файл контактов не открылся на запись"); return; }
+    f.write(&contactCount, 1);
+    size_t need = sizeof(Contact) * contactCount;
+    bool ok = (contactCount == 0) || (f.write((const uint8_t*)contacts, need) == need);
+    f.close();
+    if (!ok) { Serial.println("[BLE] список контактов записан не полностью"); return; }
     contactsDirty = false;
     Serial.printf("[BLE] контакты сохранены: %u\n", contactCount);
 }
 
 static void contactsLoad() {
-    Preferences p;
-    // На запись, как и конфиг: в режиме только для чтения несуществующее пространство
-    // имён даёт ошибку в журнале при каждом первом запуске устройства.
-    if (!p.begin(COMPANION_NS, false)) return;
-    uint8_t n = p.getUChar("ccount", 0);
+    contactCount = 0;
+    File f = LittleFS.open(CONTACTS_FILE, "r");
+    if (!f) { Serial.println("[BLE] списка контактов ещё нет"); return; }
+    uint8_t n = 0;
+    if (f.read(&n, 1) != 1) { f.close(); return; }
     if (n > COMPANION_MAX_CONTACTS) n = COMPANION_MAX_CONTACTS;
-    // Счётчик и записи — разные ключи NVS, и после смены формата счётчик может пережить
-    // данные. Если прочиталось не столько, сколько обещано, список считаем пустым:
-    // иначе приложение получило бы контакты из мусора.
     size_t need = sizeof(Contact) * n;
-    if (n > 0 && p.getBytes("contacts2", contacts, need) != need) {
-        Serial.println("[BLE] записи контактов не совпали с счётчиком, начинаем с пустого списка");
+    // Прочиталось меньше обещанного — файл оборван или от другой версии записи:
+    // лучше пустой список, чем контакты из мусора.
+    if (n > 0 && f.read((uint8_t*)contacts, need) != (int)need) {
+        Serial.println("[BLE] файл контактов повреждён, начинаем с пустого списка");
         n = 0;
     }
+    f.close();
     contactCount = n;
-    p.end();
     Serial.printf("[BLE] контактов загружено: %u\n", contactCount);
 }
 
@@ -330,6 +334,11 @@ void companionBegin() {
     BLEAdvertising* adv = BLEDevice::getAdvertising();
     adv->addServiceUUID(NUS_SERVICE);
     adv->setScanResponse(true);
+    // Интервал рекламы в единицах по 0.625 мс: 800–1200 мс вместо частого объявления.
+    // Телефон всё равно находит устройство за пару секунд, а радио большую часть
+    // времени молчит — на аккумуляторе это несколько миллиампер разницы.
+    adv->setMinInterval(1280);
+    adv->setMaxInterval(1920);
     BLEDevice::startAdvertising();
     Serial.printf("[BLE] компаньон «%s» ждёт подключения, код сопряжения %u\n",
                   name.c_str(), blePin);

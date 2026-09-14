@@ -15,6 +15,10 @@
 #include <time.h>
 #include <Update.h>
 
+#if defined(MQTT_ENABLED) || defined(COMPANION_NODE)
+#include <LittleFS.h>        // компаньон держит в файле список контактов
+#endif
+
 #ifdef MQTT_ENABLED
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -55,6 +59,20 @@
 #ifndef SNS_BTN_DBL_WINDOW_MS
 #define SNS_BTN_DBL_WINDOW_MS 700
 #endif
+// Нажатие короче секунды — это триггер (button/button2/проверка связи). Длинное
+// нажатие триггером не считается вовсе, а от двух секунд будит погасший экран:
+// иначе случайное удержание кнопки в кармане слало бы сообщения в сеть.
+#define BTN_TRIGGER_MAX_MS 1000
+#define BTN_WAKE_MS        2000
+
+// ===== ЭНЕРГОСБЕРЕЖЕНИЕ (узлы на аккумуляторе; координатор питается от сети) =====
+// Панель ест 15–25 мА и большую часть времени никем не читается.
+#define SCREEN_IDLE_OFF_MS (2UL * 60 * 1000)
+// На 80 МГц BLE и LoRa работают штатно, а ток меньше на 20–30 мА. Ниже 80 МГц
+// радиоподсистема не работает, поэтому это и есть нижняя граница. На время прошивки
+// по воздуху частота поднимается обратно: там кадры идут каждые 8 мс.
+#define CPU_MHZ_IDLE 80
+#define CPU_MHZ_FAST 240
 #ifndef SENSOR_HEARTBEAT_MS
 #define SENSOR_HEARTBEAT_MS (10UL * 60 * 1000)
 #endif
@@ -87,7 +105,10 @@ struct PeerEntry {
 #define PATH_HASH_SIZE 2
 #define PATH_LEN_INIT  ((uint8_t)((PATH_HASH_SIZE - 1) << 6))   // 0 хопов, хэш нужного размера
 
-#define COMPANION_MAX_CONTACTS 16   // список узлов, который видит приложение
+// Список узлов, который видит приложение. Лежит не в NVS (там всего 20 КБ на весь
+// раздел, вместе с настройками), а файлом в LittleFS, поэтому предел задаёт только
+// массив в памяти: 200 записей — это около 43 КБ при 320 КБ на плате.
+#define COMPANION_MAX_CONTACTS 200
 
 // ===== ИДЕНТИЧНОСТЬ НОДЫ ДЛЯ ADVERT =====
 #define ADVERT_PERIOD_MS        (5UL * 60 * 1000)
