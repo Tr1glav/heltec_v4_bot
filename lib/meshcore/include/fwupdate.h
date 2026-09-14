@@ -23,4 +23,8 @@ bool fwSelfUpdate(const String& url);      // скачать и прошить �
 bool fwFetchSensorImage(const String& url);// скачать .otaz в /ota.bin
 const char* fwSensorEnvForBoard(const String& board);
 void fwUpdateTick();                       // периодическая проверка и автообновление
+// Ручной запуск той же проверки кнопкой на странице: расписание и настройка auto_upd
+// не учитываются — нажатие кнопки и есть явное согласие обновиться. Возвращает строку
+// для страницы.
+String fwUpdateNow();
 #endif

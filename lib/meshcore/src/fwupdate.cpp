@@ -188,43 +188,75 @@ bool fwFetchSensorImage(const String& url) {
     return otaFwReady;
 }
 
+// Когда до следующей проверки: после начатой сессии очередь разбирается быстрее.
+static unsigned long fwNextInterval = FW_CHECK_INTERVAL_MS;
+// Самообновление, отложенное до следующего прохода цикла. Нужно только для ручного
+// запуска: прошивка себя заканчивается перезагрузкой, и если начать её прямо в
+// обработчике запроса, страница не успеет получить ответ.
+static bool fwSelfPending = false;
+
+// Один и тот же ход проверки для расписания и для кнопки. manual = нажали кнопку:
+// тогда настройка auto_upd не учитывается, ведь нажатие и есть явное согласие.
+// Возвращает строку, пригодную и для журнала, и для страницы.
+static String fwUpdateRun(bool manual) {
+    if (!wifiConnected) return "нет WiFi";
+    // Пока идёт прошивка, не начинаем ничего нового: сессия в эфире одна.
+    if (otaSessionActive()) return "идёт прошивка узла";
+    if (!fwCheckLatest()) return "не удалось получить сведения о релизе";
+    if (!manual && !cfg.autoUpd) return "автообновление выключено";
+
+    fwNextInterval = FW_CHECK_INTERVAL_MS;
+    // Сначала узлы: обновление себя означает перезагрузку и потерю сессии. Берём ровно
+    // один узел за проход — прошивка по радио занимает эфир целиком, и параллельно
+    // обновлять несколько физически нельзя.
+    for (int i = 0; i < sensorDeviceDiscCount; i++) {
+        if (!sensorOnlineNow[i] || sensorFwVersion[i].length() == 0) continue;
+        if (fwVersionCmp(fwLatest.version, sensorFwVersion[i]) <= 0) continue;
+        // Окружение берём из hello; у прошивок постарше его нет — тогда по плате
+        String envName = sensorEnv[i];
+        if (envName.length() == 0) envName = fwSensorEnvForBoard(sensorBoard[i]);
+        if (envName.length() == 0) continue;
+        String url = String(FW_RELEASE_DL) + "v" + fwLatest.version + "/"
+                   + envName + "_v" + fwLatest.version + ".otaz";
+        slog("[FW] узел %s: %s -> %s\n", sensorDeviceDisc[i].c_str(),
+             sensorFwVersion[i].c_str(), fwLatest.version.c_str());
+        if (fwFetchSensorImage(url) && otaStartSession(sensorDeviceDisc[i])) {
+            fwNextInterval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
+            return String("обновляю ") + sensorDeviceDisc[i] + ": "
+                 + sensorFwVersion[i] + " -> " + fwLatest.version;
+        }
+        return String("не удалось взять образ для ") + sensorDeviceDisc[i];
+    }
+    if (fwLatest.binUrl.length() > 0 && fwVersionCmp(fwLatest.version, FW_VERSION) > 0) {
+        if (manual) {
+            fwSelfPending = true;   // прошьём себя следующим проходом, после ответа странице
+            return String("ставлю на себя ") + fwLatest.version + ", устройство перезагрузится";
+        }
+        fwSelfUpdate(fwLatest.binUrl);
+        return "";
+    }
+    return String("обновлять нечего, последняя версия ") + fwLatest.version;
+}
+
 void fwUpdateTick() {
     if (!wifiConnected || !cfgReady()) return;
-    // Пока идёт прошивка, не проверяем и не начинаем ничего нового: сессия в эфире одна,
-    // и вклиниваться в неё нельзя.
+    if (fwSelfPending && !otaSessionActive()) {
+        fwSelfPending = false;
+        fwSelfUpdate(fwLatest.binUrl);   // отсюда возврата обычно нет: плата перезагружается
+        return;
+    }
     if (otaSessionActive()) return;
 
     static unsigned long lastCheck = 0;
-    static unsigned long interval = FW_CHECK_INTERVAL_MS;
-    if (lastCheck != 0 && millis() - lastCheck < interval) return;
+    if (lastCheck != 0 && millis() - lastCheck < fwNextInterval) return;
     lastCheck = millis();
-    interval = FW_CHECK_INTERVAL_MS;
-    if (!fwCheckLatest()) return;
-    if (!cfg.autoUpd) return;
+    String r = fwUpdateRun(false);
+    if (r.length() > 0) slog("[FW] %s\n", r.c_str());
+}
 
-    // Сначала сенсоры: обновление себя означает перезагрузку и потерю сессии.
-    // Берём ровно один сенсор за проход — прошивка по радио занимает эфир целиком,
-    // и параллельно обновлять несколько физически нельзя.
-    {
-        for (int i = 0; i < sensorDeviceDiscCount; i++) {
-            if (!sensorOnlineNow[i] || sensorFwVersion[i].length() == 0) continue;
-            if (fwVersionCmp(fwLatest.version, sensorFwVersion[i]) <= 0) continue;
-            // Окружение берём из hello; у прошивок постарше его нет — тогда по плате
-            String envName = sensorEnv[i];
-            if (envName.length() == 0) envName = fwSensorEnvForBoard(sensorBoard[i]);
-            if (envName.length() == 0) continue;
-            String url = String(FW_RELEASE_DL) + "v" + fwLatest.version + "/"
-                       + envName + "_v" + fwLatest.version + ".otaz";
-            slog("[FW] сенсор %s: %s -> %s\n", sensorDeviceDisc[i].c_str(),
-                 sensorFwVersion[i].c_str(), fwLatest.version.c_str());
-            if (fwFetchSensorImage(url) && otaStartSession(sensorDeviceDisc[i])) {
-                interval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
-                return;
-            }
-        }
-    }
-    if (fwLatest.binUrl.length() > 0 && fwVersionCmp(fwLatest.version, FW_VERSION) > 0) {
-        fwSelfUpdate(fwLatest.binUrl);
-    }
+String fwUpdateNow() {
+    String r = fwUpdateRun(true);
+    slog("[FW] проверка по кнопке: %s\n", r.c_str());
+    return r;
 }
 #endif

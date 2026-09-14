@@ -4,6 +4,7 @@
 #include "radio.h"
 #include "mesh.h"
 #include "ota.h"
+#include "fwupdate.h"   // проверка обновлений по кнопке
 #include "display.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -651,6 +652,12 @@ void otaHandleSensorsConfig() {
                    String("отправлено полей: ") + sent + ", ответы смотрите в журнале");
 }
 
+// Кнопка «Проверить обновления»: тот же ход, что у автообновления по расписанию.
+void otaHandleFwCheck() {
+    String msg = fwUpdateNow();
+    otaServer.send(200, "text/plain; charset=utf-8", msg);
+}
+
 void otaHandleSensorsHello() {
     if (otaSessionActive()) { otaServer.send(409, "text/plain", "идёт прошивка сенсора"); return; }
     if (sensorChannelIdx < 0) { otaServer.send(503, "text/plain", "канал сенсоров не настроен"); return; }
@@ -674,7 +681,8 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang='ru'><h
 <div id='info' class='info'>…</div>
 <label>Куда прошиваем</label>
 <div id='targets'></div>
-<div class='row'><button id='ask' class='sec sm grow'>Опросить сенсоры</button></div>
+<div class='row'><button id='ask' class='sec sm grow'>Опросить сенсоры</button>
+<button id='fwchk' class='sec sm grow'>Проверить обновления</button></div>
 <details class='cfg' id='scfgbox' hidden><summary>Настройки сенсора по радио</summary>
 <div id='scfg'></div>
 <div class='cfghint'>Заполняйте только те поля, которые меняете. Сенсор применяет их в памяти,
@@ -1040,6 +1048,7 @@ void setupOtaServer() {
     otaServer.on("/ota/status", HTTP_GET, otaHandleStatus);
     otaServer.on("/sensors", HTTP_GET, otaHandleSensors);
     otaServer.on("/sensors/hello", HTTP_POST, otaHandleSensorsHello);
+    otaServer.on("/fw/check", HTTP_POST, otaHandleFwCheck);
     otaServer.on("/sensors/config", HTTP_POST, otaHandleSensorsConfig);
     otaServer.on("/logs", HTTP_GET, []() {
         otaServer.sendHeader("X-Log-Pos", String(logTotal));

@@ -103,6 +103,17 @@ $('ask').onclick=async()=>{
   }catch(e){if(!busy)st(e.message,'err')}
   $('ask').disabled=false;
 };
+$('fwchk').onclick=async()=>{
+  $('fwchk').disabled=true;
+  if(!busy)st('Спрашиваю GitHub…','ok');
+  try{
+    const r=await fetch('/fw/check',{method:'POST'});
+    const t=(await r.text()).trim();
+    if(!busy)st(t||'готово',r.ok?'ok':'err');
+    await loadSensors();
+  }catch(e){if(!busy)st(e.message,'err')}
+  $('fwchk').disabled=false;
+};
 let logPos=0,logTimer=null,logAll='',logLines=[],filterQ='';
 const atBottom=()=>{const l=$('logs');return l.scrollTop+l.clientHeight>=l.scrollHeight-12};
 function scrollBottom(){const l=$('logs');l.scrollTop=l.scrollHeight;$('down').hidden=true}

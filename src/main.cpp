@@ -477,7 +477,7 @@ void loop() {
             } else {
                 unsigned long held = now - btnDownMs;
                 if (held >= BTN_WAKE_MS) {
-                    screenWake();               // от двух секунд — только будим экран
+                    screenToggle();             // от двух секунд — переключаем экран
                 } else if (held < BTN_TRIGGER_MAX_MS) {
                     btnPresses++;               // короткое нажатие идёт в счёт серии
                 }

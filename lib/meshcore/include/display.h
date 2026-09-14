@@ -2,8 +2,9 @@
 #include "config.h"
 void drawIdleStatus();
 #ifdef SENSOR_NODE
-// Экран узла гаснет в простое и просыпается от длинного нажатия кнопки
+// Экран узла гаснет в простое. Длинное нажатие кнопки переключает его вручную.
 void screenWake();
+void screenToggle();
 bool screenIsOn();
 void screenTick();
 #endif

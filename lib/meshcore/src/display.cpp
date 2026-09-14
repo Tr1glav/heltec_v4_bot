@@ -126,6 +126,19 @@ void screenWake() {
 
 bool screenIsOn() { return screenOn; }
 
+// Длинное нажатие кнопки: горит — гасим, погас — зажигаем. Ручное решение сильнее
+// сторожа простоя: выключенный вручную экран сам не загорится.
+void screenToggle() {
+    if (screenOn) {
+        screenOn = false;
+        display.setPower(false);
+        Serial.println("[SCR] экран выключен кнопкой");
+    } else {
+        screenWake();
+        Serial.println("[SCR] экран включён кнопкой");
+    }
+}
+
 void screenTick() {
     if (!screenOn) return;
     #ifdef COMPANION_NODE
