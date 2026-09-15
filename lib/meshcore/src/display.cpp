@@ -3,6 +3,7 @@
 #include "crypto.h"
 #include "display.h"
 #include "companion.h"   // код сопряжения BLE на экране компаньона
+#include "mesh_ip.h"     // экран AP IP-туннеля (FEATURE_MESH_IP)
 
 #ifdef SENSOR_NODE
 // "12m05s" / "3h07m" — сколько прошло с момента sinceMs
@@ -195,6 +196,29 @@ void drawIdleStatus() {
     if (timeSyncMs) display.printf("sync %s ago\n", agoStr(timeSyncMs).c_str());
     else            display.println("sync: never");
     display.printf("Up: %luh%02lum\n", up / 3600, (up % 3600) / 60);
+    #if defined(COMPANION_NODE) && FEATURE_MESH_IP
+    // IP over mesh на компаньоне: когда AP включён, показываем SSID/пароль и статус
+    // туннеля вместо последнего отправленного в сенсорный канал сообщения.
+    if (meshIpApActive()) {
+        display.printf("AP %s\n", meshIpApSsid());
+        display.printf("pw %s\n", meshIpApPass());
+        display.printf("%s\n", meshIpLinkUp() ? "tunnel UP" : "waiting peer");
+        display.setCursor(0, 56);
+        display.print("v" FW_VERSION);
+        #if HAS_BATTERY
+        if (batteryPresent()) {
+            char bat[16];
+            char v[12];
+            snprintf(bat, sizeof(bat), "%d%% %sV", batteryPercent(),
+                     fmtFix(batteryVoltage(), 2, v, sizeof(v)));
+            display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
+            display.print(bat);
+        }
+        #endif
+        display.display();
+        return;
+    }
+    #endif
     if (sensorLastSent.length() > 0) {
         display.printf("TX: %s\n", sensorLastSent.substring(0, 17).c_str());
         display.printf("    %s ago\n", agoStr(sensorLastSentMs).c_str());

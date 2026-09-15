@@ -68,6 +68,11 @@
   #endif
 #endif
 
+// --- сеть через mesh ---
+#ifndef FEATURE_MESH_IP         // IP-over-mesh: компаньон раздаёт WiFi, координатор — шлюз в интернет
+  #define FEATURE_MESH_IP 0
+#endif
+
 // --- железо ---
 #ifndef FEATURE_BUTTON
   #define FEATURE_BUTTON FEATURE_SENSOR
@@ -85,6 +90,9 @@
 #endif
 #if FEATURE_COMPANION && !FEATURE_SENSOR
   #error "Компаньон собирается поверх сенсорного узла: нужен FEATURE_SENSOR"
+#endif
+#if FEATURE_MESH_IP && !FEATURE_SENSOR
+  #error "FEATURE_MESH_IP требует FEATURE_SENSOR (сенсорный канал для туннеля)"
 #endif
 // Код пока ветвится и по старому флагу MQTT_ENABLED, который задаёт platformio.ini: под ним
 // лежат wifi/mqtt/fwupdate/ota.cpp целиком. Если новый признак включён, а старого флага нет,

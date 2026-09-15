@@ -3,6 +3,7 @@
 #include "mesh.h"
 #include "display.h"
 #include "button.h"
+#include "mesh_ip.h"   // компаньон: двойное нажатие включает/выключает AP туннеля
 
 // ===== Кнопка узла =====
 // Выделено из главного цикла. Нажатия считаются без остановки цикла: короткое (меньше
@@ -48,6 +49,14 @@ void buttonTick() {
             btnPresses = 0;
             screenWake();                       // результат должно быть видно
             if (presses >= 3) sensorPingSend();
+            // Компаньон: двойное нажатие включает/выключает softAP IP-туннеля —
+            // телефон подключается к нему и уходит в интернет через mesh-шлюз.
+            #if FEATURE_MESH_IP && defined(COMPANION_NODE)
+            else if (presses == 2) {
+                if (meshIpApActive()) meshIpApStop();
+                else meshIpApStart();
+            }
+            #endif
             // На компаньоне короткие нажатия в сеть не уходят: это телефон в кармане,
             // случайные 1-2 нажатия не должны слать "button"/"button2" в MQTT. Остаются
             // тройное нажатие (проверка связи) и долгое (экран). На сенсоре как было.

@@ -6,6 +6,7 @@
 #include "display.h"
 #include "ota.h"
 #include "companion.h"
+#include "mesh_ip.h"   // туннель IP over MeshCore (FEATURE_MESH_IP)
 
 // ===== Разбор входящего пакета =====
 // Выделено из mesh.cpp: распознавание типа пакета, проверка адресата, расшифровка
@@ -185,6 +186,16 @@ bool parseMeshCorePacket(uint8_t* data, int len) {
 
     // не обрабатываем собственные сообщения (эхо собственного флуда)
     if (lastSender == cfg.name) return false;
+
+    #if FEATURE_MESH_IP
+    // === IP OVER MESH: трафик туннеля (фрагменты/ACK) не показываем на экране,
+    //     не пересылаем в приложение и не отвечаем на него как на сообщение —
+    //     этим занимается транспорт mesh_ip.cpp ===
+    if (lastMessage.startsWith(MESH_IP_PFX)) {
+        meshIpOnChannelText(lastSender, lastMessage);
+        return true;
+    }
+    #endif
 
     #ifdef COMPANION_NODE
     // Показываем всё, что пришло в канал, включая служебный обмен узлов (hello, ping,
