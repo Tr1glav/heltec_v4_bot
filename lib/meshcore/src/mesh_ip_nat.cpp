@@ -145,7 +145,6 @@ static void natUpstreamCb(const uint8_t* pkt, uint16_t len) {
     if (ihl < 20 || ihl >= len) return;
     uint8_t proto = pkt[9];
     if (proto != 1 && proto != 6 && proto != 17) return;
-    // Фрагменты IP обойти NAT не можем (порты только в первом) — пропускаем
     uint16_t fragOff = (uint16_t)(((pkt[6] & 0x1F) << 8) | pkt[7]);
     if (fragOff != 0) return;
 
@@ -156,8 +155,11 @@ static void natUpstreamCb(const uint8_t* pkt, uint16_t len) {
                        ((uint32_t)pkt[14] << 8) | (uint32_t)pkt[15];
     uint32_t dstIp = ((uint32_t)pkt[16] << 24) | ((uint32_t)pkt[17] << 16) |
                      ((uint32_t)pkt[18] << 8) | (uint32_t)pkt[19];
-    // cls guest — dst должен быть публичным (не 192.168.4.x и не broadcast/multicast)
     if ((dstIp & 0xFF000000) == 0xE0000000 || dstIp == 0xFFFFFFFF) return;
+
+    Serial.printf("[NAT] ← tunnel %dB proto=%d %d.%d.%d.%d:%u → %d.%d.%d.%d\n", len, proto,
+                  (int)pkt[12], (int)pkt[13], (int)pkt[14], (int)pkt[15], phonePort,
+                  (int)pkt[16], (int)pkt[17], (int)pkt[18], (int)pkt[19]);
 
     NatEntry* e = natFindOrCreate(proto, phoneIp, phonePort);
     if (!e) { Serial.println("[NAT] table full"); return; }

@@ -252,6 +252,13 @@ void companionBegin() {
 uint32_t companionBlePin() { return blePin; }
 bool companionBleLinked() { return blePaired; }
 
+void companionBleStop() {
+    BLEDevice::deinit(true);   // полное отключение BLE, освобождает ~70 КБ RAM
+    bleServer = nullptr;
+    blePaired = false;
+    Serial.println("[BLE] deinit — freed ~70 KB for WiFi AP");
+}
+
 void companionOnChannelText(int channelIdx, const String& text, float snr, uint8_t pathLen,
                             bool notify) {
     if (msgCount >= MSG_QUEUE_MAX) {   // очередь полна — вытесняем самое старое

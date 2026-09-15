@@ -10,13 +10,14 @@
 #if FEATURE_MESH_IP && defined(COMPANION_NODE)
 
 #include "mesh_ip.h"
+#include "companion.h"   // companionBleStop / companionBegin
 #include "globals.h"
 #include "display.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_netif.h>
-#include <esp_netif_net_stack.h>   // esp_netif_get_netif_impl
+#include <esp_netif_net_stack.h>
 #include <esp_wifi.h>
 #include <esp_private/wifi.h>
 #include <lwip/raw.h>
@@ -25,22 +26,44 @@
 #include <lwip/ip_addr.h>
 #include <lwip/pbuf.h>
 
+// ===================== Состояние =====================
+
 static esp_netif_t*         s_apNetif    = NULL;
 static esp_netif_ip_info_t  s_apIp;
 static struct netif*        s_apLwip    = NULL;
 static bool                 s_apActive  = false;
 static String               s_ssid;
 static String               s_pass;
+static bool                 s_inited    = false;   // пароль сгенерирован при старте
 
 static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb);
-
-// Колбэк собранной из туннеля датаграммы — определён ниже, нужен meshIpApStart.
 static void meshIpApRecvCb(const uint8_t* pkt, uint16_t len);
 
 // ===================== Жизненный цикл AP =====================
 
 void meshIpApInit() {
-    // AP включается пользователем (двойное нажатие), при старте ничего не делаем.
+    // Пароль генерируется ОДИН раз при включении ноды — чтобы можно было
+    // переподключиться после потери связи без повторного нажатия кнопки.
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);   // MAC STA стабильнее, чем AP
+
+    char ssidBuf[32];
+    snprintf(ssidBuf, sizeof(ssidBuf), "mesh-%02X%02X", mac[4], mac[5]);
+
+    // Детерминированный пароль: MAC + startup millis
+    uint32_t seed = (uint32_t)millis();
+    for (int i = 0; i < 6; i++) seed ^= (uint32_t)mac[i] << ((i & 3) * 8);
+    char passBuf[16];
+    for (int i = 0; i < 8; i++) {
+        seed = seed * 1103515245 + 12345;
+        passBuf[i] = (char)('0' + (seed / 65536) % 10);
+    }
+    passBuf[8] = 0;
+
+    s_ssid = String(ssidBuf);
+    s_pass = String(passBuf);
+    s_inited = true;
+    Serial.printf("[IP] pass=%s generated at boot\n", passBuf);
 }
 
 const char* meshIpApSsid() { return s_ssid.c_str(); }
@@ -49,26 +72,22 @@ bool meshIpApActive()      { return s_apActive; }
 
 void meshIpApStart() {
     if (s_apActive) return;
-    uint8_t mac[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_AP, mac);
+    if (!s_inited) { Serial.println("[IP] not inited!"); return; }
 
-    char ssidBuf[32];
-    snprintf(ssidBuf, sizeof(ssidBuf), "mesh-%02X%02X", mac[4], mac[5]);
-    uint32_t seed = (millis() ^ ((uint32_t)mac[2] << 16 | (uint32_t)mac[3])) & 0x7FFFFFFF;
-    char passBuf[16];
-    for (int i = 0; i < 8; i++) {
-        seed = seed * 1103515245 + 12345;
-        passBuf[i] = (char)('0' + (seed / 65536) % 10);
-    }
-    passBuf[8] = 0;
-    s_ssid = String(ssidBuf);
-    s_pass = String(passBuf);
+    Serial.println("[IP] === AP START ===");
 
-    if (!WiFi.softAP(ssidBuf, passBuf)) {
-        Serial.println("[IP] softAP FAILED");
-        return;
-    }
-    delay(100);  // дать AP-интерфейсу подняться (DHCP-сервер, netif)
+    // 1) Полностью выключаем BLE — освобождаем ~70 КБ RAM + освобождаем радио
+    Serial.println("[IP] stopping BLE...");
+    companionBleStop();
+
+    // 2) Максимальная частота процессора — вся мощность на WiFi + LoRa
+    setCpuFrequencyMhz(CPU_MHZ_FAST);
+    Serial.printf("[IP] CPU → %d MHz\n", CPU_MHZ_FAST);
+
+    // 3) Поднимаем WiFi AP
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(s_ssid.c_str(), s_pass.c_str());
+    delay(200);   // дать AP подняться (DHCP-сервер, netif)
 
     s_apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (s_apNetif) {
@@ -76,36 +95,51 @@ void meshIpApStart() {
         s_apLwip = (struct netif*)esp_netif_get_netif_impl(s_apNetif);
     }
     if (!s_apLwip) {
-        Serial.println("[IP] AP netif not found");
+        Serial.println("[IP] AP netif FAIL — rollback");
         WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        setCpuFrequencyMhz(CPU_MHZ_IDLE);
+        companionBegin();
         return;
     }
 
-    // Перехват RX-буфера AP. Кадры в «чужую» сеть забираем в туннель, остальное
-    // (ARP/DHCP/к себе) прогоняем через esp_netif_receive — ровно как делал бы
-    // штатный wifi_ap_receive.
+    // 4) Перехват RX-буфера AP: гребём «чужой» IPv4 в туннель,
+    //    ARP/DHCP/локальное — в lwIP как обычно.
     esp_wifi_internal_reg_rxcb(WIFI_IF_AP, apRxGrab);
 
-    // Собранные из туннеля IP-датаграммы уходят в телефон
+    // 5) Даунлинк: из туннеля → телефон
     meshIpSetRecvCb(meshIpApRecvCb);
 
     s_apActive = true;
-    Serial.printf("[IP] AP ssid=%s pass=%s gw=%ld.%ld.%ld.%ld\n",
-                  ssidBuf, passBuf,
-                  (long)(s_apIp.ip.addr >> 24) & 0xFF, (long)(s_apIp.ip.addr >> 16) & 0xFF,
-                  (long)(s_apIp.ip.addr >> 8) & 0xFF, (long)s_apIp.ip.addr & 0xFF);
+    Serial.printf("[IP] AP UP  ssid=%s pass=%s gw=%d.%d.%d.%d\n",
+                  s_ssid.c_str(), s_pass.c_str(),
+                  s_apIp.ip.addr & 0xFF, (s_apIp.ip.addr >> 8) & 0xFF,
+                  (s_apIp.ip.addr >> 16) & 0xFF, (s_apIp.ip.addr >> 24) & 0xFF);
     screenWake();
 }
 
 void meshIpApStop() {
     if (!s_apActive) return;
+    Serial.println("[IP] === AP STOP ===");
     s_apActive = false;
-    // При остановке AP слот rxcb освобождается драйвером сам; переустанавливаем
-    // перехват при следующем старте (idempotent). Старый callback не трогаем.
+
     WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    // Восстанавливаем BLE
+    companionBegin();
+    Serial.println("[IP] BLE restarted");
+
+    // Восстанавливаем частоту
+    setCpuFrequencyMhz(CPU_MHZ_IDLE);
+    Serial.printf("[IP] CPU → %d MHz\n", CPU_MHZ_IDLE);
+    screenWake();
 }
 
 // ===================== Захват входящих кадров телефона =====================
+
+static uint32_t s_rxFwd = 0;   // forwarded to lwIP (ARP/DHCP/local)
+static uint32_t s_rxTun = 0;   // injected into tunnel
 
 static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
     if (!s_apNetif || !buffer || len < 14) {
@@ -121,14 +155,16 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
         typeOff = 12;
     } else if (len >= 22 && b[12] == 0xAA && b[13] == 0xAA && b[14] == 0x03 &&
                b[15] == 0x00 && b[16] == 0x00 && b[17] == 0x00) {
-        typeOff = 20;   // SNAP: LLC aa aa 03 + OUI 00 00 00 + ethertype
+        typeOff = 20;
     } else {
+        s_rxFwd++;
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
 
     uint16_t etype = (uint16_t)((b[typeOff] << 8) | b[typeOff + 1]);
-    if (etype != 0x0800) {               // ARP, IPv6 и пр. — lwIP сам
+    if (etype != 0x0800) {
+        s_rxFwd++;
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
@@ -143,19 +179,32 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
     uint32_t dst = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
                    ((uint32_t)ip[18] << 8) | (uint32_t)ip[19];
 
-    // Локальная цель (шлюзу/DHCP/broadcast) — пусть обработает lwIP
+    // Локальная цель (шлюзу/DHCP/broadcast) — lwIP обработает
     if (dst == 0 || dst == 0xFFFFFFFF || dst == s_apIp.ip.addr) {
+        s_rxFwd++;
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
 
-    // Датаграмма в «внешний» мир — в туннель
+    // Внешний мир → туннель
     int takeLen = (int)iplen;
     if (takeLen > MESH_IP_PKT_MAX) takeLen = MESH_IP_PKT_MAX;
     uint8_t pkt[MESH_IP_PKT_MAX];
     memcpy(pkt, ip, (size_t)takeLen);
     esp_wifi_internal_free_rx_buffer(eb);
     meshIpInject(pkt, (uint16_t)takeLen);
+
+    s_rxTun++;
+    if ((s_rxTun & 0x1F) == 1) {   // раз в 32 пакета, чтобы не спамить
+        uint32_t src = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                       ((uint32_t)ip[14] << 8) | (uint32_t)ip[15];
+        Serial.printf("[IP] rx tun #%lu: %d.%d.%d.%d → %d.%d.%d.%d (%dB)\n",
+                      s_rxTun,
+                      (int)ip[12], (int)ip[13], (int)ip[14], (int)ip[15],
+                      (int)ip[16], (int)ip[17], (int)ip[18], (int)ip[19],
+                      takeLen);
+        (void)src;
+    }
     return ESP_OK;
 }
 
@@ -168,14 +217,12 @@ static struct raw_pcb* apGetOrCreateRaw(uint8_t proto) {
     if (!s_rawSend[proto]) {
         struct raw_pcb* pcb = raw_new_ip_type(IPADDR_TYPE_V4, proto);
         if (!pcb) return NULL;
-        raw_bind_netif(pcb, s_apLwip);   // отправка — строго через AP-интерфейс
+        raw_bind_netif(pcb, s_apLwip);
         s_rawSend[proto] = pcb;
     }
     return s_rawSend[proto];
 }
 
-// Полный IPv4-датаграммы для телефона (src=шлюз, dst=телефон). Отправляем
-// транспортный сегмент через raw_sendto_if_src — lwIP соберёт IP-заголовок.
 static uint8_t  s_sendPkt[MESH_IP_PKT_MAX];
 static uint16_t s_sendLen = 0;
 
@@ -190,9 +237,9 @@ static void apSendToPhoneTcpip(void* arg) {
     uint16_t segLen = s_sendLen - ihl;
 
     struct raw_pcb* pcb = apGetOrCreateRaw(proto);
-    if (!pcb) return;
+    if (!pcb) { Serial.println("[IP] raw_new FAIL"); return; }
     struct pbuf* p = pbuf_alloc(PBUF_RAW, segLen, PBUF_RAM);
-    if (!p) return;
+    if (!p) { Serial.println("[IP] pbuf_alloc FAIL"); return; }
     memcpy(p->payload, ip + ihl, segLen);
 
     ip_addr_t src_ip, dst_ip;
@@ -200,13 +247,17 @@ static void apSendToPhoneTcpip(void* arg) {
     IP_ADDR4(&dst_ip, ip[16], ip[17], ip[18], ip[19]);
     err_t err = raw_sendto_if_src(pcb, p, &dst_ip, s_apLwip, &src_ip);
     if (err != ERR_OK) {
-        Serial.printf("[IP] ap send err=%d\n", (int)err);
+        Serial.printf("[IP] → phone ERR %d  proto=%d seg=%d\n", (int)err, proto, segLen);
+    } else {
+        Serial.printf("[IP] → phone OK   proto=%d seg=%d %d.%d.%d.%d\n",
+                      proto, segLen, ip[16], ip[17], ip[18], ip[19]);
     }
     pbuf_free(p);
 }
 
 static void meshIpApRecvCb(const uint8_t* pkt, uint16_t len) {
     if (!s_apActive || len > sizeof(s_sendPkt)) return;
+    Serial.printf("[IP] recvCb %dB → phone\n", len);
     memcpy(s_sendPkt, pkt, len);
     s_sendLen = len;
     tcpip_callback(apSendToPhoneTcpip, NULL);

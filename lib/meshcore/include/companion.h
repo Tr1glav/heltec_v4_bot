@@ -11,6 +11,8 @@
 // окружение компаньона определяет и SENSOR_NODE, поэтому тот код собирается как есть.
 void companionBegin();
 void companionTick();
+// Полное отключение BLE (BLEDevice::deinit) — освобождает ~70 КБ RAM
+void companionBleStop();
 // Код сопряжения BLE — случайный при каждом запуске, показывается на экране
 uint32_t companionBlePin();
 // true — приложение подключено; пока нет, экран занят кодом сопряжения

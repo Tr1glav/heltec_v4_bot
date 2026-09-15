@@ -197,24 +197,19 @@ void drawIdleStatus() {
     else            display.println("sync: never");
     display.printf("Up: %luh%02lum\n", up / 3600, (up % 3600) / 60);
     #if defined(COMPANION_NODE) && FEATURE_MESH_IP
-    // IP over mesh на компаньоне: когда AP включён, показываем SSID/пароль и статус
-    // туннеля вместо последнего отправленного в сенсорный канал сообщения.
+    // IP over mesh на компаньоне: в режиме AP — только SSID и пароль.
+    // Весь ресурс уходит на WiFi + туннель, экран простой.
     if (meshIpApActive()) {
-        display.printf("AP %s\n", meshIpApSsid());
-        display.printf("pw %s\n", meshIpApPass());
-        display.printf("%s\n", meshIpLinkUp() ? "tunnel UP" : "waiting peer");
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("IP MESH AP");
+        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+        display.setCursor(0, 14);
+        display.printf("SSID:\n%s\n", meshIpApSsid());
+        display.printf("PASS:\n%s\n", meshIpApPass());
         display.setCursor(0, 56);
-        display.print("v" FW_VERSION);
-        #if HAS_BATTERY
-        if (batteryPresent()) {
-            char bat[16];
-            char v[12];
-            snprintf(bat, sizeof(bat), "%d%% %sV", batteryPercent(),
-                     fmtFix(batteryVoltage(), 2, v, sizeof(v)));
-            display.setCursor(SCREEN_WIDTH - (int)strlen(bat) * 6, 56);
-            display.print(bat);
-        }
-        #endif
+        display.print(meshIpLinkUp() ? "tunnel UP" : "waiting peer");
         display.display();
         return;
     }
