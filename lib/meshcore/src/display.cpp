@@ -171,6 +171,25 @@ static void drawBtIcon(int x, int y) {
 #endif
 
 void drawIdleStatus() {
+    #if defined(COMPANION_NODE) && FEATURE_MESH_IP
+    // Режим AP (IP over mesh) имеет полный приоритет: BLE выключен, экран —
+    // только SSID и пароль точки, чтобы их можно было прочитать и ввести.
+    if (meshIpApActive()) {
+        if (!screenOn) { screenOn = true; display.setPower(true); }
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("IP MESH AP");
+        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+        display.setCursor(0, 14);
+        display.printf("SSID:\n%s\n", meshIpApSsid());
+        display.printf("PASS:\n%s\n", meshIpApPass());
+        display.setCursor(0, 56);
+        display.print(meshIpLinkUp() ? "tunnel UP" : "waiting peer");
+        display.display();
+        return;
+    }
+    #endif
     #ifdef SENSOR_NODE
     if (!screenOn) return;          // панель выключена — не тратим шину I2C впустую
     if (pingShowUntil != 0 && (long)(millis() - pingShowUntil) < 0) { drawPingResult(); return; }
@@ -196,24 +215,6 @@ void drawIdleStatus() {
     if (timeSyncMs) display.printf("sync %s ago\n", agoStr(timeSyncMs).c_str());
     else            display.println("sync: never");
     display.printf("Up: %luh%02lum\n", up / 3600, (up % 3600) / 60);
-    #if defined(COMPANION_NODE) && FEATURE_MESH_IP
-    // IP over mesh на компаньоне: в режиме AP — только SSID и пароль.
-    // Весь ресурс уходит на WiFi + туннель, экран простой.
-    if (meshIpApActive()) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.println("IP MESH AP");
-        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-        display.setCursor(0, 14);
-        display.printf("SSID:\n%s\n", meshIpApSsid());
-        display.printf("PASS:\n%s\n", meshIpApPass());
-        display.setCursor(0, 56);
-        display.print(meshIpLinkUp() ? "tunnel UP" : "waiting peer");
-        display.display();
-        return;
-    }
-    #endif
     if (sensorLastSent.length() > 0) {
         display.printf("TX: %s\n", sensorLastSent.substring(0, 17).c_str());
         display.printf("    %s ago\n", agoStr(sensorLastSentMs).c_str());
