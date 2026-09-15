@@ -9,6 +9,11 @@ AppConfig cfg;
 
 static const char* NS = "meshcfg";
 
+// Имя узла: столько влезает в ADV-кадр (mesh_tx.cpp режет на 31) и в адресата OTA
+// (otaStartSession отвергает target длиннее 31). Больше задать нельзя — иначе обрезание
+// в одном месте и в другом даст совпавшие короткие имена у разных узлов.
+static const int CFG_NAME_MAX = 31;
+
 // Одна таблица описывает поле сразу для трёх вещей: чтения из NVS, записи и команды "set".
 // Добавить настройку — добавить строку. Значение по умолчанию берётся из макросов
 // board_config.h: там же лежат параметры железа, и оба источника не расходятся.
@@ -23,24 +28,25 @@ struct CfgField {
     float AppConfig::*f;
     bool secret;              // скрывать значение в "show"
     float def;                // значение по умолчанию для числовых полей
+    float lo, hi;             // допустимый диапазон числового поля: lo==hi — не проверять
     const char* defStr;       // ...и для строковых
 };
 
 #define F_STR(cmd, member, secret, def) \
-    { cmd, CFG_STR, &AppConfig::member, nullptr, nullptr, nullptr, secret, 0, def }
-#define F_U16(cmd, member, def) \
-    { cmd, CFG_U16, nullptr, &AppConfig::member, nullptr, nullptr, false, def, "" }
-#define F_I16(cmd, member, def) \
-    { cmd, CFG_I16, nullptr, nullptr, &AppConfig::member, nullptr, false, def, "" }
-#define F_FLT(cmd, member, def) \
-    { cmd, CFG_FLT, nullptr, nullptr, nullptr, &AppConfig::member, false, def, "" }
+    { cmd, CFG_STR, &AppConfig::member, nullptr, nullptr, nullptr, secret, 0, 0, 0, def }
+#define F_U16(cmd, member, def, lo, hi) \
+    { cmd, CFG_U16, nullptr, &AppConfig::member, nullptr, nullptr, false, def, lo, hi, "" }
+#define F_I16(cmd, member, def, lo, hi) \
+    { cmd, CFG_I16, nullptr, nullptr, &AppConfig::member, nullptr, false, def, lo, hi, "" }
+#define F_FLT(cmd, member, def, lo, hi) \
+    { cmd, CFG_FLT, nullptr, nullptr, nullptr, &AppConfig::member, false, def, lo, hi, "" }
 
 static const CfgField FIELDS[] = {
     F_STR("name",      name,      false, ""),
     F_STR("wifi_ssid", wifiSsid,  false, ""),
     F_STR("wifi_pass", wifiPass,  true,  ""),
     F_STR("mqtt_host", mqttHost,  false, ""),
-    F_U16("mqtt_port", mqttPort,  1883),
+    F_U16("mqtt_port", mqttPort,  1883, 1, 65535),
     F_STR("mqtt_user", mqttUser,  false, ""),
     F_STR("mqtt_pass", mqttPass,  true,  ""),
     F_STR("prv_name",  prvName,   false, ""),
@@ -48,17 +54,17 @@ static const CfgField FIELDS[] = {
     F_STR("sns_name",  snsName,   false, ""),
     F_STR("sns_key",   snsKey,    true,  ""),
     F_STR("tx_ch",     txChannel, false, "#connections"),
-    F_FLT("lora_freq", loraFreq,  LORA_FREQ),
-    F_FLT("lora_bw",   loraBw,    LORA_BW),
-    F_U16("lora_sf",   loraSf,    LORA_SF),
-    F_U16("lora_cr",   loraCr,    LORA_CR),
-    F_I16("lora_tx",   loraTx,    LORA_TX_POWER),
-    F_U16("lora_pre",  loraPre,   LORA_PREAMBLE),
-    F_U16("lora_sync", loraSync,  LORA_SYNC_WORD),
-    F_I16("tz",        tzOffset,  TZ_OFFSET_HOURS),
-    F_U16("disp_bri",  dispBri,   255),
-    F_U16("vext_on",   vextOn,    VEXT_EN_ACTIVE),
-    F_U16("auto_upd",  autoUpd,   1),
+    F_FLT("lora_freq", loraFreq,  LORA_FREQ, 400, 1000),
+    F_FLT("lora_bw",   loraBw,    LORA_BW, 7, 500),
+    F_U16("lora_sf",   loraSf,    LORA_SF, 5, 12),
+    F_U16("lora_cr",   loraCr,    LORA_CR, 5, 8),
+    F_I16("lora_tx",   loraTx,    LORA_TX_POWER, -22, 22),
+    F_U16("lora_pre",  loraPre,   LORA_PREAMBLE, 4, 255),
+    F_U16("lora_sync", loraSync,  LORA_SYNC_WORD, 0, 255),
+    F_I16("tz",        tzOffset,  TZ_OFFSET_HOURS, -12, 14),
+    F_U16("disp_bri",  dispBri,   255, 0, 255),
+    F_U16("vext_on",   vextOn,    VEXT_EN_ACTIVE, 0, 1),
+    F_U16("auto_upd",  autoUpd,   1, 0, 1),
 };
 static const size_t FIELD_COUNT = sizeof(FIELDS) / sizeof(FIELDS[0]);
 
@@ -94,6 +100,9 @@ bool cfgLoad() {
         }
     }
     p.end();
+    // Если в NVS лежало имя длиннее лимита (среди старых версий или от консоли без проверки),
+    // обрежем сразу — иначе разные узлы могут совпасть по обрезанной версии.
+    if (cfg.name.length() > CFG_NAME_MAX) cfg.name = cfg.name.substring(0, CFG_NAME_MAX);
     return cfgReady();
 }
 
@@ -187,12 +196,36 @@ static const CfgField* cfgFind(const String& field) {
 }
 
 static bool cfgSetField(const CfgField& fl, const String& value) {
+    // Числовые поля проверяем на месте: бессмысленный lora_sf=2 или vext_on=5 уедет в NVS,
+    // и после save узел просто пропадёт из сети. Ошибку лучше сказать сразу, чем чинить
+    // потом снятием питания.
+    bool badNum = false;
     switch (fl.kind) {
         case CFG_STR: cfg.*(fl.s) = value; break;
         // strtol с основанием 0 понимает и 18, и 0x12 — слово синхронизации привычнее в hex
-        case CFG_U16: cfg.*(fl.u) = (uint16_t)strtoul(value.c_str(), NULL, 0); break;
-        case CFG_I16: cfg.*(fl.i) = (int16_t)strtol(value.c_str(), NULL, 0); break;
-        case CFG_FLT: cfg.*(fl.f) = parseFixed(value.c_str()); break;
+        case CFG_U16: {
+            unsigned long v = strtoul(value.c_str(), NULL, 0);   // до усечения: 70000 и 4464 — разные
+            if (fl.lo == fl.hi || v < fl.lo || v > fl.hi) { badNum = true; break; }
+            cfg.*(fl.u) = (uint16_t)v;
+            break;
+        }
+        case CFG_I16: {
+            long v = strtol(value.c_str(), NULL, 0);
+            if (fl.lo == fl.hi || v < fl.lo || v > fl.hi) { badNum = true; break; }
+            cfg.*(fl.i) = (int16_t)v;
+            break;
+        }
+        case CFG_FLT: {
+            float v = parseFixed(value.c_str());
+            if (fl.lo == fl.hi || v < fl.lo || v > fl.hi) { badNum = true; break; }
+            cfg.*(fl.f) = v;
+            break;
+        }
+    }
+    if (badNum) {
+        Serial.printf("[CFG] %s: значение '%s' вне диапазона %.0f..%.0f\n",
+                      fl.cmd, value.c_str(), fl.lo, fl.hi);
+        return false;
     }
     return true;
 }
@@ -247,7 +280,10 @@ static void cfgHandleLine(String line) {
         value.trim();
         const CfgField* fl = cfgFind(field);
         if (!fl) { Serial.printf("[CFG] неизвестное поле '%s', см. help\n", field.c_str()); return; }
-        cfgSetField(*fl, value);
+        if (!cfgSetField(*fl, value)) {
+            Serial.printf("[CFG] %s не задано: значение вне диапазона\n", field.c_str());
+            return;
+        }
         Serial.printf("[CFG] %s задано (нужен save)\n", field.c_str());
         return;
     }
@@ -309,7 +345,10 @@ void cfgHandleMeshCfg(const String& rest) {
         sensorSendMsg(("cfg:err:" + field).c_str(), FLOOD_RETRY_MS, 1);
         return;
     }
-    cfgSetField(*fl, value);
+    if (!cfgSetField(*fl, value)) {
+        sensorSendMsg(("cfg:err:" + field).c_str(), FLOOD_RETRY_MS, 1);
+        return;
+    }
     cfgPendingSince = millis();
     Serial.printf("[CFG] по радио: %s задано (жду save)\n", field.c_str());
     sensorSendMsg(("cfg:ok:" + field).c_str(), FLOOD_RETRY_MS, 1);
