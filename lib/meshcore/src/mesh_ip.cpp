@@ -395,14 +395,18 @@ void meshIpTick() {
 
     // Во время OTAfastMode не отправляем (радио занято)
     if (otaFastMode) return;
-    if (!s_linkUp) return;
 
-    // Таймаут пира
-    if (millis() - s_lastRxMs > MESH_IP_IDLE_MS) {
+    // Таймаут пира: только если линк реально был поднят. Иначе не трогаем
+    // очередь — она нужна для bootstrap, пока мы ещё не слышали пира.
+    if (s_linkUp && millis() - s_lastRxMs > MESH_IP_IDLE_MS) {
         s_linkUp = false;
         meshIpReset();
         return;
     }
+
+    // Bootstrap: пока пир не слышен, но есть что слать — шлём. Первый же
+    // фрагмент, принятый координатором, поднимет линк и на его стороне.
+    if (!s_linkUp && s_txCount == 0) return;
 
     // Исходящий фрагмент-движок
     if (s_txInFlight) {
