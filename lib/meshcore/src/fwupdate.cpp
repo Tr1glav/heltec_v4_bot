@@ -267,7 +267,6 @@ bool fwFetchNodeImage(const String& url) {
     // Узел может быть и сенсором, и компаньоном — пишем, кому именно качаем:
     // подпись «образ сенсора» рядом со ссылкой на образ компаньона сбивает с толку.
     slog("[FW] образ для %s: %s\n", fwFetchTarget.c_str(), url.c_str());
-    if (otaFile) { otaFile.close(); otaFile = File(); }
     // Прежний образ не трогаем: сорвётся загрузка — он останется рабочим, и его
     // по-прежнему можно отправить в эфир. Удаляем его только перед переименованием.
     LittleFS.remove("/ota.bin.part");
@@ -324,19 +323,13 @@ bool fwFetchNodeImage(const String& url) {
             }
         }
     }
-    fwDlPhase = 0;
-    if (!ok) { LittleFS.remove("/ota.bin.part"); return false; }
-    LittleFS.remove("/ota.bin");
-    // переименование в конце: оборванная загрузка не должна выглядеть готовой прошивкой
-    if (!LittleFS.rename("/ota.bin.part", "/ota.bin")) { slog("[FW] rename не удался\n"); return false; }
-    // Имя образа кладём рядом с файлом: без этого страница показывает имя от прошлой
-    // ручной заливки — например сенсорное рядом с образом компаньона.
-    int slash = url.lastIndexOf('/');
-    otaFwName = (slash < 0) ? url : url.substring(slash + 1);
-    File nm = LittleFS.open("/ota.name", "w");
-    if (nm) { nm.print(otaFwName); nm.close(); }
-    otaInspectStoredFw();
-    return otaFwReady;
+    if (!ok) { LittleFS.remove("/ota.bin.part"); fwDlPhase = 0; return false; }
+    // Дальше — не здесь. Переименование, /ota.name, инспекция и старт сессии выполняются
+    // в главном цикле (ветка FW_NET_FETCHED в fwUpdateTick): задача уже завершилась, и
+    // никто не читает её результат, пока она сама не написала флаги. Оставляем файл как
+    // .part и fwDlPhase = 1 — полоса на странице показывает «загрузка завершена», пока
+    // цикл не финализирует.
+    return true;
 }
 
 // Когда до следующей проверки: после начатой сессии очередь разбирается быстрее.
@@ -387,6 +380,10 @@ static bool fwStartNetTask(TaskFunction_t fn, const char* name) {
     return false;
 }
 
+bool fwNetBusy() {
+    return fwNetStage != FW_NET_IDLE;
+}
+
 // Что делать с результатом проверки: выбрать узел и заказать скачивание образа либо
 // решить, что обновлять нечего. Выполняется в главном цикле — здесь читаются общие
 // данные об узлах.
@@ -434,7 +431,30 @@ void fwUpdateTick() {
     }
     if (fwNetStage == FW_NET_FETCHED) {
         fwNetStage = FW_NET_IDLE;
-        if (!fwNetOk) { slog("[FW] образ для %s взять не удалось\n", fwFetchTarget.c_str()); return; }
+        if (!fwNetOk) {
+            slog("[FW] образ для %s взять не удалось\n", fwFetchTarget.c_str());
+            fwDlPhase = 0;
+            return;
+        }
+        // Финализация в главном контексте: задача загрузки завершилась и не трогает
+        // общие файлы и флаги. Закрываем возможный остаток сессии, затем переименовываем.
+        if (otaFile) { otaFile.close(); otaFile = File(); }
+        LittleFS.remove("/ota.bin");
+        if (!LittleFS.rename("/ota.bin.part", "/ota.bin")) {
+            slog("[FW] rename не удался\n");
+            fwDlPhase = 0;
+            return;
+        }
+        int slash = fwFetchUrl.lastIndexOf('/');
+        otaFwName = (slash < 0) ? fwFetchUrl : fwFetchUrl.substring(slash + 1);
+        File nm = LittleFS.open("/ota.name", "w");
+        if (nm) { nm.print(otaFwName); nm.close(); }
+        otaInspectStoredFw();
+        fwDlPhase = 0;
+        if (!otaFwReady) {
+            slog("[FW] образ для %s не подходит (маркер платы)\n", fwFetchTarget.c_str());
+            return;
+        }
         if (otaStartSession(fwFetchTarget)) {
             fwNextInterval = FW_RECHECK_AFTER_MS;   // очередь разберём следующим проходом
             slog("[FW] прошиваю %s до %s\n", fwFetchTarget.c_str(), fwLatest.version.c_str());

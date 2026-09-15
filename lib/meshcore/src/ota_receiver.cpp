@@ -306,6 +306,10 @@ void otaSensorHandle() {
         // ackstart уходит на штатном конфиге; бот после него ждёт OTA_FAST_SETTLE_MS.
         sensorSendMsg(OTA_ACKSTART, 20);
         radioSetFastConfig();
+        if (!radioFastReadyNow()) {
+            otaSensorAbort("радио не переключилось");
+            return;
+        }
         otaFastMode = true;
         Serial.printf("[OTA] fast config: FSK %d кбит/с\n", (int)OTA_FSK_BR);
         return;

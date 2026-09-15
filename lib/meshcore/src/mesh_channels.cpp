@@ -45,13 +45,18 @@ int channelSetSlot(int idx, const char* name, const uint8_t* key16) {
 }
 
 void addChannelKey16(const char* name, const uint8_t* key16) {
+    if (name == nullptr || name[0] == 0) return;
+    if (numChannels >= MAX_CHANNELS) {
+        Serial.printf("[CH] не могу добавить %s: список каналов полон\n", name);
+        return;
+    }
     MeshChannel& ch = channels[numChannels];
     setChannelKey(ch, key16);
     ch.name = name;
     numChannels++;
-    Serial.printf("Channel %s: key ", name);
-    for (int i = 0; i < 16; i++) Serial.printf("%02x", ch.secret[i]);
-    Serial.printf(", hash 0x%02X\n", ch.hash);
+    // Хэш ключа (первый байт SHA256) — это безопасно: по нему нельзя восстановить ключ.
+    // Сам ключ не печатаем — он попал бы в лог одним и тем же у всех плат сети.
+    Serial.printf("Channel %s: hash 0x%02X\n", name, ch.hash);
 }
 
 void deriveChannels() {

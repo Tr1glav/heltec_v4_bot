@@ -239,6 +239,11 @@ static const char* roleFromEnv(const String& env) {
 
 void publishSensorDisc(const String& sender, const char* slug, const String& env) {
     const char* role = roleFromEnv(env);
+    // Имя узла вставляется в discovery-конфиг дословно. Имя может содержать кавычки,
+    // обратные слэши и управляющие символы — без экранирования Home Assistant сломает
+    // разбор JSON-конфига, и датчик просто не появится в интерфейсе.
+    char senderEsc[64];
+    jsonEscape(sender.c_str(), senderEsc, sizeof(senderEsc));
     char devBlock[192];
     snprintf(devBlock, sizeof(devBlock),
         "\"identifiers\":[\"meshcore_sensor_%s\"],\"name\":\"MeshBot %s %s\","
@@ -255,7 +260,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"icon\":\"mdi:sprout\",\"unique_id\":\"meshcore_sensor_%s_text\","
         "\"entity_category\":\"diagnostic\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/rssi/config", slug);
@@ -264,7 +269,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\","
         "\"unique_id\":\"meshcore_sensor_%s_rssi\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     // Availability: бинарник device_class=connectivity, «online» пока датчик шлёт.
@@ -274,7 +279,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"payload_on\":\"online\",\"payload_off\":\"offline\",\"device_class\":\"connectivity\","
         "\"unique_id\":\"meshcore_sensor_%s_available\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/version/config", slug);
@@ -283,7 +288,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"icon\":\"mdi:chip\",\"entity_category\":\"diagnostic\","
         "\"unique_id\":\"meshcore_sensor_%s_version\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     // Заряд и напряжение батареи сенсора — приходят в hello
@@ -293,7 +298,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"device_class\":\"battery\",\"unit_of_measurement\":\"%%\",\"state_class\":\"measurement\","
         "\"unique_id\":\"meshcore_sensor_%s_battery\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/board/config", slug);
@@ -302,7 +307,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"icon\":\"mdi:developer-board\",\"entity_category\":\"diagnostic\","
         "\"unique_id\":\"meshcore_sensor_%s_board\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/meshcore_sensor_%s/voltage/config", slug);
@@ -312,7 +317,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"entity_category\":\"diagnostic\","
         "\"unique_id\":\"meshcore_sensor_%s_voltage\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     // Event entity: MQTT event platform — появляется как device-trigger "Fired"
@@ -325,7 +330,7 @@ void publishSensorDisc(const String& sender, const char* slug, const String& env
         "\"event_types\":[\"button\",\"button2\"],"
         "\"unique_id\":\"meshcore_sensor_%s_button\","
         "\"device\":{%s}}",
-        sender.c_str(), mqttPrefix, slug, slug, devBlock);
+        senderEsc, mqttPrefix, slug, slug, devBlock);
     mqtt.publish(topic, payload, true);
 
     Serial.printf("[MQTT] sensor discovery published: %s\n", slug);

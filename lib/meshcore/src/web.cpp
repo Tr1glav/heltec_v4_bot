@@ -74,8 +74,13 @@ String buildDiagReport() {
     for (int i = 0; i < sensorDeviceDiscCount; i++) if (sensorOnlineNow[i]) on++;
     r += String(on) + "\r\n";
     r += "\r\n===== LOG TAIL =====\r\n";
-    if (logTotal > logTail.length()) r += "…(начало обрезано)…\r\n";
-    r += logTail;
+    {
+        String tail;
+        uint32_t total;
+        logGetSnapshot(tail, total);
+        if (total > tail.length()) r += "…(начало обрезано)…\r\n";
+        r += tail;
+    }
     return r;
 }
 
@@ -185,18 +190,21 @@ void otaHandleInfo() {
     otaServer.send(200, "application/json", json);
 }
 
-// Живой вывод лога: текст, записанный после позиции from (счётчик logTotal)
+// Живой вывод лога: текст, записанный после позиции from (счётчик xlogpPos)
 void otaHandleLogTail() {
+    String tail;
+    uint32_t pos;
+    logGetSnapshot(tail, pos);
     uint32_t from = strtoul(otaServer.arg("from").c_str(), NULL, 10);
-    uint32_t tailStart = logTotal - logTail.length();
+    uint32_t tailStart = pos - tail.length();
     String out;
-    if (from > logTotal) from = tailStart;   // бот перезагрузился — отдаём весь хвост
+    if (from > pos) from = tailStart;   // бот перезагрузился — отдаём весь хвост
     if (from < tailStart) {
         out = "…(пропущено)…\n";
         from = tailStart;
     }
-    out += logTail.substring(from - tailStart);
-    otaServer.sendHeader("X-Log-Pos", String(logTotal));
+    out += tail.substring(from - tailStart);
+    otaServer.sendHeader("X-Log-Pos", String(pos));
     otaServer.send(200, "text/plain; charset=utf-8", out);
 }
 
@@ -477,6 +485,16 @@ void otaHandleSaveFw() {
     case UPLOAD_FILE_START:
     {
         if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) otaBotAbort("новый файл");
+        // Идёт сетевая загрузка образа (задача fwFetch): она пишет /ota.bin.part, и её
+        // финализация в главном цикле держит общие флаги. Свою заливку начинать нельзя —
+        // обе писали бы /ota.bin и otaFwReady/otaFwName, и результат смешался бы.
+        if (fwNetBusy()) {
+            otaSaving = false;
+            otaSaveOk = false;
+            slog("[OTA-SAVE] отклонено: идёт сетевая загрузка образа\n");
+            otaServer.send(503, "text/plain; charset=utf-8", "идёт сетевая загрузка образа, подождите");
+            return;
+        }
         otaSaving = true;
         otaSaveOk = false;
         otaSaveTooBig = false;
@@ -574,6 +592,13 @@ void otaHandleSaveFw() {
 }
 
 void otaHandleStartOta() {
+    // Образ сейчас качается из релиза или финализируется: /ota.bin ещё не готов, и его
+    // могут переименовывать. Сессия по недописанному файлу ничего не даст.
+    if (fwNetBusy()) {
+        slog("[WEB] /ota/start: идёт сетевая загрузка образа\n");
+        otaServer.send(503, "text/plain; charset=utf-8", "идёт загрузка образа, подождите");
+        return;
+    }
     String target = otaServer.arg("target");
     if (otaPhase != OTA_PHASE_IDLE && otaPhase != OTA_PHASE_DONE) {
         slog("[WEB] /ota/start busy (phase=%d)\n", otaPhase);
@@ -668,7 +693,10 @@ void setupOtaServer() {
     otaServer.on("/fw/status", HTTP_GET, otaHandleFwStatus);
     otaServer.on("/sensors/config", HTTP_POST, otaHandleSensorsConfig);
     otaServer.on("/logs", HTTP_GET, []() {
-        otaServer.sendHeader("X-Log-Pos", String(logTotal));
+        String tail;
+        uint32_t pos;
+        logGetSnapshot(tail, pos);
+        otaServer.sendHeader("X-Log-Pos", String(pos));
         otaServer.send(200, "text/plain; charset=utf-8", buildDiagReport());
     });
     otaServer.on("/logs/tail", HTTP_GET, otaHandleLogTail);
@@ -677,6 +705,10 @@ void setupOtaServer() {
     // Обслуживание: раздел, переставший принимать запись, лечится только пересозданием.
     // Образ прошивки не жаль — он всегда скачивается заново с релиза.
     otaServer.on("/fs/format", HTTP_POST, []() {
+        if (fwNetBusy()) {
+            otaServer.send(503, "text/plain; charset=utf-8", "идёт сетевая загрузка образа, подождите");
+            return;
+        }
         if (otaFile) { otaFile.close(); otaFile = File(); }
         otaFwReady = false;
         otaFwSize = 0;

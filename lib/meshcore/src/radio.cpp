@@ -91,11 +91,22 @@ void radioSetParams(float freq, float bw, int sf, int cr) {
 }
 
 static bool radioFsk = false;
+// Годится ли радио после последнего перехода в быстрый режим: beginFSK возвращает ошибку,
+// если чип не отвечает или состояние не переключается. Если так — прошивку в эфир не
+// начинаем (она всё равно не дойдёт), а сессия отменяется явно, а не молча в пустоту.
+static bool radioFastReady = false;
 
 void radioSetNormalConfig() {
+    radioFastReady = false;
     if (radioFsk) {
         radioFsk = false;
-        initLoRa();
+        if (!initLoRa()) {
+            // Радио не поднялось — честно сообщаем, что приём выключен, а не ставим
+            // isListening=true на мёртвом чипе (по нему mesh решит, что сеть есть).
+            Serial.printf("[RADIO] возврат в LoRa не удался — приём ВЫКЛЮЧЕН\n");
+            isListening = false;
+            return;
+        }
         lastReArmMs = 0;
         radio.startReceive();
         isListening = true;
@@ -109,7 +120,14 @@ void radioSetFastConfig() {
     fastRxErrors = 0;
     int st = radio.beginFSK(OTA_FAST_FREQ, OTA_FSK_BR, OTA_FSK_DEV, OTA_FSK_RXBW,
                             (int8_t)cfg.loraTx, OTA_FSK_PREAMBLE, 1.8);
-    if (st != RADIOLIB_ERR_NONE) Serial.printf("[RADIO] beginFSK failed %d\n", st);
+    if (st != RADIOLIB_ERR_NONE) {
+        Serial.printf("[RADIO] beginFSK failed %d\n", st);
+        radioFastReady = false;
+        // radioFsk не трогаем: переход не состоялся, остаёмся в LoRa
+        isListening = false;
+        return;
+    }
+    radioFastReady = true;
     radioFsk = true;
     applyBoardRadioOptions();
     radio.setDataShaping(RADIOLIB_SHAPING_0_5);
@@ -119,3 +137,5 @@ void radioSetFastConfig() {
     radio.startReceive();
     isListening = true;
 }
+
+bool radioFastReadyNow() { return radioFastReady; }
