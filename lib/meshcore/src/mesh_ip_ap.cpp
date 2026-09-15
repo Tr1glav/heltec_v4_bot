@@ -30,6 +30,7 @@
 
 static esp_netif_t*         s_apNetif    = NULL;
 static esp_netif_ip_info_t  s_apIp;
+static uint32_t             s_apGw   = 0;   // GW в порядке байт пакета (big-endian uint32)
 static struct netif*        s_apLwip    = NULL;
 static bool                 s_apActive  = false;
 static String               s_ssid;
@@ -92,6 +93,7 @@ void meshIpApStart() {
     s_apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (s_apNetif) {
         esp_netif_get_ip_info(s_apNetif, &s_apIp);
+        s_apGw = ntohl(s_apIp.ip.addr);   // ← lwIP хранит в network order; ntohl() → big-endian uint32, как构造 dst из пакета
         s_apLwip = (struct netif*)esp_netif_get_netif_impl(s_apNetif);
     }
     if (!s_apLwip) {
@@ -197,7 +199,7 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
                    ((uint32_t)ip[18] << 8) | (uint32_t)ip[19];
 
     // Локальная цель (шлюзу/DHCP/broadcast) — lwIP обработает
-    if (dst == 0 || dst == 0xFFFFFFFF || dst == s_apIp.ip.addr) {
+    if (dst == 0 || dst == 0xFFFFFFFF || dst == s_apGw) {
         g_meshIpRxFwd++;
         if (s_rxTotal <= 20 || (g_meshIpRxFwd & 0x0F) == 1)
             Serial.printf("[IP] fwd #%lu: dst=%d.%d.%d.%d %s, %dB\n",
