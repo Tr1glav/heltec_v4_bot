@@ -206,6 +206,11 @@ static bool httpStream(const String& url, Sink sink, uint32_t* gotOut = nullptr)
     return got == total;
 }
 
+// Сколько раз пробуем скачать образ. Соединение с GitHub срывается не всегда, а через
+// раз (HTTPClient возвращает -1 ещё на установке связи), и повтор через паузу обычно
+// проходит. Без него единичный срыв отменял всё обновление до следующей проверки.
+#define FW_DOWNLOAD_TRIES 3
+
 bool fwSelfUpdate(const String& url) {
     slog("[FW] самообновление: %s\n", url.c_str());
     radio.sleep();
@@ -213,40 +218,46 @@ bool fwSelfUpdate(const String& url) {
     #if HAS_FEM
     digitalWrite(FEM_EN_PIN, LOW);
     #endif
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-        Update.printError(Serial);
-        return false;
+    // Связь с хранилищем рвётся на установке соединения через раз (HTTP -1), а повтор
+    // через паузу обычно проходит — как у загрузки образов узлов, делаем до трёх попыток.
+    // Радио всё это время выключено, мешать эфиру нечему.
+    bool ok = false;
+    for (int attempt = 1; attempt <= FW_DOWNLOAD_TRIES && !ok; attempt++) {
+        if (attempt > 1) {
+            slog("[FW] самообновление, попытка %d: качаю заново\n", attempt);
+            delay(2000);
+        }
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+            break;
+        }
+        FwScan scan;
+        fwScanReset(&scan);
+        ok = httpStream(url, [&](const uint8_t* d, size_t n) {
+            fwScanFeed(&scan, d, n);
+            return Update.write((uint8_t*)d, n) == n;
+        });
+        if (ok && fwScanVerdict(&scan) < 0) {
+            slog("[FW] образ платы %s — не наш, отказ\n", scan.other);
+            ok = false;
+        }
+        if (!ok) Update.abort();   // иначе следующая попытка пишет поверх открытой OTA-сессии
     }
-    FwScan scan;
-    fwScanReset(&scan);
-    bool ok = httpStream(url, [&](const uint8_t* d, size_t n) {
-        fwScanFeed(&scan, d, n);
-        return Update.write((uint8_t*)d, n) == n;
-    });
-    if (ok && fwScanVerdict(&scan) < 0) {
-        slog("[FW] образ платы %s — не наш, отказ\n", scan.other);
-        ok = false;
+    if (ok && Update.end(true)) {
+        slog("[FW] прошито, перезагрузка\n");
+        delay(300);
+        ESP.restart();
+        return true;
     }
-    if (!ok || !Update.end(true)) {
-        Update.abort();
-        slog("[FW] самообновление не удалось\n");
-        #if HAS_FEM
-        digitalWrite(FEM_EN_PIN, HIGH);
-        #endif
-        radio.startReceive();
-        isListening = true;
-        return false;
-    }
-    slog("[FW] прошито, перезагрузка\n");
-    delay(300);
-    ESP.restart();
-    return true;
+    if (ok) Update.abort();
+    slog("[FW] самообновление не удалось\n");
+    #if HAS_FEM
+    digitalWrite(FEM_EN_PIN, HIGH);
+    #endif
+    radio.startReceive();
+    isListening = true;
+    return false;
 }
-
-// Сколько раз пробуем скачать образ. Соединение с GitHub срывается не всегда, а через
-// раз (HTTPClient возвращает -1 ещё на установке связи), и повтор через паузу обычно
-// проходит. Без него единичный срыв отменял всё обновление до следующей проверки.
-#define FW_DOWNLOAD_TRIES 3
 
 // Заполняются в цикле ДО запуска задачи и после этого не меняются: так задача не читает
 // то, что цикл может переписать при очередном hello.
