@@ -211,21 +211,21 @@ static u8_t coordRawRecv(void* arg, struct raw_pcb* pcb, struct pbuf* p,
     if (!p) return 0;
     uint8_t buf[MESH_IP_PKT_MAX];
     uint16_t copied = pbuf_copy_partial(p, buf, sizeof(buf), 0);
-    if (copied < 20) { pbuf_free(p); return 0; }
+    if (copied < 20) return 0;
     uint8_t ihl = (uint8_t)((buf[0] & 0x0F) * 4);
     uint8_t proto = buf[9];
-    if (ihl < 20 || ihl >= copied) { pbuf_free(p); return 0; }
+    if (ihl < 20 || ihl >= copied) return 0;
     uint16_t dstPort;
     if (proto == 1) {
-        if (copied < ihl + 6) { pbuf_free(p); return 0; }
+        if (copied < ihl + 6) return 0;
         dstPort = (uint16_t)((buf[ihl + 4] << 8) | buf[ihl + 5]);
     } else if (proto == 6 || proto == 17) {
         dstPort = (uint16_t)((buf[ihl + 2] << 8) | buf[ihl + 3]);
     } else {
-        pbuf_free(p); return 0;
+        return 0;
     }
     NatEntry* e = natFindByExt(proto, dstPort);
-    if (!e) { pbuf_free(p); return 0; }   // не наш трафик — lwIP разберётся сам
+    if (!e) return 0;   // не наш трафик — lwIP разберётся сам
 
     // Восстанавливаем адрес телефона
     buf[16] = (uint8_t)(e->phone_ip >> 24);
