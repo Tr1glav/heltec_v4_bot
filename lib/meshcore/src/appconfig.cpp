@@ -203,7 +203,7 @@ static bool cfgSetField(const CfgField& fl, const String& value) {
     switch (fl.kind) {
         case CFG_STR:
             cfg.*(fl.s) = value;
-            if (fl.s == &cfg.name && cfg.name.length() > CFG_NAME_MAX) {
+            if (fl.s == &AppConfig::name && cfg.name.length() > CFG_NAME_MAX) {
                 cfg.name.remove(CFG_NAME_MAX);
                 Serial.printf("[CFG] имя узла обрезано до %d символов\n", CFG_NAME_MAX);
             }
