@@ -178,8 +178,11 @@ void sensorSendHello() {
 // Эхо-запрос: одиночная посылка, чтобы измерять время одного обмена, а не повторов
 void sensorPingSend() {
     if (sensorChannelIdx < 0) return;
-    pingId = (uint16_t)millis();
-    if (pingId == 0) pingId = 1;
+    // Номер запроса — счётчик, а не младшие байты millis(): те заворачиваются каждые ~65 с,
+    // и «свежий» милисекундный номер совпадёт со старым ответом, застрявшим в эфире.
+    static uint16_t pingSeq = 1;
+    pingId = (pingSeq == 0xFFFF) ? 1 : pingSeq + 1;
+    pingSeq = pingId;
     pingFailed = false;
     pingShowUntil = 0;
     char msg[24];

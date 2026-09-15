@@ -116,6 +116,7 @@ uint32_t otaCrcExp = 0;     // ожидаемый CRC32 образа
 uint32_t otaCrcAcc = 0xFFFFFFFF;  // накапливаемый CRC32
 uint32_t otaSeqExp = 0;     // следующий ожидаемый seq
 unsigned long otaLastActivity = 0; // millis() последнего OTA-пакета
+unsigned long otaAwaitEndMs = 0;   // millis() начала ожидания DONE после приёма всего образа
 String sensorLastSent = "";        // последнее сообщение, отправленное сенсором (для экрана)
 unsigned long sensorLastSentMs = 0; // millis() его отправки
 unsigned long sensorHelloDueMs = 0; // когда ответить на "hello?" (0 — запроса нет)

@@ -233,6 +233,7 @@ void otaSensorAbort(const char* why) {
     otaWinMask = 0;
     otaActive = false;
     otaGotStart = false;
+    otaAwaitEndMs = 0;
     otaCrcAcc = 0xFFFFFFFF;
     otaSeqExp = 0;
     #if HAS_OLED
@@ -250,6 +251,18 @@ void otaSensorTick() {
     // бот не услышал ackstart и остался на штатном конфиге — возвращаемся, чтобы принять повтор ota:start
     if (otaFastMode && otaGot == 0 && millis() - otaLastActivity > OTA_SENSOR_FIRST_CHUNK_MS) {
         otaSensorAbort("no first chunk");
+        return;
+    }
+    // Весь образ принят — остался только фрейм DONE. Не ждём его весь OTA_SENSOR_STALL_MS:
+    // бот повторяет DONE ~18 с и сдаётся, а мы глухи к сети, пока сидим в быстром канале.
+    if (otaGot == otaTotal) {
+        if (otaAwaitEndMs == 0) {
+            // Можно проверить целостность уже сейчас: CRC копится по мере записи образа.
+            if (~otaCrcAcc != otaCrcExp) { otaSensorAbort("crc mismatch before DONE"); return; }
+            otaAwaitEndMs = millis();
+        } else if (millis() - otaAwaitEndMs > OTA_SENSOR_END_MS) {
+            otaSensorAbort("no final DONE");
+        }
         return;
     }
     if (millis() - otaLastActivity > OTA_SENSOR_STALL_MS) {
@@ -282,6 +295,7 @@ void otaSensorHandle() {
         if (otaActive && otaGotStart) Update.abort();
         otaTotal = total; otaCrcExp = crc;
         otaGot = 0; otaCrcAcc = 0xFFFFFFFF; otaSeqExp = 0;
+        otaAwaitEndMs = 0;
         otaActive = true; otaGotStart = true;
         otaLastActivity = millis();
         #if HAS_OLED

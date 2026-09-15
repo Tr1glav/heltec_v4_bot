@@ -3,7 +3,8 @@
 
 Reads a monospace TTF (DejaVu Sans Mono) off the system, rasterises the
 Cyrillic alphabet into 6x8 pixel bitmaps (1 bit/px, MSB = leftmost column),
-and emits src/cyrillic_glyphs.h + a magnified preview PNG for visual check.
+and emits lib/meshcore/include/cyrillic_glyphs.h + a magnified preview PNG
+for visual check.
 
 Usage: python3 scripts/gen_cyrillic_font.py
 """
@@ -14,7 +15,7 @@ from PIL import Image, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FONT_PATH = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"
-OUT_DIR = os.path.join(ROOT, "src")
+OUT_DIR = os.path.join(ROOT, "lib", "meshcore", "include")
 OUT_H = os.path.join(OUT_DIR, "cyrillic_glyphs.h")
 PREVIEW = os.path.join(OUT_DIR, "_preview.png")
 

@@ -418,7 +418,10 @@ void otaHandleUpdate() {
         // на время записи радио и сеть выключены
         radio.sleep();
         isListening = false;
-        if (mqttConnected) mqtt.disconnect();
+        if (mqttConnected) {
+            mqtt.disconnect();
+            mqttConnected = false;   // при неудаче otaSelfUpdateResume не оставит ложь: цикл тут же переподключит
+        }
         #if HAS_FEM
         digitalWrite(FEM_EN_PIN, LOW);
         #endif

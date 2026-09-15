@@ -101,6 +101,7 @@ int fwScanVerdict(const FwScan* s) {
 uint32_t otaImgSize = 0;       // размер прошивки после распаковки
 static uint16_t otaWinAcked = 0;      // бит i — чанк otaSeq+i уже у сенсора
 static unsigned long otaBurstMs = 0;  // когда ушёл последний кадр пачки
+static unsigned long otaPolledMs = 0; // когда ушёл POLL (0 — POLL на связи нет)
 unsigned long otaSessionMs = 0; // старт сессии — для скорости и длительности на странице
 unsigned long otaDoneMs = 0;    // когда сенсор подтвердил прошивку
 char otaLastErr[48] = "";       // причина последнего abort — показывается на странице
@@ -327,8 +328,11 @@ void otaHandleRawBot(const uint8_t* buf, int len) {
         if (seq < otaSeq || seq > totalChunks) return;
         uint16_t mask = (uint16_t)buf[7] | ((uint16_t)buf[8] << 8);
         bool progress = seq > otaSeq || (mask & ~otaWinAcked) != 0;
-        // WACK без прогресса сразу после пачки — запоздалый ответ на прошлую, ждём ответ на эту
-        if (!progress && millis() - otaBurstMs < OTA_ACK_TIMEOUT_MS) return;
+        // WACK без прогресса сразу после пачки и без висящего POLL — запоздалый ответ на
+        // прошлую пачку, отвечать на неё незачем. Ответ на POLL так не отбрасываем: это
+        // честное «ничего нового» на прямой вопрос, и ретрай за него уже на боте учтён.
+        if (!progress && otaPolledMs == 0 && millis() - otaBurstMs < OTA_ACK_TIMEOUT_MS) return;
+        otaPolledMs = 0;   // сенсор ответил — висящего POLL больше нет
         if (!progress) otaRetrTotal++;
         otaRetries = progress ? 0 : otaRetries + 1;
         if (otaRetries > OTA_MAX_RETRIES) { otaBotAbort("no progress"); return; }
@@ -393,10 +397,43 @@ void otaBotTick() {
     if (otaPhase != OTA_PHASE_WAIT_START &&
         otaPhase != OTA_PHASE_DATA &&
         otaPhase != OTA_PHASE_WAIT_END) return;
-    unsigned long timeout = (otaPhase == OTA_PHASE_WAIT_START) ? OTA_START_TIMEOUT_MS
-                          : (otaPhase == OTA_PHASE_WAIT_END)   ? OTA_END_TIMEOUT_MS
-                          : OTA_ACK_TIMEOUT_MS;
-    if (millis() - otaSince < timeout) return;
+    // Сторона DATA ждёт ответ на пачку либо на POLL; строго один источник на эпизод.
+    unsigned long wait = (otaPhase == OTA_PHASE_WAIT_START) ? OTA_START_TIMEOUT_MS
+                       : (otaPhase == OTA_PHASE_WAIT_END)   ? OTA_END_TIMEOUT_MS
+                       : (otaPolledMs == 0)                 ? OTA_ACK_TIMEOUT_MS
+                       : OTA_ACK_TIMEOUT_MS;
+    unsigned long since = (otaPhase == OTA_PHASE_DATA && otaPolledMs != 0) ? otaPolledMs : otaSince;
+    if (millis() - since < wait) return;
+
+    if (otaPhase == OTA_PHASE_DATA) {
+        // Пачка зависла (потерян ответ). POLL — не ретрай: он лишь запрашивает состояние
+        // сенсора. Ретрай копим по завершённым эпизодам без прогресса: пачка не собралась
+        // и честный ответ «ничего нового» (WACK без прогресса) либо вообще нет ответа.
+        // Так потерянная пачка не сжигает две единицы ретраев: одну за таймаут пачки и
+        // вторую за правдивый ответ сенсора в otaHandleRawBot.
+        if (otaPolledMs != 0) {
+            otaRetries++;          // предыдущий POLL остался без ответа
+            otaRetrTotal++;
+            if (otaRetries > OTA_MAX_RETRIES) {
+                otaPolledMs = 0;
+                otaBotAbort("no response");
+                return;
+            }
+        }
+        otaPolls++;
+        slog("[OTA] poll seq=%u\n", (unsigned)otaSeq);
+        uint8_t frame[16];
+        int f = rawBuildFrame(frame, RAW_TYPE_POLL, otaSeq, NULL, 0);
+        if (rawTxFrame(frame, f) == RADIOLIB_ERR_NONE) {
+            otaSince = millis();
+            otaBurstMs = millis();   // ответ на POLL — свежий, «запоздалым» его не считать
+            otaPolledMs = millis();
+        } else {
+            otaPolledMs = 0;         // POLL не ушёл — просто ждём, ретраи то же, что и раньше
+        }
+        otaDrawProgress();
+        return;
+    }
 
     otaRetries++;
     otaRetrTotal++;
@@ -407,13 +444,6 @@ void otaBotTick() {
         return;
     }
     if (otaPhase == OTA_PHASE_WAIT_START) otaSendStart();
-    else if (otaPhase == OTA_PHASE_DATA) {
-        otaPolls++;
-        slog("[OTA] poll seq=%u\n", (unsigned)otaSeq);
-        uint8_t frame[16];
-        int f = rawBuildFrame(frame, RAW_TYPE_POLL, otaSeq, NULL, 0);
-        if (rawTxFrame(frame, f) == RADIOLIB_ERR_NONE) otaSince = millis();
-    }
     else if (otaPhase == OTA_PHASE_WAIT_END) otaSendEnd();
     otaDrawProgress();
 }
@@ -474,6 +504,7 @@ bool otaStartSession(const String& target) {
     otaSeq = 0;
     otaSentBytes = 0;
     otaRetries = 0;
+    otaPolledMs = 0;
     slog("[OTA] старт -> '%s' (%u байт, crc=%08X)\n",
          otaTarget.c_str(), (unsigned)otaFwSize, (unsigned)otaFwCrc);
     otaSendStart();

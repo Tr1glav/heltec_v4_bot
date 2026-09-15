@@ -191,6 +191,11 @@ struct PeerEntry {
 #define OTA_SENSOR_STALL_MS 60000
 // без первого чанка сенсор возвращается на штатный канал; бот выжидает это время перед повтором
 #define OTA_SENSOR_FIRST_CHUNK_MS 5000
+// Весь образ принят, остался фрейм DONE. Бот повторяет его каждые OTA_END_TIMEOUT_MS и
+// сдаётся после OTA_END_TIMEOUT_MS*(OTA_MAX_RETRIES+2) ≈ 18 с. Этот сторож кроет то же
+// окно с запасом: потерялся DONE — сенсор сам возвращается на штатный канал, а не сидит
+// весь OTA_SENSOR_STALL_MS (60 с) в быстром, глухой к сети.
+#define OTA_SENSOR_END_MS   20000
 
 // ===== ЧИСТЫЙ LoRa OTA (сырые фреймы вне meshcore) =====
 // Данные шлются напрямую radio.transmit/readData на быстрой конфигурации

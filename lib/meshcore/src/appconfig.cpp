@@ -201,7 +201,13 @@ static bool cfgSetField(const CfgField& fl, const String& value) {
     // потом снятием питания.
     bool badNum = false;
     switch (fl.kind) {
-        case CFG_STR: cfg.*(fl.s) = value; break;
+        case CFG_STR:
+            cfg.*(fl.s) = value;
+            if (fl.s == &cfg.name && cfg.name.length() > CFG_NAME_MAX) {
+                cfg.name.remove(CFG_NAME_MAX);
+                Serial.printf("[CFG] имя узла обрезано до %d символов\n", CFG_NAME_MAX);
+            }
+            break;
         // strtol с основанием 0 понимает и 18, и 0x12 — слово синхронизации привычнее в hex
         case CFG_U16: {
             unsigned long v = strtoul(value.c_str(), NULL, 0);   // до усечения: 70000 и 4464 — разные

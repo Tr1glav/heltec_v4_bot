@@ -48,11 +48,11 @@ python3 scripts/provision.py flash Tr1glav_home   # прошить и настр
 | `FEATURE_MESH_OTA_RECEIVER` | приём образа по радио |
 | `FEATURE_SENSOR` | heartbeat, кнопка, проверка связи, настройка по радио |
 | `FEATURE_COMPANION` | BLE и протокол телефонного приложения |
-| `FEATURE_POWERSAVE` | гашение экрана и пониженная частота процессора |
-| `FEATURE_DISPLAY`, `FEATURE_BUTTON` | экран и кнопка платы |
+| `FEATURE_BUTTON` | кнопка платы |
 
 Несовместимые сочетания останавливают сборку с понятным сообщением: например `FEATURE_WEB`
-без `FEATURE_WIFI` или компаньон без `FEATURE_SENSOR`.
+без `FEATURE_WIFI` или компаньон без `FEATURE_SENSOR`. Экран включается признаком `HAS_OLED`
+из `board_build` платы.
 
 ## Настройка устройства
 
@@ -373,20 +373,20 @@ python3 scripts/release.py -m "текст"   зафиксировать со с�
 | Файл | Что внутри |
 |---|---|
 | `src/main.cpp` | `setup()` и `loop()`: инициализация и вызовы модулей |
-| `radio.cpp`, `radio_rx.cpp` | настройка SX1262; приём из эфира и разбор кадров |
-| `mesh.cpp` | ключи узлов, дедупликация пакетов |
-| `mesh_channels.cpp` | каналы: ключи, автоключ по имени, загрузка из настроек |
-| `mesh_rx.cpp` | разбор входящего пакета, служебные команды, ответы |
-| `mesh_tx.cpp` | адверты, сборка кадров, повторы, сообщения узла |
-| `ota.cpp` | раздача образа по радио (координатор) |
-| `ota_receiver.cpp` | приём образа, распаковка и запись (узел) |
-| `web.cpp` | страница, обработчики HTTP, диагностика, журнал |
-| `fwupdate.cpp` | релизы GitHub: проверка, загрузка в отдельной задаче, обновление сети |
-| `mqtt.cpp` | публикация в MQTT и автообнаружение в Home Assistant |
-| `companion.cpp` | BLE-транспорт, сопряжение, контакты, каналы приложения |
-| `companion_proto.cpp` | разбор команд телефонного приложения |
-| `coordinator_tasks.cpp`, `sensor_tasks.cpp` | периодические задачи ролей |
-| `button.cpp` | счёт нажатий и переключение экрана |
-| `display.cpp` | экран, код сопряжения, значок BLE, измерение батареи |
-| `appconfig.cpp` | настройки в NVS, консоль, поля для веб-интерфейса |
-| `config.h`, `features.h` | тайминги и параметры радио; признаки сборки |
+| `lib/meshcore/src/radio.cpp`, `radio_rx.cpp` | настройка SX1262; приём из эфира и разбор кадров |
+| `lib/meshcore/src/mesh.cpp` | ключи узлов, дедупликация пакетов |
+| `lib/meshcore/src/mesh_channels.cpp` | каналы: ключи, автоключ по имени, загрузка из настроек |
+| `lib/meshcore/src/mesh_rx.cpp` | разбор входящего пакета, служебные команды, ответы |
+| `lib/meshcore/src/mesh_tx.cpp` | адверты, сборка кадров, повторы, сообщения узла |
+| `lib/meshcore/src/ota.cpp` | раздача образа по радио (координатор) |
+| `lib/meshcore/src/ota_receiver.cpp` | приём образа, распаковка и запись (узел) |
+| `lib/meshcore/src/web.cpp` | страница, обработчики HTTP, диагностика, журнал |
+| `lib/meshcore/src/fwupdate.cpp` | релизы GitHub: проверка, загрузка в отдельной задаче, обновление сети |
+| `lib/meshcore/src/mqtt.cpp` | публикация в MQTT и автообнаружение в Home Assistant |
+| `lib/meshcore/src/companion.cpp` | BLE-транспорт, сопряжение, контакты, каналы приложения |
+| `lib/meshcore/src/companion_proto.cpp` | разбор команд телефонного приложения |
+| `lib/meshcore/src/coordinator_tasks.cpp`, `sensor_tasks.cpp` | периодические задачи ролей |
+| `lib/meshcore/src/button.cpp` | счёт нажатий и переключение экрана |
+| `lib/meshcore/src/display.cpp` | экран, код сопряжения, значок BLE, измерение батареи |
+| `lib/meshcore/src/appconfig.cpp` | настройки в NVS, консоль, поля для веб-интерфейса |
+| `lib/meshcore/include/config.h`, `features.h` | тайминги и параметры радио; признаки сборки |

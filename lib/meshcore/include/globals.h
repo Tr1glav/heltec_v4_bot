@@ -102,6 +102,7 @@ extern uint32_t otaCrcExp;
 extern uint32_t otaCrcAcc;
 extern uint32_t otaSeqExp;
 extern unsigned long otaLastActivity;
+extern unsigned long otaAwaitEndMs;   // таймер «образ принят, жду DONE» (0 — не вошло)
 extern String sensorLastSent;
 extern unsigned long sensorLastSentMs;
 extern unsigned long sensorHelloDueMs;

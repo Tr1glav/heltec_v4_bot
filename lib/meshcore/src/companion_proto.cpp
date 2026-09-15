@@ -295,9 +295,11 @@ static void handleFrame(const uint8_t* f, size_t len) {
 
         String text;
         for (size_t k = 13; k < len; k++) text += (char)f[k];
-        if (text.length() > DM_TEXT_MAX)
-            Serial.printf("[BLE] текст личного сообщения обрезан: %u -> %u байт\n",
-                          text.length(), (unsigned)DM_TEXT_MAX);
+        if (text.length() > DM_TEXT_MAX) {
+            text.remove(DM_TEXT_MAX);
+            Serial.printf("[BLE] текст личного сообщения обрезан до %u байт\n",
+                          (unsigned)DM_TEXT_MAX);
+        }
 
         bool sent = false;
         if (idx >= 0 && txtType == 0 && text.length() > 0) {   // 0 — обычный текст

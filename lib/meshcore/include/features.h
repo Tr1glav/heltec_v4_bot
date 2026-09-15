@@ -68,15 +68,7 @@
   #endif
 #endif
 
-#ifndef FEATURE_POWERSAVE     // гашение экрана и пониженная частота процессора
-  #define FEATURE_POWERSAVE FEATURE_SENSOR
-#endif
-
 // --- железо ---
-#ifndef FEATURE_DISPLAY
-  #define FEATURE_DISPLAY HAS_OLED
-#endif
-
 #ifndef FEATURE_BUTTON
   #define FEATURE_BUTTON FEATURE_SENSOR
 #endif
@@ -93,4 +85,10 @@
 #endif
 #if FEATURE_COMPANION && !FEATURE_SENSOR
   #error "Компаньон собирается поверх сенсорного узла: нужен FEATURE_SENSOR"
+#endif
+// Код пока ветвится и по старому флагу MQTT_ENABLED, который задаёт platformio.ini: под ним
+// лежат wifi/mqtt/fwupdate/ota.cpp целиком. Если новый признак включён, а старого флага нет,
+// сборка молча упадёт на нехватке функций. Расхождение лучше видеть сразу.
+#if !defined(MQTT_ENABLED) && (FEATURE_WIFI || FEATURE_MQTT || FEATURE_WEB || FEATURE_AUTOUPDATE || FEATURE_NTP)
+  #error "FEATURE_WIFI/MQTT/WEB/AUTOUPDATE/NTP требуют MQTT_ENABLED (задаётся в platformio.ini)"
 #endif

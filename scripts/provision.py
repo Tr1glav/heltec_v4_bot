@@ -98,7 +98,7 @@ def device_config(data, key):
                  + ", ".join(sorted(devices)))
     role = dev.get("role")
     if role not in ROLE_FIELDS:
-        sys.exit(f"у устройства '{key}' роль должна быть bot или sensor")
+        sys.exit(f"у устройства '{key}' роль должна быть bot, sensor или companion")
     merged = dict(data.get("common", {}))
     merged["name"] = dev.get("name", key)   # имя узла = ключ, если явно не задано иное
     merged.update({k: v for k, v in dev.items() if k not in ("role", "env", "port")})

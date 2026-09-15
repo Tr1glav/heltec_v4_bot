@@ -31,10 +31,8 @@ void floodSend(int chIdx, const uint8_t* frame, int f, unsigned int gapMs = FLOO
 void sensorSendMsg(const char* msg, unsigned int gapMs = FLOOD_RETRY_MS, int repeats = 2);
 #ifdef SENSOR_NODE
 void sensorSendHello();
-#ifdef SENSOR_NODE
 void sensorPingSend();   // эхо-запрос к координатору (тройное нажатие)
 void sensorPingTick();   // сторож ожидания ответа
-#endif
 #endif
 void sendAdvert(uint8_t route_type);
 void sendSensorTimeSync();
