@@ -91,7 +91,7 @@
 #if FEATURE_COMPANION && !FEATURE_SENSOR
   #error "Компаньон собирается поверх сенсорного узла: нужен FEATURE_SENSOR"
 #endif
-#if FEATURE_MESH_IP && !FEATURE_SENSOR
+#if FEATURE_MESH_IP && !FEATURE_SENSOR && !defined(MQTT_ENABLED)
   #error "FEATURE_MESH_IP требует FEATURE_SENSOR (сенсорный канал для туннеля)"
 #endif
 // Код пока ветвится и по старому флагу MQTT_ENABLED, который задаёт platformio.ini: под ним
