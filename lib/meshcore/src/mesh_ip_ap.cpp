@@ -105,7 +105,12 @@ void meshIpApStart() {
 
     // 4) Перехват RX-буфера AP: гребём «чужой» IPv4 в туннель,
     //    ARP/DHCP/локальное — в lwIP как обычно.
-    esp_wifi_internal_reg_rxcb(WIFI_IF_AP, apRxGrab);
+    esp_err_t rc = esp_wifi_internal_reg_rxcb(WIFI_IF_AP, apRxGrab);
+    Serial.printf("[IP] reg_rxcb(WIFI_IF_AP) rc=0x%X  (%s)\n", rc,
+                  rc == ESP_OK ? "OK" : "FAIL");
+    if (rc != ESP_OK) {
+        Serial.println("[IP] WARNING: rxcb NOT installed — телефон не сможет ходить в туннель");
+    }
 
     // 5) Даунлинк: из туннеля → телефон
     meshIpSetRecvCb(meshIpApRecvCb);
@@ -138,8 +143,9 @@ void meshIpApStop() {
 
 // ===================== Захват входящих кадров телефона =====================
 
-static uint32_t s_rxFwd = 0;   // forwarded to lwIP (ARP/DHCP/local)
-static uint32_t s_rxTun = 0;   // injected into tunnel
+uint32_t g_meshIpRxFwd = 0;   // forwarded to lwIP (ARP/DHCP/local)
+uint32_t g_meshIpRxTun = 0;   // injected into tunnel
+static uint32_t s_rxTotal = 0; // all calls into apRxGrab
 
 static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
     if (!s_apNetif || !buffer || len < 14) {
@@ -147,6 +153,13 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
         return ESP_OK;
     }
     uint8_t* b = (uint8_t*)buffer;
+    s_rxTotal++;
+
+    // Первые 20 пакетов — логируем каждый, чтобы понять что вообще приходит
+    if (s_rxTotal <= 20) {
+        Serial.printf("[IP] apRxGrab #%lu len=%d eth=%02X%02X\n",
+                      s_rxTotal, len, b[12], b[13]);
+    }
 
     // Ищем ethertype: обычный 802.3 (type на off 12) или LLC/SNAP (type на off 20)
     int typeOff = -1;
@@ -157,14 +170,18 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
                b[15] == 0x00 && b[16] == 0x00 && b[17] == 0x00) {
         typeOff = 20;
     } else {
-        s_rxFwd++;
+        g_meshIpRxFwd++;
+        if (s_rxTotal <= 20)
+            Serial.printf("[IP] fwd #%lu: unknown-eth, %dB\n", s_rxTotal, len);
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
 
     uint16_t etype = (uint16_t)((b[typeOff] << 8) | b[typeOff + 1]);
     if (etype != 0x0800) {
-        s_rxFwd++;
+        g_meshIpRxFwd++;
+        if (s_rxTotal <= 20)
+            Serial.printf("[IP] fwd #%lu: non-IPv4 eth=0x%04X, %dB\n", s_rxTotal, etype, len);
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
@@ -181,7 +198,11 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
 
     // Локальная цель (шлюзу/DHCP/broadcast) — lwIP обработает
     if (dst == 0 || dst == 0xFFFFFFFF || dst == s_apIp.ip.addr) {
-        s_rxFwd++;
+        g_meshIpRxFwd++;
+        if (s_rxTotal <= 20 || (g_meshIpRxFwd & 0x0F) == 1)
+            Serial.printf("[IP] fwd #%lu: dst=%d.%d.%d.%d %s, %dB\n",
+                          s_rxTotal, ip[16], ip[17], ip[18], ip[19],
+                          etype == 0x0800 ? "IPv4-ICMP/UDP" : "?", len);
         esp_netif_receive(s_apNetif, buffer, len, eb);
         return ESP_OK;
     }
@@ -194,12 +215,12 @@ static esp_err_t apRxGrab(void* buffer, uint16_t len, void* eb) {
     esp_wifi_internal_free_rx_buffer(eb);
     meshIpInject(pkt, (uint16_t)takeLen);
 
-    s_rxTun++;
-    if ((s_rxTun & 0x1F) == 1) {   // раз в 32 пакета, чтобы не спамить
+    g_meshIpRxTun++;
+    if ((g_meshIpRxTun & 0x1F) == 1) {   // раз в 32 пакета, чтобы не спамить
         uint32_t src = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
                        ((uint32_t)ip[14] << 8) | (uint32_t)ip[15];
         Serial.printf("[IP] rx tun #%lu: %d.%d.%d.%d → %d.%d.%d.%d (%dB)\n",
-                      s_rxTun,
+                      g_meshIpRxTun,
                       (int)ip[12], (int)ip[13], (int)ip[14], (int)ip[15],
                       (int)ip[16], (int)ip[17], (int)ip[18], (int)ip[19],
                       takeLen);

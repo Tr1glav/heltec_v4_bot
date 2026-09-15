@@ -114,10 +114,17 @@ uint16_t meshIpTcpUdpChecksum(const uint8_t* src_ip, const uint8_t* dst_ip,
 
 // ===================== Состояние линка =====================
 
+#if defined(COMPANION_NODE) && FEATURE_MESH_IP
+// Счётчики перехвата кадров телефона живут в mesh_ip_ap.cpp
+extern uint32_t g_meshIpRxFwd;
+extern uint32_t g_meshIpRxTun;
+#endif
+
 static String       s_linkPeer;       // имя пира (первый полученный фрагмент)
 static uint32_t     s_lastRxMs = 0;   // момент последнего кадра от пира
 static bool         s_linkUp   = false;
 static meshIpRecvCb s_recvCb   = nullptr;
+static uint32_t     s_dbgStatusMs = 0; // последний вывод статуса
 
 // --- Исходящая очередь (кольцо IP-датаграмм) ---
 static uint8_t  s_txQueue[MESH_IP_QUEUE_MAX][MESH_IP_PKT_MAX];
@@ -369,6 +376,21 @@ void meshIpTick() {
     if (s_rxMsgReady && s_recvCb) {
         s_recvCb(s_rxMsgBuf, s_rxMsgLen);
         s_rxMsgReady = false;
+    }
+
+    // Периодический статус (раз в 5 c) — видно, есть ли вообще трафик телефона
+    if ((millis() - s_dbgStatusMs) >= 5000) {
+        s_dbgStatusMs = millis();
+        #if defined(COMPANION_NODE) && FEATURE_MESH_IP
+        Serial.printf("[IP] st: link=%d rxFwd=%lu rxTun=%lu txQue=%d peer=%s\n",
+                      (int)s_linkUp, (unsigned long)g_meshIpRxFwd,
+                      (unsigned long)g_meshIpRxTun, (int)s_txCount,
+                      s_linkPeer.length() ? s_linkPeer.c_str() : "-");
+        #else
+        Serial.printf("[IP] st: link=%d txQue=%d peer=%s\n",
+                      (int)s_linkUp, (int)s_txCount,
+                      s_linkPeer.length() ? s_linkPeer.c_str() : "-");
+        #endif
     }
 
     // Во время OTAfastMode не отправляем (радио занято)
